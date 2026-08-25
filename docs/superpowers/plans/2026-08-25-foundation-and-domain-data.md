@@ -423,7 +423,7 @@ git commit -m "feat: add commerce business schema"
 - Produces: `require_roles(*roles) -> FastAPI dependency`
 - Produces: `require_store_access(store_id, user, session) -> Store`
 
-- [ ] **Step 1: Write failing API authorization tests**
+- [x] **Step 1: Write failing API authorization tests**
 
 Cover these exact behaviors:
 
@@ -449,13 +449,13 @@ async def test_disabled_user_cannot_login(client):
 
 Also test bad password and missing token.
 
-- [ ] **Step 2: Run the authorization tests and confirm failure**
+- [x] **Step 2: Run the authorization tests and confirm failure**
 
 Run `& '.\.venv\Scripts\python.exe' -m pytest tests/test_auth_and_scope.py -v`.
 
 Expected: FAIL because auth routes and dependencies do not exist.
 
-- [ ] **Step 3: Implement password and JWT functions**
+- [x] **Step 3: Implement password and JWT functions**
 
 `backend/auth.py` uses one `PasswordHash.recommended()` instance and exposes these exact concrete functions:
 
@@ -490,7 +490,7 @@ def create_access_token(user: User, settings: Settings) -> str:
 
 JWT claims are `sub`, `role`, `iat`, and `exp`. Never accept role or store scope from request bodies. Return the same 401 message for unknown username and wrong password.
 
-- [ ] **Step 4: Implement schemas and routes**
+- [x] **Step 4: Implement schemas and routes**
 
 Pydantic contracts:
 
@@ -521,7 +521,7 @@ class ProductSummary(BaseModel):
 
 Admins see all enabled stores; operators and supervisors see only joined scopes. Product queries require store access and filter `Product.enabled is True`.
 
-- [ ] **Step 5: Register routes and run tests**
+- [x] **Step 5: Register routes and run tests**
 
 Run:
 
@@ -531,7 +531,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```powershell
 git add backend/auth.py backend/schemas.py backend/routes.py backend/main.py tests/test_auth_and_scope.py
