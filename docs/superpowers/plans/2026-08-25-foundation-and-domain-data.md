@@ -85,7 +85,7 @@ The phase intentionally keeps related logic in a few focused modules. Split a mo
 - Produces: `backend.database:get_session() -> AsyncIterator[AsyncSession]`
 - Produces: `GET /health/live -> {"status": "ok"}`
 
-- [ ] **Step 1: Initialize Git and verify the exact root**
+- [x] **Step 1: Initialize Git and verify the exact root**
 
 Run:
 
@@ -97,7 +97,7 @@ git status --short
 
 Expected: root is `D:\E-commerce_operations`; Git reports the approved docs as untracked. Do not initialize any parent directory.
 
-- [ ] **Step 1A: Create a project-local Python 3.11 environment**
+- [x] **Step 1A: Create a project-local Python 3.11 environment**
 
 The machine's default `python` is 3.10. Use the existing Python 3.11.15 interpreter only as a bootstrap and keep all new packages inside the project:
 
@@ -109,7 +109,7 @@ The machine's default `python` is 3.10. Use the existing Python 3.11.15 interpre
 
 Expected: the project-local interpreter reports Python 3.11.x. Never install project packages into `deepS`, `edu_agent`, the base Conda environment, or the system Python. Every subsequent Python command in this plan must use `.\.venv\Scripts\python.exe` or activate `.venv` first.
 
-- [ ] **Step 2: Add the failing health test**
+- [x] **Step 2: Add the failing health test**
 
 Create `tests/test_health.py`:
 
@@ -131,7 +131,7 @@ async def test_liveness() -> None:
 
 Add `asyncio_mode = "auto"` under `[tool.pytest.ini_options]` in `pyproject.toml`.
 
-- [ ] **Step 3: Run the test and confirm the expected failure**
+- [x] **Step 3: Run the test and confirm the expected failure**
 
 Run:
 
@@ -141,7 +141,7 @@ Run:
 
 Expected: FAIL because `backend.main` or `create_app` does not exist.
 
-- [ ] **Step 4: Add the minimal project configuration**
+- [x] **Step 4: Add the minimal project configuration**
 
 `pyproject.toml` must declare Python `>=3.11,<3.12` and these runtime dependencies:
 
@@ -203,7 +203,7 @@ os.environ.setdefault("JWT_SECRET_KEY", "test-only-secret-at-least-32-characters
 
 Its SQLite fixture must enable `PRAGMA foreign_keys=ON` for every connection so foreign-key behavior is not silently skipped.
 
-- [ ] **Step 5: Add settings, database boundary, and app factory**
+- [x] **Step 5: Add settings, database boundary, and app factory**
 
 Use this settings contract in `backend/config.py`:
 
@@ -250,11 +250,11 @@ app = create_app()
 
 Do not expose environment secrets in health responses.
 
-- [ ] **Step 6: Add the PostgreSQL Compose service**
+- [x] **Step 6: Add the PostgreSQL Compose service**
 
 `docker-compose.yml` contains one PostgreSQL 16 service named `postgres`, host port `5434`, a named volume, and a health check using `pg_isready`. It reads non-secret local defaults and must not include a real DeepSeek key.
 
-- [ ] **Step 7: Run the health test and configuration checks**
+- [x] **Step 7: Run the health test and configuration checks**
 
 Run:
 
@@ -266,7 +266,7 @@ docker compose config
 
 Expected: health test PASS, Compose config parses, compilation succeeds.
 
-- [ ] **Step 8: Commit Task 1**
+- [x] **Step 8: Commit Task 1**
 
 ```powershell
 git add .gitignore .env.example pyproject.toml docker-compose.yml backend tests docs
