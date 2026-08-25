@@ -24,6 +24,10 @@ from backend.database import Base
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("role IN ('operator', 'supervisor', 'admin')", name="user_role"),
+        CheckConstraint("status IN ('active', 'disabled')", name="user_status"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
@@ -33,7 +37,7 @@ class User(Base):
             UserRole,
             name="user_role",
             native_enum=False,
-            create_constraint=True,
+            create_constraint=False,
             values_callable=lambda enum: [member.value for member in enum],
         ),
         nullable=False,
@@ -43,7 +47,7 @@ class User(Base):
             UserStatus,
             name="user_status",
             native_enum=False,
-            create_constraint=True,
+            create_constraint=False,
             values_callable=lambda enum: [member.value for member in enum],
         ),
         default=lambda: UserStatus.ACTIVE,
@@ -108,7 +112,12 @@ class ProductSku(Base):
 
 class Order(Base):
     __tablename__ = "orders"
-    __table_args__ = (CheckConstraint("total_amount >= 0", name="ck_orders_total_amount"),)
+    __table_args__ = (
+        CheckConstraint("total_amount >= 0", name="ck_orders_total_amount"),
+        CheckConstraint(
+            "status IN ('paid', 'shipped', 'completed', 'cancelled')", name="order_status"
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     store_id: Mapped[str] = mapped_column(ForeignKey("stores.id"), nullable=False)
@@ -118,7 +127,7 @@ class Order(Base):
             OrderStatus,
             name="order_status",
             native_enum=False,
-            create_constraint=True,
+            create_constraint=False,
             values_callable=lambda enum: [member.value for member in enum],
         ),
         nullable=False,
@@ -131,6 +140,10 @@ class OrderItem(Base):
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_order_items_quantity"),
         CheckConstraint("unit_price >= 0", name="ck_order_items_unit_price"),
+        CheckConstraint(
+            "refund_status IN ('none', 'requested', 'refunded', 'returned')",
+            name="refund_status",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
@@ -144,7 +157,7 @@ class OrderItem(Base):
             RefundStatus,
             name="refund_status",
             native_enum=False,
-            create_constraint=True,
+            create_constraint=False,
             values_callable=lambda enum: [member.value for member in enum],
         ),
         nullable=False,
