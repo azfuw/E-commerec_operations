@@ -552,7 +552,7 @@ git commit -m "feat: enforce role and store authorization"
 - Produces: `async clear_demo_data(session: AsyncSession) -> None`
 - Produces a CLI that supports `--seed` and `--reset`.
 
-- [ ] **Step 1: Write failing deterministic seed tests**
+- [x] **Step 1: Write failing deterministic seed tests**
 
 Tests must assert:
 
@@ -573,13 +573,13 @@ async def test_seed_contains_known_anomaly_cases(session):
 
 Also verify the same seed produces the same store codes and anomaly product codes after reset.
 
-- [ ] **Step 2: Run tests and confirm failure**
+- [x] **Step 2: Run tests and confirm failure**
 
 Run `& '.\.venv\Scripts\python.exe' -m pytest tests/test_seed.py -v`.
 
 Expected: FAIL because seeding functions do not exist.
 
-- [ ] **Step 3: Implement deterministic identities and dataset shape**
+- [x] **Step 3: Implement deterministic identities and dataset shape**
 
 Use `random.Random(seed)` and UUID5 derived from stable business keys. Generate exactly:
 
@@ -594,13 +594,13 @@ Do not depend on Faker. Dates are derived from one explicit `end_date` argument 
 
 `SeedSummary` contains integer counts, `days`, and sorted `anomaly_types` only; it contains no credentials.
 
-- [ ] **Step 4: Make seeding idempotent**
+- [x] **Step 4: Make seeding idempotent**
 
 Use stable unique keys and PostgreSQL-compatible upserts or existence checks. `--reset` deletes only rows owned by the known demo store IDs, in foreign-key-safe order; it must never issue a broad database drop.
 
 Create users with documented demo usernames `operator`, `supervisor`, and `admin`; hash the default local password rather than storing plaintext. The CLI may print usernames but must not print hashes, JWTs, environment variables, or real secrets.
 
-- [ ] **Step 5: Run seed tests and a PostgreSQL smoke run**
+- [x] **Step 5: Run seed tests and a PostgreSQL smoke run**
 
 Run:
 
@@ -612,7 +612,7 @@ Run:
 
 Expected: tests PASS; second CLI invocation reports unchanged counts and creates no duplicates.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```powershell
 git add backend/seed.py scripts/seed_demo.py tests/test_seed.py
