@@ -307,6 +307,12 @@ async def test_product_code_is_unique_within_store(session):
 
 
 async def test_sku_rejects_negative_price(session):
+    store = Store(id="store-1", name="旗舰店", code="flagship")
+    product = Product(
+        id="p-1", store_id="store-1", code="SKU-001", title="商品一", category="数码"
+    )
+    session.add_all([store, product])
+    await session.flush()
     session.add(ProductSku(
         id="sku-1", product_id="p-1", code="P1-BLACK", spec={"颜色": "黑色"},
         price=Decimal("-1.00"), current_stock=10,
@@ -361,10 +367,10 @@ Use SQLAlchemy 2 typed mappings. Required fields and constraints:
 
 | Model | Required fields | Required constraints |
 |---|---|---|
-| User | id, username, password_hash, role, status, created_at | username unique |
-| Store | id, name, code, enabled, created_at | code unique |
+| User | id, username, password_hash, role; status and created_at have callable defaults | username unique |
+| Store | id, name, code; enabled and created_at have callable defaults | code unique |
 | UserStoreScope | user_id, store_id | composite primary key |
-| Product | id, store_id, code, title, category, brand, selling_points JSON, description, search_keywords JSON, attributes JSON, current_version, enabled | unique(store_id, code), current_version >= 1 |
+| Product | id, store_id, code, title, category; brand/description default empty, JSON fields use callable defaults, current_version defaults 1, enabled defaults true | unique(store_id, code), current_version >= 1 |
 | ProductSku | id, product_id, code, spec JSON, price Numeric(12,2), current_stock | unique(product_id, code), price >= 0, stock >= 0 |
 | Order | id, store_id, ordered_at, status, total_amount | total_amount >= 0 |
 | OrderItem | id, order_id, product_id, sku_id, quantity, unit_price, refund_status | quantity > 0, unit_price >= 0 |
@@ -384,6 +390,7 @@ Run:
 ```powershell
 & '.\.venv\Scripts\python.exe' -m pytest tests/test_models.py -v
 docker compose up -d postgres
+$env:JWT_SECRET_KEY='local-development-only-secret-at-least-32-characters'
 alembic upgrade head
 alembic current
 ```
