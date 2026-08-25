@@ -637,7 +637,7 @@ git commit -m "feat: add deterministic commerce demo data"
 - Produces: `ProductMetrics.from_totals(*, impressions: int, clicks: int, orders: int, units: int, revenue: Decimal, refunds: int) -> ProductMetrics`
 - Produces: `ProductNotInStore`, raised when the requested product is not owned by the requested store.
 
-- [ ] **Step 1: Write failing metric and anomaly tests**
+- [x] **Step 1: Write failing metric and anomaly tests**
 
 Cover formulas and trust boundaries:
 
@@ -676,13 +676,13 @@ async def test_store_boundary_is_enforced(session):
         )
 ```
 
-- [ ] **Step 2: Run tests and confirm failure**
+- [x] **Step 2: Run tests and confirm failure**
 
 Run `& '.\.venv\Scripts\python.exe' -m pytest tests/test_analytics.py -v`.
 
 Expected: FAIL because analytics contracts do not exist.
 
-- [ ] **Step 3: Implement exact metrics with safe zero handling**
+- [x] **Step 3: Implement exact metrics with safe zero handling**
 
 Use Decimal quantized to four places for rates:
 
@@ -695,7 +695,7 @@ average_order_value = revenue / paid_or_completed_order_count
 
 Return Decimal zero when a denominator is zero; never raise division errors or invent rates. Keep raw totals in every metrics result so Agent explanations remain auditable.
 
-- [ ] **Step 4: Implement deterministic anomaly rules**
+- [x] **Step 4: Implement deterministic anomaly rules**
 
 Compare the requested period with the immediately preceding equal-length period. Emit these labels:
 
@@ -708,7 +708,7 @@ stock_risk: on_hand <= max(3, seven_day_units_sold)
 
 Each `AnomalyCandidate` includes `product_id`, `product_code`, `anomaly_types`, `score`, `business_impact`, `metrics`, and an `evidence` list containing exact observed values and comparison values. Rank by score descending, then product code ascending for deterministic ties.
 
-- [ ] **Step 5: Run analytics and full phase tests**
+- [x] **Step 5: Run analytics and full phase tests**
 
 Run:
 
@@ -720,7 +720,7 @@ Run:
 
 Expected: all tests PASS and compilation succeeds.
 
-- [ ] **Step 6: Commit Task 5**
+- [x] **Step 6: Commit Task 5**
 
 ```powershell
 git add backend/analytics.py backend/schemas.py tests/test_analytics.py
@@ -738,7 +738,7 @@ git commit -m "feat: add deterministic commerce analytics tools"
 **Interfaces:**
 - Produces a runnable, authenticated backend foundation and deterministic tool layer for the next Agent phase.
 
-- [ ] **Step 1: Run the complete verification set**
+- [x] **Step 1: Run the complete verification set**
 
 ```powershell
 docker compose config
@@ -752,7 +752,7 @@ git log --oneline --decorate -8
 
 Expected: Compose parses; PostgreSQL is healthy if started; migration is current; tests and compilation pass; only intentionally unfinished plan checkbox edits may remain.
 
-- [ ] **Step 2: Audit the implementation against phase scope**
+- [x] **Step 2: Audit the implementation against phase scope**
 
 Confirm all of the following with exact file and test evidence:
 
@@ -763,7 +763,7 @@ Confirm all of the following with exact file and test evidence:
 - Analytics expose raw evidence and deterministic rankings.
 - README claims were not added for unimplemented capabilities.
 
-- [ ] **Step 3: Save the deadline handoff**
+- [x] **Step 3: Save the deadline handoff**
 
 At or before 22:20 Asia/Shanghai, stop new work and report:
 
