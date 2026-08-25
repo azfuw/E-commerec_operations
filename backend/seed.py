@@ -159,20 +159,13 @@ async def seed_demo_data(
                 if sku_number == 1:
                     primary_sku_id = sku_id
                 price = Decimal("99.00") + Decimal(rng.randrange(30))
-                sku_rows.append(
-                    {
-                        "id": sku_id,
-                        "product_id": product_id,
-                        "code": f"{code}-S{sku_number}",
-                        "spec": {"规格": f"标准款{sku_number}"},
-                        "price": price,
-                        "current_stock": 50,
-                    }
-                )
+                current_stock = 0
                 for metric_date in dates:
                     on_hand = 20 + rng.randrange(40)
                     if code in stock_risk and metric_date >= end_date - timedelta(days=6):
                         on_hand = 1
+                    if metric_date == end_date:
+                        current_stock = on_hand
                     inventory_rows.append(
                         {
                             "id": stable_id(f"inventory:{sku_id}:{metric_date.isoformat()}"),
@@ -183,6 +176,16 @@ async def seed_demo_data(
                             "inbound": rng.randrange(8),
                         }
                     )
+                sku_rows.append(
+                    {
+                        "id": sku_id,
+                        "product_id": product_id,
+                        "code": f"{code}-S{sku_number}",
+                        "spec": {"规格": f"标准款{sku_number}"},
+                        "price": price,
+                        "current_stock": current_stock,
+                    }
+                )
             for metric_date in dates:
                 clicks = 80 + rng.randrange(40)
                 if code in low_conversion:

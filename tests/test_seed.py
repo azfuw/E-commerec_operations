@@ -46,6 +46,15 @@ async def test_seed_has_required_shape_and_real_anomaly_data(session) -> None:
     ).all()
     assert len(sku_counts) == 300
     assert {count for _, count in sku_counts} <= {1, 2, 3}
+    assert await session.scalar(
+        select(func.count(ProductSku.id))
+        .join(
+            InventorySnapshot,
+            (InventorySnapshot.sku_id == ProductSku.id)
+            & (InventorySnapshot.snapshot_date == date(2026, 8, 24)),
+        )
+        .where(ProductSku.current_stock == InventorySnapshot.on_hand)
+    ) == sum(count for _, count in sku_counts)
 
     low_conversion_id = await session.scalar(
         select(Product.id).where(Product.code == "FLAGSHIP-001")
