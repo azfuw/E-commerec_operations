@@ -150,6 +150,7 @@ async def test_candidates_reject_duplicate_keys_and_invalid_rank_or_confidence(s
         ("run-type", {"workflow_type": "other"}),
         ("run-status", {"status": "unknown"}),
         ("run-quality", {"quality_status": "unknown"}),
+        ("run-dates", {"start_date": date(2026, 8, 25), "end_date": date(2026, 8, 24)}),
         ("run-attempt-low", {"attempt_count": -1}),
         ("run-attempt-high", {"attempt_count": 4}),
         (
@@ -173,6 +174,22 @@ async def test_candidates_reject_duplicate_keys_and_invalid_rank_or_confidence(s
 async def test_workflow_runs_reject_invalid_state_or_lease(session, run_id, changes) -> None:
     await _add_references(session)
     await _assert_integrity_error(session, _workflow_run(run_id, **changes))
+
+
+async def test_processing_run_with_complete_lease_persists(session) -> None:
+    await _add_references(session)
+    run = _workflow_run(
+        "run-processing",
+        status=WorkflowStatus.PROCESSING,
+        lease_owner="worker-a",
+        lease_expires_at=datetime(2026, 8, 25, tzinfo=UTC),
+    )
+    session.add(run)
+    await session.flush()
+
+    assert run.status is WorkflowStatus.PROCESSING
+    assert run.lease_owner == "worker-a"
+    assert run.lease_expires_at == datetime(2026, 8, 25, tzinfo=UTC)
 
 
 async def test_agent_calls_reject_duplicate_or_invalid_audit_values(session) -> None:
@@ -203,3 +220,20 @@ async def test_agent_calls_reject_duplicate_or_invalid_audit_values(session) -> 
                 **{field: -1},
             ),
         )
+
+
+async def test_agent_call_attempt_zero_persists_for_degradation(session) -> None:
+    await _add_references(session)
+    run = _workflow_run("run-1")
+    session.add(run)
+    await session.flush()
+    call = _agent_call(
+        "call-degradation",
+        run.id,
+        node_name="validate_and_reconcile",
+        attempt=0,
+    )
+    session.add(call)
+    await session.flush()
+
+    assert call.attempt == 0
