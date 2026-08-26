@@ -49,11 +49,11 @@ def minimal_trusted_facts() -> AnalysisFacts:
 @pytest.mark.skipif(
     os.getenv("RUN_DEEPSEEK_SMOKE") != "1", reason="explicit opt-in required"
 )
-async def test_explicit_deepseek_flash_schema_smoke() -> None:
+async def test_explicit_deepseek_v4_flash_schema_smoke() -> None:
     settings = get_settings()
     if settings.deepseek_api_key is None:
         pytest.skip("DeepSeek key is not configured")
     client = DeepSeekAnalysisClient(settings)
     result = await client.request(minimal_trusted_facts(), call_type=AgentCallType.PRIMARY)
     assert result.response is not None
-    assert result.records[-1].model == "deepseek-flash"
+    assert result.records[-1].model == "deepseek-v4-flash"

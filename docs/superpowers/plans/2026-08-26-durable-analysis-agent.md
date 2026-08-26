@@ -20,9 +20,9 @@
 - `workflow_runs.status` is limited to `accepted`, `processing`, `awaiting_selection`, and `failed`; its quality schema permits `normal`, `partial`, and `degraded`, while this implementation writes only `normal` or `degraded`.
 - Lease selection, expiry, renewal, and stale-owner protection use PostgreSQL `now()` plus `FOR UPDATE SKIP LOCKED`; an accepted or expired processing run is claimed at most three times and terminal rows are never claimed.
 - Call all five existing read-only functions in `backend.analytics`: `get_store_summary`, `find_anomalous_products`, `get_product_metrics`, `compare_store_products`, and `get_inventory_risk`. Their already-tested store and date behavior remains unchanged.
-- DeepSeek is called directly with `httpx`; the default model is exactly `deepseek-flash`, and `DEEPSEEK_MODEL` may override it. The API must start without a DeepSeek key; only the Worker call node checks for it.
+- DeepSeek is called directly with `httpx`; the default model is exactly `deepseek-v4-flash`, and `DEEPSEEK_MODEL` may override it. The API must start without a DeepSeek key; only the Worker call node checks for it.
 - No database row, API response, test assertion output, or log message may contain an API key, `Authorization` value, password, complete token, complete prompt, complete model response, or chain of thought.
-- Every normal LLM test uses `httpx.MockTransport`; the sole real `deepseek-flash` smoke test is skipped by default and runs only through its explicit opt-in command.
+- Every normal LLM test uses `httpx.MockTransport`; the sole real `deepseek-v4-flash` smoke test is skipped by default and runs only through its explicit opt-in command.
 - Use manual, named SQL `CheckConstraint`s for every application enum as in the existing schema; do not rely on type-bound enum checks or hide Alembic drift in `alembic/env.py`.
 
 ## Existing Structure to Reuse
@@ -425,7 +425,7 @@ class DeepSeekAnalysisClient:
 
 `DeepSeekAnalysisClient.request()` sets `AgentCallRecord.node_name="call_analysis_agent"` for every `primary` transport record and `"validate_and_reconcile"` for every `schema_repair` record. The Worker creates the deterministic attempt-0 degradation record with `node_name="validate_and_reconcile"` and `call_type=primary`.
 
-Add runtime dependency `httpx>=0.28,<1` to `[project].dependencies` and remove its duplicate from the `test` extra. Add `deepseek_api_key: SecretStr | None = None`, `deepseek_model: str = "deepseek-flash"`, `deepseek_base_url: str = "https://api.deepseek.com"`, `deepseek_timeout_seconds: float = 30.0`, and `deepseek_price_per_million_tokens: Decimal | None = None` to `Settings`. Add matching non-secret names and defaults to `.env.example`; leave `DEEPSEEK_API_KEY=` blank. `estimated_cost` is `None` unless the price setting is non-null, then is `(total_tokens * price / 1_000_000)` quantized to six decimal places.
+Add runtime dependency `httpx>=0.28,<1` to `[project].dependencies` and remove its duplicate from the `test` extra. Add `deepseek_api_key: SecretStr | None = None`, `deepseek_model: str = "deepseek-v4-flash"`, `deepseek_base_url: str = "https://api.deepseek.com"`, `deepseek_timeout_seconds: float = 30.0`, and `deepseek_price_per_million_tokens: Decimal | None = None` to `Settings`. Add matching non-secret names and defaults to `.env.example`; leave `DEEPSEEK_API_KEY=` blank. `estimated_cost` is `None` unless the price setting is non-null, then is `(total_tokens * price / 1_000_000)` quantized to six decimal places.
 
 - [ ] **Step 1: Write MockTransport-only tests for fact provenance, output validation, retry, and degradation**
 
@@ -446,7 +446,7 @@ Use a valid structured mock response whose product IDs and ranks match `facts`; 
 
 Parameterize raw invalid JSON, extra-field/schema responses, and `confidence=-0.0001` or `confidence=1.0001`; `parse_agent_response()` must raise `AgentSchemaError` for each because Pydantic validates `AgentCandidateDraft` bounds, while `DeepSeekAnalysisClient.request()` catches that exception and returns `AgentInvocation(response=None, error_code="DEEPSEEK_SCHEMA_INVALID")`. Parameterize schema-valid responses for an unknown ID, duplicate ID, missing ID, duplicate rank, and non-contiguous rank; only `validate_agent_response()` must raise `AgentSchemaError` for those trusted-set inconsistencies. Verify two 429 responses followed by 200 produce exactly three `primary` records; independently cover timeout, transport error, and 5xx with three attempts. Pass a recording `before_http_attempt` callback and assert it is awaited immediately before every attempt with `[(AgentCallType.PRIMARY, 1), (AgentCallType.PRIMARY, 2), (AgentCallType.PRIMARY, 3)]`. Assert primary records use `node_name="call_analysis_agent"`; make a `schema_repair` request and assert its record uses `node_name="validate_and_reconcile"`. Verify 401 and 403 create exactly one safe record, and no key makes zero HTTP requests with error code `DEEPSEEK_KEY_MISSING`.
 
-Assert the fixed Chinese degraded drafts cover exactly the trusted product IDs and ranks, contain the Chinese statement `模型解释暂不可用，请人工核验。`, and carry no invented product facts. Assert every `AgentCallRecord` has a 64-character input hash and no attributes for a request header, prompt body, raw response, key, or authorization value. With no price setting, assert `estimated_cost is None`. Clear `get_settings`' cache around the settings tests, assert the default is `deepseek-flash`, and assert `DEEPSEEK_MODEL` overrides only the model value.
+Assert the fixed Chinese degraded drafts cover exactly the trusted product IDs and ranks, contain the Chinese statement `模型解释暂不可用，请人工核验。`, and carry no invented product facts. Assert every `AgentCallRecord` has a 64-character input hash and no attributes for a request header, prompt body, raw response, key, or authorization value. With no price setting, assert `estimated_cost is None`. Clear `get_settings`' cache around the settings tests, assert the default is `deepseek-v4-flash`, and assert `DEEPSEEK_MODEL` overrides only the model value.
 
 - [ ] **Step 2: Run the agent tests and observe RED**
 
@@ -473,7 +473,7 @@ Run:
 .\.venv\Scripts\python.exe -m pytest tests/test_analytics.py -v
 ```
 
-Expected: all agent tests use `MockTransport`, the default model assertion is `deepseek-flash`, and the five original deterministic tools still pass their regression suite.
+Expected: all agent tests use `MockTransport`, the default model assertion is `deepseek-v4-flash`, and the five original deterministic tools still pass their regression suite.
 
 - [ ] **Step 5: Commit the deterministic/LLM boundary**
 
@@ -697,7 +697,7 @@ git commit -m "feat: add durable analysis worker"
 [tool.pytest.ini_options]
 markers = [
   "postgres_integration: requires the configured local PostgreSQL service",
-  "deepseek_smoke: explicit real deepseek-flash smoke test",
+  "deepseek_smoke: explicit real deepseek-v4-flash smoke test",
 ]
 
 # tests/test_analysis_postgres.py
@@ -706,7 +706,7 @@ async def test_postgres_analysis_vertical_slice() -> None: ...
 
 # tests/test_deepseek_smoke.py
 @pytest.mark.deepseek_smoke
-async def test_explicit_deepseek_flash_schema_smoke() -> None: ...
+async def test_explicit_deepseek_v4_flash_schema_smoke() -> None: ...
 ```
 
 The PostgreSQL test is skipped unless `RUN_POSTGRES_INTEGRATION=1`; it uses `async_session_factory`, `AsyncPostgresSaver`, and the existing deterministic seed data. It deletes only workflow, candidate, and call rows it created by exact test UUIDs during cleanup. The DeepSeek test is skipped unless `RUN_DEEPSEEK_SMOKE=1`; it obtains the configured optional key only inside `DeepSeekAnalysisClient`, never prints it, and does not store a prompt or response.
@@ -754,14 +754,14 @@ def minimal_trusted_facts() -> AnalysisFacts:
 
 @pytest.mark.deepseek_smoke
 @pytest.mark.skipif(os.getenv("RUN_DEEPSEEK_SMOKE") != "1", reason="explicit opt-in required")
-async def test_explicit_deepseek_flash_schema_smoke() -> None:
+async def test_explicit_deepseek_v4_flash_schema_smoke() -> None:
     settings = get_settings()
     if settings.deepseek_api_key is None:
         pytest.skip("DeepSeek key is not configured")
     client = DeepSeekAnalysisClient(settings)
     result = await client.request(minimal_trusted_facts(), call_type=AgentCallType.PRIMARY)
     assert result.response is not None
-    assert result.records[-1].model == "deepseek-flash"
+    assert result.records[-1].model == "deepseek-v4-flash"
 ```
 
 `minimal_trusted_facts()` contains one local synthetic product and no user credentials. The smoke test asserts only parsed schema and safe record metadata; it neither prints nor writes the result body.
@@ -780,7 +780,7 @@ Expected: collection fails because the markers and test modules do not exist. Af
 
 Register the two markers in `pyproject.toml`; do not add a test database service or new environment-file values. Build the PostgreSQL fixture from the configured application session factory, run `await checkpointer.setup()` before the graph, and clean up only records created by test IDs. Use `seed_demo_data(session)` for prerequisite facts and do not reset, drop, truncate, or broadly delete project data.
 
-The real smoke test retains the exact `deepseek-flash` assertion. Its opt-in command below temporarily sets only non-secret feature/model flags; the key remains in the operator's already-configured secret source and is never read, echoed, asserted, or persisted by test code.
+The real smoke test retains the exact `deepseek-v4-flash` assertion. Its opt-in command below temporarily sets only non-secret feature/model flags; the key remains in the operator's already-configured secret source and is never read, echoed, asserted, or persisted by test code.
 
 - [ ] **Step 4: Run the required PostgreSQL closed loop and the full normal suite**
 
@@ -808,13 +808,13 @@ Only after Step 4 passes and an operator has deliberately configured a DeepSeek 
 
 ```powershell
 $env:RUN_DEEPSEEK_SMOKE = "1"
-$env:DEEPSEEK_MODEL = "deepseek-flash"
+$env:DEEPSEEK_MODEL = "deepseek-v4-flash"
 .\.venv\Scripts\python.exe -m pytest tests/test_deepseek_smoke.py -m deepseek_smoke -v
 Remove-Item Env:RUN_DEEPSEEK_SMOKE
 Remove-Item Env:DEEPSEEK_MODEL
 ```
 
-Expected: one real, minimal structured request passes using `deepseek-flash`; command output contains no key, authorization value, prompt, or response body. If the operator has not authorized this step or no private key is configured, leave the test skipped and report that the explicit external acceptance was not performed rather than fabricating a result.
+Expected: one real, minimal structured request passes using `deepseek-v4-flash`; command output contains no key, authorization value, prompt, or response body. If the operator has not authorized this step or no private key is configured, leave the test skipped and report that the explicit external acceptance was not performed rather than fabricating a result.
 
 - [ ] **Step 6: Commit the acceptance coverage**
 

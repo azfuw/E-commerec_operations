@@ -145,7 +145,7 @@ Worker 公开可测试的 `run_once()`：每次最多领取并处理一个工作
 
 ## 8. LLM 结构化输出与可信事实重附加
 
-DeepSeek 通过 `httpx` 直接调用兼容 Chat Completions 接口；不使用 SDK，也不建立供应商工厂。默认模型精确为 `deepseek-flash`，可由 `DEEPSEEK_MODEL` 覆盖。API 进程在没有 API Key 时仍能启动；只有 Worker 的 `call_analysis_agent` 节点检查 Key 是否可用。
+DeepSeek 通过 `httpx` 直接调用兼容 Chat Completions 接口；不使用 SDK，也不建立供应商工厂。默认模型精确为 `deepseek-v4-flash`，可由 `DEEPSEEK_MODEL` 覆盖。API 进程在没有 API Key 时仍能启动；只有 Worker 的 `call_analysis_agent` 节点检查 Key 是否可用。
 
 模型输出是禁止额外字段的结构化 JSON。每个候选只允许以下字段：
 
@@ -195,7 +195,7 @@ JWT 与店铺范围只在服务端验证；每次读取运行或候选都重新�
 | LangGraph 持久化 | 节点后 checkpoint、重启从 checkpoint 恢复、候选与 `agent_calls` 幂等、过期 Worker 不能覆盖新租约结果。 |
 | LLM 失败策略 | 超时、网络、429、5xx 的两次重试；一次 Schema 修复；缺 Key、401、403 和修复失败均降级；事实层、输入和 checkpoint 错误均失败。 |
 | PostgreSQL 纵向闭环 | 固定种子数据得到 5 个可信候选，Worker 完成到 `awaiting_selection`，候选包含服务端事实，`agent_calls` 可审计。 |
-| 明确真实烟测 | 在所有 Mock 测试之后，显式授权的最小 `deepseek-flash` 请求验证真实配置与结构化响应；只记录安全元数据，不打印或保存 Key、Authorization、完整 Prompt 或完整响应。 |
+| 明确真实烟测 | 在所有 Mock 测试之后，显式授权的最小 `deepseek-v4-flash` 请求验证真实配置与结构化响应；只记录安全元数据，不打印或保存 Key、Authorization、完整 Prompt 或完整响应。 |
 
 ## 12. 验收标准
 
@@ -206,7 +206,7 @@ JWT 与店铺范围只在服务端验证；每次读取运行或候选都重新�
 5. 候选和 `agent_calls` 在恢复或重放后保持幂等，终态不会回退。
 6. 超时、网络、429、5xx、结构错误、缺 Key、401、403 均产生确定性降级候选并到达 `awaiting_selection/degraded`；事实层、输入和 checkpoint 错误到达 `failed`。
 7. `agent_calls` 不含密钥、Authorization、完整 Prompt/响应或思维链；价格未配置时成本为 `null`。
-8. 常规测试全部 Mock，最后仅运行一次显式授权的最小 `deepseek-flash` 真实烟测。
+8. 常规测试全部 Mock，最后仅运行一次显式授权的最小 `deepseek-v4-flash` 真实烟测。
 9. 阶段终点固定为 `awaiting_selection`，不包含人工选品或商品优化实现。
 
 ## 13. 与总设计的一致性及未实现范围

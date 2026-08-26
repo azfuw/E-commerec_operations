@@ -286,6 +286,7 @@ async def test_client_post_contract_requires_concise_simplified_chinese_explanat
 
     assert invocation.response is not None
     assert requests[0]["response_format"] == {"type": "json_object"}
+    assert requests[0]["model"] == "deepseek-v4-flash"
     instruction = requests[0]["messages"][0]["content"]
     assert "impact_explanation、reason、recommended_action 必须使用简洁简体中文。" in instruction
     assert all(
@@ -440,6 +441,7 @@ async def test_client_records_safe_hash_and_optional_cost() -> None:
     assert without_price.records[0].estimated_cost is None
     assert with_price.records[0].estimated_cost == Decimal("0.000020")
     for record in (*without_price.records, *with_price.records):
+        assert record.model == "deepseek-v4-flash"
         assert len(record.input_hash) == 64
         assert not {"headers", "prompt", "raw_response", "key", "authorization"} & set(vars(record))
 
@@ -503,7 +505,7 @@ def test_settings_default_and_model_override(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
     get_settings.cache_clear()
-    assert get_settings().deepseek_model == "deepseek-flash"
+    assert get_settings().deepseek_model == "deepseek-v4-flash"
 
     monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-custom")
     get_settings.cache_clear()

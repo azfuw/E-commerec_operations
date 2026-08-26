@@ -75,7 +75,7 @@ def _agent_call(call_id: str, run_id: str, **changes: object) -> AgentCall:
         "node_name": "call_analysis_agent",
         "call_type": AgentCallType.PRIMARY,
         "attempt": 1,
-        "model": "deepseek-flash",
+        "model": "deepseek-v4-flash",
         "prompt_version": "v1",
         "status": "success",
         "input_hash": "0" * 64,

@@ -30,5 +30,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
   "postgres_integration: requires the configured local PostgreSQL service",
-  "deepseek_smoke: explicit real deepseek-flash smoke test",
+  "deepseek_smoke: explicit real deepseek-v4-flash smoke test",
 ]

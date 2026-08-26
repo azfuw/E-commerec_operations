@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = 60
     deepseek_api_key: SecretStr | None = None
-    deepseek_model: str = "deepseek-flash"
+    deepseek_model: str = "deepseek-v4-flash"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_timeout_seconds: float = 30.0
     deepseek_price_per_million_tokens: Decimal | None = None
