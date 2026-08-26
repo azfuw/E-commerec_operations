@@ -170,6 +170,16 @@ def _node_name(call_type: AgentCallType) -> Literal["call_analysis_agent", "vali
     )
 
 
+def _nonnegative_token(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        token = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return token if token >= 0 else 0
+
+
 class DeepSeekAnalysisClient:
     def __init__(
         self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None
@@ -195,7 +205,7 @@ class DeepSeekAnalysisClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": "Return JSON candidates with only product_id, rank, impact_explanation, reason, recommended_action, and confidence.",
+                    "content": "Return JSON candidates with only product_id, rank, impact_explanation, reason, recommended_action, and confidence. impact_explanation、reason、recommended_action 必须使用简洁简体中文。",
                 },
                 {
                     "role": "user",
@@ -272,15 +282,20 @@ class DeepSeekAnalysisClient:
         response: httpx.Response | None,
         started: float,
     ) -> AgentCallRecord:
-        usage = response.json().get("usage", {}) if response is not None else {}
-        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-        total_tokens = int(usage.get("total_tokens", 0) or 0)
+        try:
+            body = response.json() if response is not None else {}
+        except ValueError:
+            body = {}
+        usage = body.get("usage") if isinstance(body, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        prompt_tokens = _nonnegative_token(usage.get("prompt_tokens"))
+        completion_tokens = _nonnegative_token(usage.get("completion_tokens"))
+        total_tokens = _nonnegative_token(usage.get("total_tokens"))
         price = self.settings.deepseek_price_per_million_tokens
         estimated_cost = (
             None
             if price is None
-            else (Decimal(total_tokens) * price / Decimal(1_000_000)).quantize(
+            else (Decimal(total_tokens) * max(price, Decimal("0")) / Decimal(1_000_000)).quantize(
                 Decimal("0.000001")
             )
         )

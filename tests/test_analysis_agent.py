@@ -271,6 +271,36 @@ async def test_client_retries_rate_limits_and_renews_before_each_attempt() -> No
     assert {record.node_name for record in invocation.records} == {"call_analysis_agent"}
 
 
+async def test_client_post_contract_requires_concise_simplified_chinese_explanations() -> None:
+    facts = make_facts()
+    requests: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/chat/completions"
+        requests.append(json.loads(request.content))
+        return completion(response_content(facts))
+
+    invocation = await client(httpx.MockTransport(handler)).request(
+        facts, call_type=AgentCallType.PRIMARY
+    )
+
+    assert invocation.response is not None
+    assert requests[0]["response_format"] == {"type": "json_object"}
+    instruction = requests[0]["messages"][0]["content"]
+    assert "impact_explanation、reason、recommended_action 必须使用简洁简体中文。" in instruction
+    assert all(
+        field in instruction
+        for field in (
+            "product_id",
+            "rank",
+            "impact_explanation",
+            "reason",
+            "recommended_action",
+            "confidence",
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("failure", "error_code"),
     [
@@ -412,6 +442,38 @@ async def test_client_records_safe_hash_and_optional_cost() -> None:
     for record in (*without_price.records, *with_price.records):
         assert len(record.input_hash) == 64
         assert not {"headers", "prompt", "raw_response", "key", "authorization"} & set(vars(record))
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        [],
+        {"prompt_tokens": "invalid", "completion_tokens": "invalid", "total_tokens": "invalid"},
+        {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1},
+    ],
+)
+async def test_client_normalizes_untrusted_usage_without_breaking_success(usage: object) -> None:
+    facts = make_facts()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": response_content(facts)}}],
+                "usage": usage,
+            },
+        )
+
+    invocation = await client(
+        httpx.MockTransport(handler), price=Decimal("2.5")
+    ).request(facts, call_type=AgentCallType.PRIMARY)
+
+    assert invocation.response is not None
+    assert invocation.error_code is None
+    record = invocation.records[0]
+    assert (record.prompt_tokens, record.completion_tokens, record.total_tokens) == (0, 0, 0)
+    assert record.estimated_cost == Decimal("0.000000")
 
 
 def test_degraded_drafts_are_fixed_chinese_and_cover_trusted_candidates() -> None:
