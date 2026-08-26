@@ -23,6 +23,7 @@ from backend.analysis_agent import (
 from backend.analysis_runs import (
     claim_next_analysis_run,
     fail_analysis_run,
+    finalize_analysis_run,
     persist_analysis_completion,
     renew_analysis_lease,
     update_analysis_step,
@@ -44,6 +45,43 @@ class LeaseLostError(RuntimeError):
 
 class CheckpointFailure(RuntimeError):
     pass
+
+
+class _CheckpointBoundary(BaseCheckpointSaver):
+    def __init__(self, saver: BaseCheckpointSaver) -> None:
+        super().__init__(serde=saver.serde)
+        self._saver = saver
+
+    @property
+    def config_specs(self):
+        return self._saver.config_specs
+
+    def get_next_version(self, current, channel):
+        return self._saver.get_next_version(current, channel)
+
+    async def aget_tuple(self, *args, **kwargs):
+        try:
+            return await self._saver.aget_tuple(*args, **kwargs)
+        except CheckpointFailure:
+            raise
+        except Exception:
+            raise CheckpointFailure() from None
+
+    async def aput(self, *args, **kwargs):
+        try:
+            return await self._saver.aput(*args, **kwargs)
+        except CheckpointFailure:
+            raise
+        except Exception:
+            raise CheckpointFailure() from None
+
+    async def aput_writes(self, *args, **kwargs):
+        try:
+            return await self._saver.aput_writes(*args, **kwargs)
+        except CheckpointFailure:
+            raise
+        except Exception:
+            raise CheckpointFailure() from None
 
 
 class _WorkflowFailure(RuntimeError):
@@ -222,7 +260,7 @@ def build_analysis_graph(
             )
             if not facts.candidates:
                 raise ValueError
-        except (SQLAlchemyError, ValueError, TypeError):
+        except Exception:
             raise _WorkflowFailure("FACT_COLLECTION_ERROR") from None
         return {"facts": facts.model_dump(mode="json")}
 
@@ -328,6 +366,7 @@ def build_analysis_graph(
                     "status": state["quality_status"],
                     "error_code": state.get("error_code"),
                 },
+                finalize=False,
             )
         except SQLAlchemyError as error:
             raise _WorkflowFailure("DATABASE_ERROR") from error
@@ -347,7 +386,7 @@ def build_analysis_graph(
     graph.add_edge("call_analysis_agent", "validate_and_reconcile")
     graph.add_edge("validate_and_reconcile", "persist_results")
     graph.add_edge("persist_results", END)
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile(checkpointer=_CheckpointBoundary(checkpointer))
 
 
 async def _fail_current_run(
@@ -387,16 +426,30 @@ async def run_once(
                 checkpointer=checkpointer,
                 transport=transport,
             )
-            await graph.ainvoke(
+            state = await graph.ainvoke(
                 {"workflow_run_id": run.id},
                 config={"configurable": {"thread_id": run.id}},
             )
+            try:
+                finalized = await finalize_analysis_run(
+                    session,
+                    workflow_run_id=run.id,
+                    lease_owner=lease_owner,
+                    candidate_count=len(state["candidates"]),
+                    quality_status=WorkflowQuality(state["quality_status"]),
+                    quality={
+                        "status": state["quality_status"],
+                        "error_code": state.get("error_code"),
+                    },
+                )
+            except SQLAlchemyError as error:
+                raise _WorkflowFailure("DATABASE_ERROR") from error
+            if not finalized:
+                raise LeaseLostError()
         except LeaseLostError:
             return run.id
         except _WorkflowFailure as error:
             await _fail_current_run(session_factory, run.id, lease_owner, error.error_code)
         except CheckpointFailure:
-            await _fail_current_run(session_factory, run.id, lease_owner, "CHECKPOINT_ERROR")
-        except Exception:
             await _fail_current_run(session_factory, run.id, lease_owner, "CHECKPOINT_ERROR")
         return run.id

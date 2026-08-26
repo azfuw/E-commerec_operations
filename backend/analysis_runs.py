@@ -165,6 +165,7 @@ async def persist_analysis_completion(
     calls: list[AgentCallRecord],
     quality_status: WorkflowQuality,
     quality: dict[str, object],
+    finalize: bool = True,
 ) -> bool:
     run = await session.scalar(
         select(WorkflowRun)
@@ -225,15 +226,41 @@ async def persist_analysis_completion(
             )
         )
 
-    run.status = WorkflowStatus.AWAITING_SELECTION
-    run.quality_status = quality_status
-    run.lease_owner = None
-    run.lease_expires_at = None
     run.current_step = "persist_results"
-    run.output = {"candidate_count": len(candidates)}
-    run.quality = quality
+    if finalize:
+        run.status = WorkflowStatus.AWAITING_SELECTION
+        run.quality_status = quality_status
+        run.lease_owner = None
+        run.lease_expires_at = None
+        run.output = {"candidate_count": len(candidates)}
+        run.quality = quality
     await session.commit()
     return True
+
+
+async def finalize_analysis_run(
+    session: AsyncSession,
+    *,
+    workflow_run_id: str,
+    lease_owner: str,
+    candidate_count: int,
+    quality_status: WorkflowQuality,
+    quality: dict[str, object],
+) -> bool:
+    return await _commit_owned_update(
+        session,
+        update(WorkflowRun)
+        .where(*_owned_lease(workflow_run_id, lease_owner))
+        .values(
+            status=WorkflowStatus.AWAITING_SELECTION,
+            quality_status=quality_status,
+            lease_owner=None,
+            lease_expires_at=None,
+            current_step="persist_results",
+            output={"candidate_count": candidate_count},
+            quality=quality,
+        ),
+    )
 
 
 async def fail_analysis_run(

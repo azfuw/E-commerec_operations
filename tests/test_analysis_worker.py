@@ -168,6 +168,13 @@ async def test_run_once_processes_one_accepted_run_with_trusted_candidates(
     assert len(facts.candidates) == 5
     run_id = await _new_run(seeded_worker)
     untouched_run_id = await _new_run(seeded_worker)
+    async with factory() as session:
+        run = await session.get(WorkflowRun, run_id)
+        untouched = await session.get(WorkflowRun, untouched_run_id)
+        assert run is not None and untouched is not None
+        run.created_at = datetime(2026, 8, 25, tzinfo=UTC)
+        untouched.created_at = datetime(2026, 8, 25, 0, 0, 1, tzinfo=UTC)
+        await session.commit()
 
     processed_id = await analysis_worker.run_once(
         factory,
@@ -232,13 +239,17 @@ async def test_claim_orders_accepted_reclaims_expired_and_never_claims_terminal_
         expired = await session.get(WorkflowRun, expired_id)
         exhausted = await session.get(WorkflowRun, exhausted_id)
         terminal = await session.get(WorkflowRun, terminal_id)
-        assert expired is not None and exhausted is not None and terminal is not None
+        accepted = await session.get(WorkflowRun, accepted_id)
+        assert accepted is not None and expired is not None and exhausted is not None and terminal is not None
         for run, attempts in ((expired, 2), (exhausted, 3)):
             run.status = WorkflowStatus.PROCESSING
             run.lease_owner = "old-worker"
             run.lease_expires_at = datetime.now(UTC) - timedelta(seconds=5)
             run.attempt_count = attempts
         terminal.status = WorkflowStatus.AWAITING_SELECTION
+        ordered_runs = (accepted, expired, exhausted, terminal)
+        for seconds, run in enumerate(ordered_runs):
+            run.created_at = datetime(2026, 8, 25, 1, 0, seconds, tzinfo=UTC)
         await session.commit()
 
     async with factory() as session:
@@ -573,7 +584,7 @@ async def test_fact_and_checkpoint_failures_are_terminal_only_for_the_current_le
     assert isinstance(factory, async_sessionmaker)
 
     async def bad_facts(*_args, **_kwargs):
-        raise ValueError("deterministic input mismatch")
+        raise RuntimeError("deterministic fact collection failed")
 
     monkeypatch.setattr(analysis_worker, "collect_analysis_facts", bad_facts)
     fact_run = await _new_run(seeded_worker)
@@ -590,8 +601,8 @@ async def test_fact_and_checkpoint_failures_are_terminal_only_for_the_current_le
     monkeypatch.setattr(analysis_worker, "collect_analysis_facts", collect_analysis_facts)
 
     class FailingReadSaver(InMemorySaver):
-        async def aget_tuple(self, _config):
-            raise analysis_worker.CheckpointFailure()
+        def get_tuple(self, _config):
+            raise RuntimeError("checkpoint read failed")
 
     checkpoint_run = await _new_run(seeded_worker)
     await analysis_worker.run_once(
@@ -603,6 +614,24 @@ async def test_fact_and_checkpoint_failures_are_terminal_only_for_the_current_le
     )
     checkpoint_failed = await _read_run(factory, checkpoint_run)
     assert (checkpoint_failed.status, checkpoint_failed.error_code) == (
+        WorkflowStatus.FAILED,
+        "CHECKPOINT_ERROR",
+    )
+
+    class FailingWriteSaver(InMemorySaver):
+        def put_writes(self, *_args, **_kwargs):
+            raise RuntimeError("checkpoint consistency write failed")
+
+    checkpoint_write_run = await _new_run(seeded_worker)
+    await analysis_worker.run_once(
+        factory,
+        settings=settings,
+        lease_owner="worker-checkpoint-write",
+        checkpointer=FailingWriteSaver(),
+        transport=valid_transport,
+    )
+    checkpoint_write_failed = await _read_run(factory, checkpoint_write_run)
+    assert (checkpoint_write_failed.status, checkpoint_write_failed.error_code) == (
         WorkflowStatus.FAILED,
         "CHECKPOINT_ERROR",
     )
@@ -628,3 +657,65 @@ async def test_fact_and_checkpoint_failures_are_terminal_only_for_the_current_le
     )
     stale = await _read_run(factory, stale_run)
     assert (stale.status, stale.lease_owner) == (WorkflowStatus.PROCESSING, "new-checkpoint-owner")
+
+
+async def test_unexpected_non_checkpoint_runtime_is_not_misreported(
+    seeded_worker, settings, valid_transport, monkeypatch
+) -> None:
+    factory = seeded_worker["factory"]
+    assert isinstance(factory, async_sessionmaker)
+
+    def unexpected_merge(*_args, **_kwargs):
+        raise RuntimeError("unexpected worker defect")
+
+    monkeypatch.setattr(analysis_worker, "_merge_candidates", unexpected_merge)
+    run_id = await _new_run(seeded_worker)
+    with pytest.raises(RuntimeError, match="unexpected worker defect"):
+        await analysis_worker.run_once(
+            factory,
+            settings=settings,
+            lease_owner="worker-unexpected",
+            checkpointer=InMemorySaver(),
+            transport=valid_transport,
+        )
+    run = await _read_run(factory, run_id)
+    assert (run.status, run.error_code) == (WorkflowStatus.PROCESSING, None)
+
+
+async def test_final_checkpoint_save_failure_fails_before_completion(
+    seeded_worker, settings, valid_transport
+) -> None:
+    class RecordingFailingSaver(InMemorySaver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.save_count = 0
+
+        def put(self, *args, **kwargs):
+            self.save_count += 1
+            if self.save_count == 7:
+                raise RuntimeError("final checkpoint save failed")
+            return super().put(*args, **kwargs)
+
+    factory = seeded_worker["factory"]
+    assert isinstance(factory, async_sessionmaker)
+    saver = RecordingFailingSaver()
+    run_id = await _new_run(seeded_worker)
+    processed_id = await analysis_worker.run_once(
+        factory,
+        settings=settings,
+        lease_owner="worker-recording",
+        checkpointer=saver,
+        transport=valid_transport,
+    )
+    assert processed_id == run_id
+    run = await _read_run(factory, run_id)
+    assert saver.save_count == 7
+    assert (run.status, run.error_code, run.lease_owner) == (
+        WorkflowStatus.FAILED,
+        "CHECKPOINT_ERROR",
+        None,
+    )
+    async with factory() as session:
+        assert await session.scalar(
+            select(func.count(AnalysisCandidate.id)).where(AnalysisCandidate.workflow_run_id == run_id)
+        ) == 5
