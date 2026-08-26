@@ -327,6 +327,7 @@ Expected: new API tests and existing JWT/store-scope tests pass; no route starts
 ```powershell
 git add backend/analysis_runs.py backend/schemas.py backend/routes.py tests/test_analysis_api.py
 git commit -m "feat: add analysis run API"
+```
 
 ### Task 3: Deterministic facts and bounded DeepSeek client
 
@@ -374,6 +375,8 @@ class AgentAnalysisResponse(BaseModel):
 class AgentSchemaError(ValueError):
     pass
 
+BeforeHttpAttempt = Callable[[AgentCallType, int], Awaitable[bool]]
+
 @dataclass(frozen=True)
 class AgentCallRecord:
     node_name: str
@@ -400,6 +403,8 @@ async def collect_analysis_facts(
     session: AsyncSession, store_id: str, start_date: date, end_date: date
 ) -> AnalysisFacts: ...
 
+def parse_agent_response(content: str) -> AgentAnalysisResponse: ...
+
 def validate_agent_response(
     facts: AnalysisFacts, response: AgentAnalysisResponse
 ) -> list[AgentCandidateDraft]: ...
@@ -410,7 +415,11 @@ class DeepSeekAnalysisClient:
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None) -> None: ...
 
     async def request(
-        self, facts: AnalysisFacts, *, call_type: AgentCallType
+        self,
+        facts: AnalysisFacts,
+        *,
+        call_type: AgentCallType,
+        before_http_attempt: BeforeHttpAttempt | None = None,
     ) -> AgentInvocation: ...
 ```
 
@@ -433,7 +442,7 @@ async def test_collect_facts_calls_all_existing_tools_and_preserves_server_value
 
 Use a valid structured mock response whose product IDs and ranks match `facts`; after `validate_agent_response()`, assert the only accepted model values are the four explanation fields and confidence. Compare the eventual trusted candidate construction against `facts` so mock-provided product codes, metrics, anomaly types, impact, and evidence cannot overwrite server values.
 
-Parameterize invalid responses for an unknown ID, duplicate ID, missing ID, duplicate rank, non-contiguous rank, confidence `-0.0001`, confidence `1.0001`, extra field, and invalid JSON. Each must raise `AgentSchemaError` after Pydantic parsing or reconciliation. Verify two 429 responses followed by 200 produce exactly three `primary` records; independently cover timeout, transport error, and 5xx with three attempts. Verify 401 and 403 create exactly one safe record, and no key makes zero HTTP requests with error code `DEEPSEEK_KEY_MISSING`.
+Parameterize raw invalid JSON and extra-field/schema responses; `parse_agent_response()` must raise `AgentSchemaError`, while `DeepSeekAnalysisClient.request()` catches that exception and returns `AgentInvocation(response=None, error_code="DEEPSEEK_SCHEMA_INVALID")`. Parameterize valid parsed responses for an unknown ID, duplicate ID, missing ID, duplicate rank, non-contiguous rank, confidence `-0.0001`, and confidence `1.0001`; `validate_agent_response()` must raise `AgentSchemaError` for each. Verify two 429 responses followed by 200 produce exactly three `primary` records; independently cover timeout, transport error, and 5xx with three attempts. Pass a recording `before_http_attempt` callback and assert it is awaited immediately before every attempt with `[(AgentCallType.PRIMARY, 1), (AgentCallType.PRIMARY, 2), (AgentCallType.PRIMARY, 3)]`. Verify 401 and 403 create exactly one safe record, and no key makes zero HTTP requests with error code `DEEPSEEK_KEY_MISSING`.
 
 Assert the fixed Chinese degraded drafts cover exactly the trusted product IDs and ranks, contain the Chinese statement `模型解释暂不可用，请人工核验。`, and carry no invented product facts. Assert every `AgentCallRecord` has a 64-character input hash and no attributes for a request header, prompt body, raw response, key, or authorization value. With no price setting, assert `estimated_cost is None`. Clear `get_settings`' cache around the settings tests, assert the default is `deepseek-flash`, and assert `DEEPSEEK_MODEL` overrides only the model value.
 
@@ -447,11 +456,11 @@ Expected: collection fails because the fact schemas and `backend.analysis_agent`
 
 `collect_analysis_facts()` calls the existing functions in this fixed sequence: one `get_store_summary`, one `find_anomalous_products(..., limit=5)`, then for the selected candidate IDs one `get_product_metrics` per ID, one `compare_store_products` for the full selected ID list, and one `get_inventory_risk` per ID. Construct `TrustedAnalysisCandidate` solely from their results; preserve the anomaly function's candidate order and evidence. Raise a normal Python exception if any deterministic call fails so the Worker can classify it as a fact failure.
 
-Build a canonical, non-secret JSON representation of `AnalysisFacts` with sorted object keys and compute `sha256(...).hexdigest()` for `input_hash`. The JSON request body sent to DeepSeek contains the approved facts and a response schema asking only for `product_id`, `rank`, `impact_explanation`, `reason`, `recommended_action`, and `confidence`; it excludes credentials and is neither persisted nor logged.
+Build a canonical, non-secret JSON representation of `AnalysisFacts` with sorted object keys and compute `sha256(...).hexdigest()` for `input_hash`. Send the JSON request body only to the compatible Chat Completions endpoint with `POST /chat/completions`; it contains the approved facts and a response schema asking only for `product_id`, `rank`, `impact_explanation`, `reason`, `recommended_action`, and `confidence`, excludes credentials, and is neither persisted nor logged.
 
-`DeepSeekAnalysisClient.request()` uses one local `httpx.AsyncClient` with the configured base URL, timeout, and a transient bearer header. It retries only `httpx.TimeoutException`, `httpx.TransportError`, HTTP 429, and HTTP 500 through 599: initial request plus two retries. It records safe metadata for every attempted request. It makes no retry for missing key, 401, or 403. It parses only the model content JSON into `AgentAnalysisResponse`; caller-visible errors are stable safe codes such as `DEEPSEEK_TIMEOUT`, `DEEPSEEK_TRANSPORT`, `DEEPSEEK_RATE_LIMIT`, `DEEPSEEK_SERVER_ERROR`, `DEEPSEEK_UNAUTHORIZED`, `DEEPSEEK_FORBIDDEN`, and `DEEPSEEK_SCHEMA_INVALID`.
+Import `Awaitable` and `Callable` from `collections.abc`. `DeepSeekAnalysisClient.request()` uses one local `httpx.AsyncClient` with the configured base URL, timeout, transient bearer header, and `POST /chat/completions`. Before the initial request and before every retry, it awaits `before_http_attempt(call_type, attempt)`. If the callback returns `False`, it sends no HTTP request, records no new external attempt, and returns `AgentInvocation(response=None, error_code="LEASE_LOST")`; the Worker then stops without fallback or writes. It retries only `httpx.TimeoutException`, `httpx.TransportError`, HTTP 429, and HTTP 500 through 599: initial request plus two retries. It records safe metadata for every sent request. It makes no retry for missing key, 401, or 403. It calls `parse_agent_response()` on only the model content JSON and catches `AgentSchemaError`, returning `AgentInvocation(response=None, error_code="DEEPSEEK_SCHEMA_INVALID")`; caller-visible errors are otherwise stable safe codes such as `DEEPSEEK_TIMEOUT`, `DEEPSEEK_TRANSPORT`, `DEEPSEEK_RATE_LIMIT`, `DEEPSEEK_SERVER_ERROR`, `DEEPSEEK_UNAUTHORIZED`, and `DEEPSEEK_FORBIDDEN`.
 
-`validate_agent_response()` requires exact product-ID coverage, unique product IDs, rank set exactly `1..N`, and the already bounded confidence values. `build_degraded_drafts()` derives rank and all four permitted model fields from candidate order using the fixed Chinese message; the next task will merge these drafts back onto trusted facts. Do not add a DeepSeek SDK, vendor factory, prompt persistence, response persistence, or logging of request/response bodies.
+`validate_agent_response()` requires exact product-ID coverage, unique product IDs, rank set exactly `1..N`, and the already bounded confidence values. Its `AgentSchemaError`, or `DEEPSEEK_SCHEMA_INVALID` from `request()`, makes the Worker issue exactly one schema-repair request. `build_degraded_drafts()` derives rank and all four permitted model fields from candidate order using the fixed Chinese message; the Worker reconciles those drafts to trusted facts by product ID. Do not add a DeepSeek SDK, vendor factory, prompt persistence, response persistence, or logging of request/response bodies.
 
 - [ ] **Step 4: Run GREEN agent tests and existing analytics regression**
 
@@ -469,6 +478,7 @@ Expected: all agent tests use `MockTransport`, the default model assertion is `d
 ```powershell
 git add pyproject.toml .env.example backend/config.py backend/schemas.py backend/analysis_agent.py tests/test_analysis_agent.py
 git commit -m "feat: add bounded analysis agent client"
+```
 ### Task 4: Checkpointed PostgreSQL lease Worker and idempotent persistence
 
 **Files:**
@@ -521,6 +531,12 @@ async def fail_analysis_run(
 
 ```python
 # backend/analysis_worker.py
+class LeaseLostError(RuntimeError):
+    pass
+
+class CheckpointFailure(RuntimeError):
+    pass
+
 class AnalysisWorkflowState(TypedDict, total=False):
     workflow_run_id: str
     store_id: str
@@ -583,7 +599,9 @@ Assert exactly five persisted candidates and verify each persisted `product_code
 
 Test one `run_once()` claims no more than one accepted run; `accepted` is claimed before expired `processing` in creation order; terminal rows return `None`; a stale `processing` row with `attempt_count=3` becomes `failed/LEASE_ATTEMPTS_EXHAUSTED` without a fourth claim; and an expired row with count 2 is reclaimed once with count 3. Directly replace `lease_owner` in the test database, then assert `renew_analysis_lease`, `persist_analysis_completion`, and `fail_analysis_run` return `False` for the old owner and do not change the replacement owner's row.
 
-Parameterize model outcomes for timeout, transport error, 429, 5xx, missing key, 401, 403, invalid primary response followed by invalid schema-repair response. Each must end `awaiting_selection/degraded` with five Chinese fallback candidates, safe error metadata, and no more than three transport attempts per logical request. Assert exactly one `schema_repair` logical request follows a schema error and no repair follows non-schema errors. Inject an exception from deterministic fact collection and an exception from a checkpointer test double; each must result in `failed` with its safe fact/checkpoint error code, never a degradation.
+Use a recording wrapper around `renew_analysis_lease` and a `MockTransport` sequence `429, 429, 200` to prove the Worker invokes the `before_http_attempt` callback, receives `True`, and then sends each `primary` attempt in the exact order `renew(1), post(1), renew(2), post(2), renew(3), post(3)`. Repeat with a primary schema error and a valid repair response to prove `renew(AgentCallType.SCHEMA_REPAIR, 1)` occurs before the repair POST. Make the callback return `False` after a replacement owner takes the lease; assert the old Worker sends no further HTTP request and neither persists candidates/calls nor changes the replacement owner's row.
+
+Parameterize model outcomes for timeout, transport error, 429, 5xx, missing key, 401, 403, and `DEEPSEEK_SCHEMA_INVALID` from both primary and schema-repair requests. Each LLM failure except `LEASE_LOST` must end `awaiting_selection/degraded` with five Chinese fallback candidates, safe error metadata, and no more than three transport attempts per logical request. Assert exactly one `schema_repair` logical request follows a schema error and no repair follows non-schema errors. Inject an exception from deterministic fact collection; it must result in `failed` with a safe fact error code, never a degradation. Inject `CheckpointFailure` from the checkpointer during `graph.ainvoke()`; while the lease remains valid, assert outer `run_once()` handling calls `fail_analysis_run(..., error_code="CHECKPOINT_ERROR")` and yields `failed`. Repeat after replacing the lease owner and assert `fail_analysis_run()` returns `False`, no terminal overwrite occurs, and the old Worker stops.
 
 Run normal completion twice against the same checkpoint and call `persist_analysis_completion()` twice with the same data. Assert candidate count and `agent_calls` count remain unchanged, and the latter's unique keys are `(workflow_run_id, node_name, call_type, attempt)`. Assert `estimated_cost is None` when the configured price is absent and inspect only persisted column names/values for the absence of credential, authorization, prompt, raw-response, and chain-of-thought fields.
 
@@ -626,20 +644,20 @@ Every renewal, node-step update, completion, and failure update filters `id`, `s
 START -> load_run -> collect_facts -> call_analysis_agent -> validate_and_reconcile -> persist_results -> END
 ```
 
-`load_run` reads the lease-owned run, verifies `workflow_type="analysis"`, persisted date strings, and `processing` state, then calls `update_analysis_step(..., current_step="load_run")`. `collect_facts` sets `current_step="collect_facts"`, calls the Task 3 collector, and stores only normalized trusted facts in graph state. `call_analysis_agent` renews the lease immediately before the request, calls `DeepSeekAnalysisClient.request(..., call_type=AgentCallType.PRIMARY)`, and stores only parsed draft fields plus safe `AgentCallRecord`s in state.
+`load_run` reads the lease-owned run, verifies `workflow_type="analysis"`, persisted date strings, and `processing` state, then calls `update_analysis_step(..., current_step="load_run")`. `collect_facts` sets `current_step="collect_facts"`, calls `collect_analysis_facts()`, and stores only normalized trusted facts in graph state. `call_analysis_agent` creates a minimal closure `before_http_attempt(call_type, attempt) -> bool` that calls `renew_analysis_lease(session, workflow_run_id=workflow_run.id, lease_owner=lease_owner, lease_seconds=settings.analysis_lease_seconds)` using PostgreSQL `now()`. It passes that closure to `DeepSeekAnalysisClient.request(..., call_type=AgentCallType.PRIMARY)` so every initial and retried POST renews immediately beforehand. A `False` callback result becomes `LeaseLostError`; the old Worker stops without further external calls, completion, degradation, or failure writes. The node stores only parsed draft fields plus safe `AgentCallRecord`s in state.
 
-`validate_and_reconcile` calls `update_analysis_step(..., current_step="validate_and_reconcile")`. It validates exact coverage/ranks/confidence. On a schema error only, it renews the lease and makes exactly one `SCHEMA_REPAIR` request, then validates once more. Missing key, 401, 403, exhausted transport failure, and a remaining schema error use `build_degraded_drafts()` and set `quality_status=degraded`; they are not `failed`. It merges each approved or degraded draft onto the matching trusted candidate by product ID, so all fact fields originate from `AnalysisFacts`.
+`validate_and_reconcile` calls `update_analysis_step(..., current_step="validate_and_reconcile")`. It validates exact coverage/ranks/confidence. On `AgentSchemaError` from validation or `AgentInvocation.error_code="DEEPSEEK_SCHEMA_INVALID"` from parsing, it makes exactly one `SCHEMA_REPAIR` request with the same per-attempt renewal closure, then validates once more. A false repair callback raises `LeaseLostError` and stops the old Worker. Missing key, 401, 403, exhausted transport failure, and a remaining schema error use `build_degraded_drafts()` and set `quality_status=degraded`; they are not `failed`. It merges each approved or degraded draft onto the matching trusted candidate by product ID, so all fact fields originate from `AnalysisFacts`.
 
-`persist_results` renews before its database work, calls `persist_analysis_completion()`, and refuses to overwrite if it lost the lease. Add a safe attempt-0 `AgentCallRecord` for a degradation decision. Node exceptions representing deterministic input/fact/checkpoint/lease consistency errors exit the graph through `fail_analysis_run()` with a stable code; no LLM call can convert one of these failures to degraded.
+`persist_results` renews before its database work, calls `persist_analysis_completion()`, and refuses to overwrite if it lost the lease. Add a safe attempt-0 `AgentCallRecord` for a degradation decision. Deterministic input/fact errors exit through `fail_analysis_run()` with a stable code; no LLM call can convert one of these failures to degraded. Configure the checkpointer boundary to normalize read, save, and consistency failures into `CheckpointFailure`, preserving the original exception only in controlled local diagnostics rather than a workflow row.
 
-Implement `run_once()` so it claims at most one run using a short-lived async session, invokes the graph with:
+Implement `run_once()` so it claims at most one run using a short-lived async session, invokes the graph with an outer `try`/`except`, and uses:
 
 ```python
 config = {"configurable": {"thread_id": workflow_run.id}}
 await graph.ainvoke({"workflow_run_id": workflow_run.id}, config=config)
 ```
 
-It returns `None` for no claim and the claimed ID otherwise. The script supplies the production `AsyncPostgresSaver`; tests supply `InMemorySaver`. The script creates a process-unique owner such as `f"{socket.gethostname()}:{os.getpid()}"`, never prints settings or secrets, and sleeps only when a non-`--once` poll finds no row.
+On `CheckpointFailure` from `graph.ainvoke()`, open a fresh session and call `fail_analysis_run(..., error_code="CHECKPOINT_ERROR")`. That function's owner-and-unexpired-lease predicate decides the outcome: commit `failed` only when it returns `True`; when it returns `False`, stop without any state overwrite. On `LeaseLostError`, stop without calling `fail_analysis_run()`. It returns `None` for no claim and the claimed ID otherwise. The script supplies the production `AsyncPostgresSaver`; tests supply `InMemorySaver`. The script creates a process-unique owner such as `f"{socket.gethostname()}:{os.getpid()}"`, never prints settings or secrets, and sleeps only when a non-`--once` poll finds no row.
 
 - [ ] **Step 5: Run GREEN Worker tests and static verification**
 
@@ -659,6 +677,7 @@ Expected: Worker tests pass with no external network access, all modules compile
 ```powershell
 git add pyproject.toml backend/config.py backend/analysis_runs.py backend/analysis_worker.py scripts/run_analysis_worker.py tests/test_analysis_worker.py
 git commit -m "feat: add durable analysis worker"
+```
 ### Task 5: PostgreSQL vertical acceptance and explicit DeepSeek smoke test
 
 **Files:**
@@ -702,7 +721,9 @@ assert {run.id for run in claimed if run is not None} == {first_run.id, second_r
 
 Set one test row's lease expiry with PostgreSQL `now() - interval '1 second'`, assert a new owner reclaims it, then prove the old owner cannot finish it. Create an expired attempt-3 row and assert it reaches `failed` rather than a fourth claim. Confirm terminal `awaiting_selection` and `failed` rows never appear in `claim_next_analysis_run()`.
 
-For checkpoint recovery, compile a graph with `AsyncPostgresSaver` and invoke it with `interrupt_after=["collect_facts"]` and `thread_id=workflow_run.id`. Read the checkpoint tuple and assert safe facts exist but no key, header, prompt, or raw response does. Compile a fresh graph with the same saver/thread ID and resume it; assert it reaches `awaiting_selection` without duplicate candidates or calls. The LLM transport for this entire test is a valid `MockTransport` response.
+Use the real PostgreSQL `renew_analysis_lease()` through a recording wrapper and a `MockTransport` sequence `429, 429, 200`; assert each POST follows a successful server-timed renewal for attempts 1, 2, and 3. Repeat for a primary schema error followed by a valid repair response, asserting the repair POST follows its own successful renewal. After a second session replaces the lease owner, make the next callback return `False`; assert the original Worker sends no later POST and cannot persist or finish the run.
+
+For checkpoint recovery, compile a graph with `AsyncPostgresSaver` and invoke it with `interrupt_after=["collect_facts"]` and `thread_id=workflow_run.id`. Read the checkpoint tuple and assert safe facts exist but no key, header, prompt, or raw response does. Compile a fresh graph with the same saver/thread ID and resume it; assert it reaches `awaiting_selection` without duplicate candidates or calls. Inject `CheckpointFailure` from checkpointer read, save, and consistency paths around `graph.ainvoke()`: with an unexpired matching lease, assert outer `run_once()` writes `failed/CHECKPOINT_ERROR`; after a different owner reclaims the lease, assert that old invocation stops with no overwrite. The LLM transport for this entire test is a valid `MockTransport` response.
 
 Add the vertical assertion that `run_once()` completes exactly one seeded run to `awaiting_selection/normal`, creates five candidates, calls all five deterministic tools through the graph, retains database-derived fact fields, and writes only the permitted safe `agent_calls` columns. Query candidate and call counts after a second completion/persistence attempt and assert they are unchanged.
 
@@ -800,10 +821,10 @@ git commit -m "test: verify durable analysis slice"
 
 ## Plan Self-Review Checklist
 
-- [ ] Read the approved spec section by section and confirm the mapping below before implementation begins.
-- [ ] Search this plan for placeholder language and replace each match with executable detail.
-- [ ] Reconcile every later interface against Tasks 1–4: workflow status/quality enum names, `AgentCallType`, request schemas, `AnalysisFacts`, lease function parameters, graph state keys, and `run_once()` parameters must be identical.
-- [ ] Confirm `git diff --check` is clean before the implementation-plan handoff commit.
+- [x] Read the approved spec section by section and confirm the mapping below.
+- [x] Search this plan for placeholder language and replace each match with executable detail.
+- [x] Reconcile every later interface against its preceding definitions: workflow status/quality enum names, `AgentCallType`, request schemas, `AnalysisFacts`, lease function parameters, graph state keys, and `run_once()` parameters.
+- [x] Confirm `git diff --check` is clean before the implementation-plan handoff commit.
 
 ## Approved-spec Coverage Map
 
@@ -816,9 +837,3 @@ git commit -m "test: verify durable analysis slice"
 | LangGraph PostgreSQL checkpointer, thread ID, checkpoint resume, candidate/call idempotency | Tasks 4 and 5 |
 | Mock-only ordinary tests, PostgreSQL seeded five-candidate closure, explicit real smoke | Task 5 |
 | Excluded Worker service, queues, RAG, selection endpoint, frontend, and platform integration | Global Constraints and every task's file list |
-
-```
-
-```
-
-```
