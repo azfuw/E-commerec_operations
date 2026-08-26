@@ -99,7 +99,7 @@ async def _run_smoke(
 
     async def allow_post(_call_type: AgentCallType, _attempt: int) -> bool:
         nonlocal posts
-        if posts >= 2:
+        if _attempt != 1 or posts >= 2:
             return False
         posts += 1
         return True
@@ -190,7 +190,7 @@ async def test_smoke_orchestration_stops_after_one_invalid_repair() -> None:
     assert result.error_code == "DEEPSEEK_SCHEMA_INVALID"
 
 
-async def test_smoke_orchestration_caps_transient_retries_at_two_posts() -> None:
+async def test_smoke_orchestration_stops_transient_primary_after_one_post() -> None:
     posts = 0
 
     async def handler(_request: httpx.Request) -> httpx.Response:
@@ -202,8 +202,9 @@ async def test_smoke_orchestration_caps_transient_retries_at_two_posts() -> None
         _mock_client(httpx.MockTransport(handler)), minimal_trusted_facts()
     )
 
-    assert posts == 2
-    assert len(result.records) == 2
+    assert posts == 1
+    assert [record.call_type for record in result.records] == [AgentCallType.PRIMARY]
+    assert [record.attempt for record in result.records] == [1]
     assert result.error_code == "LEASE_LOST"
 
 
