@@ -158,3 +158,34 @@ class AnalysisCandidateView(BaseModel):
     reason: str
     recommended_action: str
     confidence: Decimal
+
+
+class TrustedAnalysisCandidate(BaseModel):
+    product_id: str
+    product_code: str
+    anomaly_types: list[str]
+    metrics: ProductMetrics
+    business_impact: Decimal
+    evidence: list[str]
+
+
+class AnalysisFacts(BaseModel):
+    store_summary: StoreMetrics
+    candidates: list[TrustedAnalysisCandidate]
+
+
+class AgentCandidateDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: str
+    rank: int
+    impact_explanation: str
+    reason: str
+    recommended_action: str
+    confidence: Decimal = Field(ge=0, le=1)
+
+
+class AgentAnalysisResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[AgentCandidateDraft]
