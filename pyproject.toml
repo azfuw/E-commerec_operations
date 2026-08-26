@@ -28,3 +28,7 @@ test = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "postgres_integration: requires the configured local PostgreSQL service",
+  "deepseek_smoke: explicit real deepseek-flash smoke test",
+]
