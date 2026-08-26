@@ -759,12 +759,14 @@ async def test_explicit_deepseek_v4_flash_schema_smoke() -> None:
     if settings.deepseek_api_key is None:
         pytest.skip("DeepSeek key is not configured")
     client = DeepSeekAnalysisClient(settings)
-    result = await client.request(minimal_trusted_facts(), call_type=AgentCallType.PRIMARY)
+    result = await _run_smoke(client, minimal_trusted_facts())
     assert result.response is not None
-    assert result.records[-1].model == "deepseek-v4-flash"
+    assert 1 <= len(result.records) <= 2
+    assert result.records[0].call_type is AgentCallType.PRIMARY
+    assert all(record.model == "deepseek-v4-flash" for record in result.records)
 ```
 
-`minimal_trusted_facts()` contains one local synthetic product and no user credentials. The smoke test asserts only parsed schema and safe record metadata; it neither prints nor writes the result body.
+`_run_smoke()` is a test-only orchestrator that reuses `DeepSeekAnalysisClient`, `AgentCallType`, and `validate_agent_response()`. It makes the primary request first, performs exactly one `schema_repair` only when the primary result is `DEEPSEEK_SCHEMA_INVALID` or fails trusted-set validation, and validates the repair once without recursion. A shared `before_http_attempt` callback permits no more than two total POSTs across the smoke run, so transient client retries cannot exceed the test's external-call budget. `minimal_trusted_facts()` contains one local synthetic product and no user credentials. Default-run MockTransport tests prove invalid-primary/valid-repair, valid-primary/no-repair, invalid-repair/no-recursion, and the two-POST cap; the smoke test asserts only parsed schema and safe record metadata and neither prints nor writes the result body.
 
 - [ ] **Step 2: Run the new tests and observe RED**
 
@@ -780,7 +782,7 @@ Expected: collection fails because the markers and test modules do not exist. Af
 
 Register the two markers in `pyproject.toml`; do not add a test database service or new environment-file values. Build the PostgreSQL fixture from the configured application session factory, run `await checkpointer.setup()` before the graph, and clean up only records created by test IDs. Use `seed_demo_data(session)` for prerequisite facts and do not reset, drop, truncate, or broadly delete project data.
 
-The real smoke test retains the exact `deepseek-v4-flash` assertion. Its opt-in command below temporarily sets only non-secret feature/model flags; the key remains in the operator's already-configured secret source and is never read, echoed, asserted, or persisted by test code.
+The real smoke test retains the exact `deepseek-v4-flash` assertion. One opt-in pytest smoke run makes a primary POST and, only on `DEEPSEEK_SCHEMA_INVALID`, one `schema_repair` POST; no valid primary triggers repair and no invalid repair triggers another repair. Its shared callback caps all external POSTs, including transient client retries, at two. The key remains in the operator's already-configured secret source and is never read, echoed, asserted, or persisted by test code.
 
 - [ ] **Step 4: Run the required PostgreSQL closed loop and the full normal suite**
 
@@ -814,7 +816,7 @@ Remove-Item Env:RUN_DEEPSEEK_SMOKE
 Remove-Item Env:DEEPSEEK_MODEL
 ```
 
-Expected: one real, minimal structured request passes using `deepseek-v4-flash`; command output contains no key, authorization value, prompt, or response body. If the operator has not authorized this step or no private key is configured, leave the test skipped and report that the explicit external acceptance was not performed rather than fabricating a result.
+Expected: one real smoke run passes using `deepseek-v4-flash` after a primary response or one valid `schema_repair`; it sends no more than two external POSTs and command output contains no key, authorization value, prompt, or response body. If the operator has not authorized this step or no private key is configured, leave the test skipped and report that the explicit external acceptance was not performed rather than fabricating a result.
 
 - [ ] **Step 6: Commit the acceptance coverage**
 
