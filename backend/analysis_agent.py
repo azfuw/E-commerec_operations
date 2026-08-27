@@ -204,9 +204,9 @@ class DeepSeekAnalysisClient:
             "recommended_action, and confidence. impact_explanation、reason、recommended_action "
             "必须使用简洁简体中文。"
             if call_type is AgentCallType.PRIMARY
-            else "仅基于提供的可信 facts 重新生成 JSON。顶层对象只能是 candidates。"
+            else '仅基于提供的可信 facts 重新生成 JSON。顶层 JSON 对象只能包含 "candidates" 键，结构必须为 {"candidates":[...]}。'
             "facts.candidates 中每个 product_id 恰好一项且 ID 原样使用。"
-            "字段只能为 product_id、rank、impact_explanation、reason、recommended_action、confidence。"
+            "candidates 数组中每个对象只能包含 product_id、rank、impact_explanation、reason、recommended_action、confidence 六个字段。"
             "rank 恰为 1..N 且不重复。confidence 是 0..1 数字。"
             "impact_explanation、reason、recommended_action 必须使用简洁简体中文。"
             "仅输出 JSON、无 Markdown、无额外字段。"
