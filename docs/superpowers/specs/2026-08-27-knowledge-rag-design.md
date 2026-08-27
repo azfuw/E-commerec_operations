@@ -71,11 +71,13 @@ FastAPI + PostgreSQL ──本地路径──► data/uploads/knowledge/...
 
 | 表 | 责任 | 关键列与约束 |
 |---|---|---|
-| `knowledge_documents` | 文档身份与当前激活版本 | `id`、`name`、`category`、`enabled`、`current_version_id`、`created_by`、`created_at`、`updated_at`。`current_version_id` 仅可指向同一文档的 `active` 版本；禁用文档的 current version 在查询中永不进入 active ID 集。 |
+| `knowledge_documents` | 文档身份与当前激活版本 | `id`、`name`、`category`、`enabled`、`current_version_id`、`created_by`、`created_at`、`updated_at`。`current_version_id` 只能为 `NULL` 或指向同一文档的 `active` 版本；禁用文档将其清为 `NULL`，且不进入查询的 active ID 集。 |
 | `knowledge_document_versions` | 可恢复的导入版本、租约与处理审计 | `id`、`document_id`、单调 `version_number`、`sha256`、原始文件名、MIME、受控本地路径、`status`、`attempt_count`、`lease_owner`、`lease_expires_at`、解析器版本、分块版本、嵌入版本、`error_code`、时间戳。唯一约束为 `(document_id, version_number)` 与 `(document_id, sha256)`。 |
-| `knowledge_chunks` | 规范正文与引用元数据 | `id`、`version_id`、`chunk_index`、稳定 `chunk_id`、`chunk_hash`、`canonical_text`、标题/段落元数据、`token_count`、时间戳。唯一约束为 `(version_id, chunk_index)`、`(version_id, chunk_hash)` 与全局 `chunk_id`。 |
+| `knowledge_chunks` | 规范正文与引用元数据 | `id`、`version_id`、`chunk_index`、稳定 `chunk_id`、`chunk_hash`、`canonical_text`、标题/段落元数据、`token_count`、时间戳。唯一约束为 `(version_id, chunk_index)` 与全局 `chunk_id`；`chunk_hash` 不唯一，保留同一版本不同位置的合法重复正文。 |
 
-`knowledge_document_versions.status` 只能为 `accepted`、`processing`、`active`、`failed`、`disabled`。`attempt_count` 范围为 0 到 3。只有 `processing` 版本可持有非空 `lease_owner` 与未来的 `lease_expires_at`；所有其他状态都必须清空两项。状态变更、续租、失败和激活均要求匹配当前 owner、`processing` 状态及未过期租约。`active` 和 `disabled` 是终态，不可重新领取。
+`knowledge_document_versions.status` 只能为 `accepted`、`processing`、`active`、`failed`、`disabled`。`attempt_count` 是已成功领取的次数，范围为 0 到 3；只有 `processing` 版本可持有非空 `lease_owner` 与未来的 `lease_expires_at`，所有其他状态都必须清空两项。`accepted` 是首次或可重试处理的可领取队列；`failed` 与 `disabled` 是终态且永不领取；`active` 也不领取，但可在同文档较新版本原子激活或文档停用时转为 `disabled`。
+
+Worker 对版本行的每次领取、续租、重试回队、失败、旧版本终结和激活写入都必须包含 PostgreSQL 条件：匹配版本 ID、`status='processing'`、相同 `lease_owner` 且 `lease_expires_at > now()`。条件更新影响零行即为失租，旧 owner 必须停止，不能覆盖新 owner。领取事务用 `FOR UPDATE SKIP LOCKED` 选择 `accepted AND attempt_count < 3` 或已过期且 `attempt_count < 3` 的 `processing` 行，再原子写入新 owner、未来 expiry 和 `attempt_count + 1`。它还会把已过期且 `attempt_count=3` 的 `processing` 行原子转为 `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`、清空租约且不返回给任何 Worker；旧 owner 无法再写入。
 
 `workflow_runs` 不被泛化为知识任务：现有数据库约束将其限定为 `analysis`，且要求分析日期和店铺输入。知识版本行自身承载租约与恢复状态，避免破坏已验证的经营分析闭环。
 
@@ -92,13 +94,13 @@ Milvus collection 只存可重建的检索字段：稳定字符串 `chunk_id` �
 1. Worker 在 PostgreSQL 领取版本租约，解析并形成稳定 chunks。
 2. Worker 用稳定 `chunk_id` 将该版本全部 dense+sparse 向量幂等 upsert 到 Milvus。
 3. Worker 写入或确认 PostgreSQL `knowledge_chunks` 元数据。
-4. 仅在向量 upsert 与 chunk 元数据成功后，PostgreSQL 单一事务将新版本置为 `active`、更新 `knowledge_documents.current_version_id`，并把前一 active 版本置为 `disabled`。
+4. 仅在向量 upsert 与 chunk 元数据成功后，Worker 在仍持有有效租约时锁定对应 `knowledge_documents` 行。该 PostgreSQL 原子激活事务只在文档 `enabled=true` 且当前 `current_version_id` 为空或其 `version_number` 小于候选版本时，才将候选置为 `active`、更新 `knowledge_documents.current_version_id` 并把前一 `active` 版本置为 `disabled`。
 
-因此查询始终先从 PostgreSQL 取得 `enabled=true` 文档的 active `version_id` 集，再把该集合施加为 Milvus 过滤条件。上载失败的新版本和任何孤儿向量都不在该集合内；旧版本在新版本成功激活前持续服务。重试复用同一 version 和 chunk ID，不会产生重复向量。
+若锁定后发现已存在更高 `version_number` 的 active 版本，较旧候选必须以同一 owner-guard 条件更新为 `disabled/KNOWLEDGE_VERSION_SUPERSEDED`、清空租约，不更新 `current_version_id`；其已写入的 Milvus 向量保留为不可见索引数据。这保证较旧版本绝不能在较新版本已 active 后反向成为 current。查询始终先从 PostgreSQL 取得 `enabled=true` 文档的 active `version_id` 集，再把该集合施加为 Milvus 过滤条件。上载失败的新版本、被 supersede 的旧版本和任何孤儿向量都不在该集合内；旧版本在新版本成功激活前持续服务。重试复用同一 version 和 chunk ID，不会产生重复主键或额外索引记录。
 
 演示规模下，active-version ID filter 是清晰且正确的跨系统可见性边界。其容量边界是单次过滤集合和表达式长度随激活文档数线性增长；在未来需要远大于演示规模时，才评估按索引版本命名空间、分区或异步清理。该阶段不提前建设这些优化，也不为了清理孤儿向量阻塞激活或查询。
 
-停用文档是 PostgreSQL 事务：立即设为 `enabled=false` 并从 active version 集排除。Milvus 向量可保留为不可见的可重建索引数据；未来异步清理不属于本阶段。正在处理的版本在后续 owner-guard 写入时发现文档已禁用，必须停止并保持不可见。
+停用文档是锁定文档行的 PostgreSQL 事务：立即设为 `enabled=false`、清空 `current_version_id`，把该文档的 `accepted`、`processing` 与 `active` 版本置为 `disabled` 并清空租约。Milvus 向量可保留为不可见的可重建索引数据；未来异步清理不属于本阶段。已在外部依赖调用中的旧 owner 随后的 owner-guard 写入影响零行，必须停止，不能重新激活文档。
 
 ## 6. 安全导入与可恢复处理
 
@@ -113,19 +115,25 @@ Milvus collection 只存可重建的检索字段：稳定字符串 `chunk_id` �
 ### 6.2 导入状态机
 
 ```text
-accepted
-  → processing
-  → active
-  → failed
-  → disabled
+accepted --领取（attempt 1..3）--> processing
+processing --成功且激活守卫通过--> active
+processing --可重试失败且 attempt_count<3--> accepted
+processing --不可重试失败--> failed
+processing --可重试失败且 attempt_count=3--> failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED
+processing --租约过期且 attempt_count<3--> processing（新 owner 重新领取）
+processing --租约过期且 attempt_count=3--> failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED
+processing --已被更高 active 版本超越或文档停用--> disabled
+active --更高版本激活或文档停用--> disabled
+accepted --文档停用--> disabled
 ```
 
 - 安全上传后计算 SHA-256。相同 document 与 SHA-256 已存在时，返回既有 version 的安全状态，不创建新版本或新租约。
-- `accepted` 版本可由 Worker 用 PostgreSQL `now()` 与 `FOR UPDATE SKIP LOCKED` 领取；过期 `processing` 版本可恢复领取。
-- 每次领取增加 `attempt_count`；第三次领取失败后转 `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`，不发生第四次领取。
+- `accepted` 版本和未耗尽的过期 `processing` 版本可由 Worker 用 PostgreSQL `now()` 与 `FOR UPDATE SKIP LOCKED` 领取。领取是唯一增加 `attempt_count` 的动作；第三次尝试后不存在第四次领取。
+- 可重试失败仅指模型或 Milvus 的明确 timeout、不可用或可重试连接失败。owner-guard 处理失败时，`attempt_count` 为 1 或 2 的版本转回 `accepted` 并保留安全错误码；为 3 时转 `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`。解析失败、文件结构不合法和安全校验失败是不可重试失败，owner-guard 直接转为 `failed` 并记录其确定错误码；其他未分类处理异常同样直接转 `failed/KNOWLEDGE_PROCESSING_FAILED`，绝不隐式重试。
+- Worker 中断不执行补写：租约到期时，`attempt_count` 为 1 或 2 的版本由新 owner 领取并递增计数；为 3 的版本由领取事务转 `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`，不会被返回处理。数据库事务错误回滚其本次状态写入，行保持 `processing` 直到上述租约到期规则生效。
 - 处理步骤是解析、标题/段落感知分块、local BGE-M3 dense+sparse 嵌入、Milvus upsert、PostgreSQL chunk 元数据和原子激活。
 - 每个可能阻塞的模型或 Milvus 操作前续租；失去租约的旧 Worker 不再发起后续外部依赖调用，也不写入、激活或覆盖新 owner 的状态。
-- 进程中断时不伪造成功。未激活版本在租约到期后由下一 Worker 继续；稳定 ID 和 upsert 保证重放幂等。
+- 进程中断、失败或超越均不伪造成功；稳定 ID 和 upsert 保证允许重放的同一 version 幂等。
 
 ### 6.3 确定性分块
 
@@ -157,15 +165,15 @@ accepted
 
 ```text
 {
-  request_id,
-  status,
-  data,
-  quality,
-  error
+  "request_id": "...",
+  "status": "accepted" | "success" | "error",
+  "data": object | null,
+  "quality": {"status": "normal" | "zero_hit" | "low_confidence"} | null,
+  "error": {"category": "timeout" | "dependency_error" | "validation_error" | "authorization_error" | "not_found", "code": "稳定安全错误码", "message": "短消息"} | null
 }
 ```
 
-`error` 仅包含稳定安全错误码和可用户理解的短消息；不会包含栈、路径、密钥、原文、完整查询 Prompt 或底层依赖响应。分页响应含 `items`、`page`、`page_size`、`total`；默认 `page_size=20`，最大 100。检索 `top_k` 默认 10，最大 20，查询正文长度为 1 到 500 个 Unicode 字符。
+成功和 `202` accepted 响应的 `error=null`；检索成功时 `quality` 为三种检索质量之一，其他成功响应的 `quality=null`；错误响应的 `data=null` 和 `quality=null`。`error` 仅包含机器可判定分类、稳定安全错误码和可用户理解的短消息；不会包含栈、路径、密钥、原文、完整查询 Prompt 或底层依赖响应。依赖调用达到显式 deadline 时，查询返回 `503`、`error.category="timeout"`、`error.code="KNOWLEDGE_DEPENDENCY_TIMEOUT"`；本地 BGE-M3、reranker 或 Milvus 明确不可用、拒绝连接或协议失败而未超时，查询返回 `503`、`error.category="dependency_error"` 和对应 `KNOWLEDGE_MODEL_UNAVAILABLE` 或 `KNOWLEDGE_MILVUS_UNAVAILABLE`。两类错误均不返回伪造结果。分页响应含 `items`、`page`、`page_size`、`total`；默认 `page_size=20`，最大 100。检索 `top_k` 默认 10，最大 20，查询正文长度为 1 到 500 个 Unicode 字符。
 
 | 接口 | 授权与请求 | 成功响应 | 幂等与主要错误 |
 |---|---|---|---|
@@ -177,7 +185,7 @@ accepted
 
 身份检查必须先于资源存在性披露。管理员修改接口和检索接口都重新从数据库加载当前用户；禁用用户统一得到认证失败。知识文档是全局演示资源，不按店铺隔离，因此本阶段不引入店铺参数或跨店铺知识范围抽象。
 
-主要安全错误码包括 `KNOWLEDGE_FILE_TYPE_INVALID`、`KNOWLEDGE_MIME_MISMATCH`、`KNOWLEDGE_FILE_TOO_LARGE`、`KNOWLEDGE_FILE_EMPTY`、`KNOWLEDGE_FILE_CORRUPT`、`KNOWLEDGE_PATH_INVALID`、`KNOWLEDGE_DOCUMENT_NOT_FOUND`、`KNOWLEDGE_DOCUMENT_DISABLED`、`KNOWLEDGE_PARSE_FAILED`、`KNOWLEDGE_MODEL_UNAVAILABLE`、`KNOWLEDGE_MILVUS_UNAVAILABLE`、`KNOWLEDGE_LEASE_LOST`、`KNOWLEDGE_ATTEMPTS_EXHAUSTED` 与 `KNOWLEDGE_DEPENDENCY_TIMEOUT`。
+主要安全错误码包括 `KNOWLEDGE_FILE_TYPE_INVALID`、`KNOWLEDGE_MIME_MISMATCH`、`KNOWLEDGE_FILE_TOO_LARGE`、`KNOWLEDGE_FILE_EMPTY`、`KNOWLEDGE_FILE_CORRUPT`、`KNOWLEDGE_PATH_INVALID`、`KNOWLEDGE_DOCUMENT_NOT_FOUND`、`KNOWLEDGE_DOCUMENT_DISABLED`、`KNOWLEDGE_PARSE_FAILED`、`KNOWLEDGE_MODEL_UNAVAILABLE`、`KNOWLEDGE_MILVUS_UNAVAILABLE`、`KNOWLEDGE_LEASE_LOST`、`KNOWLEDGE_ATTEMPTS_EXHAUSTED`、`KNOWLEDGE_VERSION_SUPERSEDED`、`KNOWLEDGE_PROCESSING_FAILED` 与 `KNOWLEDGE_DEPENDENCY_TIMEOUT`。
 
 ## 9. 故障、恢复与质量路由
 
@@ -185,11 +193,12 @@ accepted
 |---|---|---|
 | 无 active version 或无候选 | `200`、`quality.status=zero_hit`、空结果 | 不伪造命中。 |
 | 候选未达校准阈值 | `200`、`quality.status=low_confidence`、返回低置信真实引用 | 不将其提升为正常结果。 |
-| BGE-M3、reranker 或 Milvus 不可用 | `503`、`dependency_error` | 版本处理保留或转安全失败；查询不返回虚构结果。 |
-| 依赖超时 | `503`、`KNOWLEDGE_DEPENDENCY_TIMEOUT` | 未完成版本可由租约恢复；不把超时标为 active。 |
+| BGE-M3、reranker 或 Milvus 不可用、拒绝连接或协议失败 | `503`、`error.category=dependency_error` 及对应稳定错误码 | 导入 Worker 按可重试失败规则转回 `accepted` 或在第三次后 `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`；查询不返回虚构结果。 |
+| 依赖调用达到显式 deadline | `503`、`error.category=timeout`、`KNOWLEDGE_DEPENDENCY_TIMEOUT` | 导入 Worker 按可重试失败规则转回 `accepted` 或在第三次后 `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`；查询不返回伪造结果，超时不标为 active。 |
 | PDF/DOCX 解析失败 | 导入状态可查询为 `failed` | `error_code=KNOWLEDGE_PARSE_FAILED`，旧 active 版本继续服务。 |
-| Worker 中断或失租 | API 保留已有安全状态 | 旧 owner 停止，租约过期后恢复领取；不覆盖新 owner。 |
-| 新版本 Milvus upsert 或 DB 激活失败 | 新版本 `failed` 或可恢复 `processing` | 当前 active 版本不变，孤儿向量不可见。 |
+| Worker 中断或失租 | API 保留已有安全状态 | 旧 owner 停止且不能写入；租约到期后按 attempt_count 精确地重新领取或转 `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`。 |
+| 新版本 Milvus upsert 失败 | 版本状态按错误分类可查询 | 明确 timeout、不可用或可重试连接失败按重试闭环处理；其他错误转 `failed/KNOWLEDGE_PROCESSING_FAILED`；当前 active 版本不变，孤儿向量不可见。 |
+| PostgreSQL 激活事务失败 | API 保留已有安全状态 | 事务回滚，版本保持 `processing` 到租约到期后按 attempt_count 恢复或耗尽；当前 active 版本不变。 |
 | 文档被停用 | 随后的检索立即不含其结果 | PostgreSQL active ID 集移除该文档，Milvus 残留向量不可见。 |
 
 处理和查询不得以通用知识、缓存的旧结果或生成式文本伪造结果。解析、嵌入、Milvus、rerank 和数据库阶段均记录安全阶段代码、耗时、版本信息和请求 ID，但不记录完整文档正文、查询 Prompt、模型权重路径细节或凭据。
@@ -212,10 +221,10 @@ accepted
 普通测试完全 mock Milvus、BGE-M3 和 reranker，不加载本地权重、不联网。重点覆盖：
 
 - 文件扩展名/MIME/大小/空文件/路径穿越/损坏 PDF 与 DOCX ZIP 边界。
-- SHA 幂等导入、同文档版本切换、停用立即不可见、旧版本服务连续性。
-- `FOR UPDATE SKIP LOCKED` 互斥领取、过期恢复、三次上限、失租 owner 保护和中断恢复。
-- 稳定 chunk ID、Milvus 幂等 upsert、孤儿向量不可见、重复处理不产生重复 chunk 或向量。
-- BGE-M3 或 Milvus 缺失、超时、解析失败和 reranker 不可用时的安全错误与无伪造结果。
+- SHA 幂等导入、同文档并发版本完成时的单调 `version_number` 激活守卫、较旧版本 supersede 终结、停用立即不可见和旧版本服务连续性。
+- `FOR UPDATE SKIP LOCKED` 互斥领取、过期恢复、三次上限、owner-guard 失租保护，以及可重试回 `accepted`、不可重试失败与第三次耗尽的精确状态迁移。
+- 稳定 chunk ID、Milvus 幂等 upsert、孤儿向量不可见、重复处理不产生重复 `chunk_id` 主键或额外索引记录；同一版本的相同正文或相同向量值位于不同 `chunk_index` 时必须保留。
+- BGE-M3 或 Milvus 缺失、deadline timeout、解析失败和 reranker 不可用时的安全错误与无伪造结果；测试必须分别断言 `timeout/KNOWLEDGE_DEPENDENCY_TIMEOUT` 和 `dependency_error` 的机器分类。
 - 服务端 RBAC：只有管理员修改；运营专员与主管只能读检索；禁用用户和无角色用户被拒绝。
 
 真实 PostgreSQL、Milvus Standalone 与本地离线模型的集成测试只在显式 opt-in 环境开关下运行。它使用固定演示知识包，清理只删除自己创建的 document/version/chunk 和对应稳定向量 ID；不删除用户知识、模型目录、数据库或 Milvus collection 的无关数据。
@@ -226,7 +235,7 @@ accepted
 |---|---:|
 | Recall@10 | ≥ 90% |
 | 引用文档与版本正确率 | 100% |
-| 重复向量 | 0 |
+| 重复向量 | 0（同一重试不产生重复主键或额外索引记录；不禁止不同位置的相同正文或相同向量值） |
 | MRR | 记录实际值，不预设生产承诺 |
 | 查询与索引延迟 | 记录实际值，不预设生产 SLA |
 
