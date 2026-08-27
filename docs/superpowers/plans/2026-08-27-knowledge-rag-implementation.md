@@ -18,14 +18,15 @@
 - Use named, non-type-bound SQL checks and named unique constraints in both ORM metadata and Alembic. PostgreSQL is authoritative; Milvus stores only reconstructable vectors and metadata.
 - Normal tests use SQLite plus fakes or mocks for Milvus, BGE-M3, and reranker. They do not load weights, make network calls, or call DeepSeek. Real PostgreSQL, Milvus, and local-model tests run only with `RUN_KNOWLEDGE_INTEGRATION=1`.
 - All version-worker ownership writes match `id`, `status='processing'`, `lease_owner`, and `lease_expires_at > now()`. Claims use PostgreSQL `now()` and `FOR UPDATE SKIP LOCKED`; no fourth claim exists.
-- Search and administration reload the current database `User`. Only administrators change knowledge; operator, supervisor, and administrator may read search. Knowledge is global demonstration data and has no store-scope parameter.
+- Every knowledge route receives its current database `User` directly through the existing role dependencies: `Depends(require_roles(UserRole.ADMIN))` for create, list, version, and disable; `Depends(require_roles(UserRole.OPERATOR, UserRole.SUPERVISOR, UserRole.ADMIN))` for search. Knowledge is global demonstration data and has no store-scope parameter.
 - Do not add Redis, Celery, Kafka, MCP, microservices, a Compose Worker service, frontend code, real platform access, cloud deployment, generated-model APIs, automatic model downloads, or a product-selection/optimization interface.
 - Never log or return upload text, server paths, model weights, vectors, credentials, Authorization values, cookies, prompts, raw dependency responses, or chain-of-thought data.
+- All parsing, local-model, and Milvus calls use `Settings.knowledge_dependency_timeout_seconds`; a deadline produces the stable timeout code rather than a partial result. Use only `logging` for safe audit events; do not add an audit table.
 
 ## Existing Structure to Reuse
 
 - `backend/database.py` provides `Base`, `async_session_factory`, and `get_session`; `tests/conftest.py` creates the same metadata against SQLite with foreign keys enabled.
-- `backend/models.py` and `alembic/versions/0001_initial_schema.py` use string UUIDs, `utc_now`, `native_enum=False`, explicit named checks, and explicit named unique constraints. Revision `0003` follows that convention.
+- `backend/models.py`, `alembic/versions/0001_initial_schema.py`, and current head `alembic/versions/0002_durable_analysis.py` use string UUIDs, `utc_now`, `native_enum=False`, explicit named checks, and explicit named unique constraints. New revision `0003_knowledge_retrieval.py` follows that convention.
 - `backend/common.py` contains `StrEnum` domain states. Add knowledge-version state values there rather than introduce a second enum package.
 - `backend/config.py` is the single `Settings` source and `get_settings()` is the existing cached settings accessor. The API must still start without loading local weights.
 - `backend/auth.py` provides database-backed `get_current_user()` and `require_roles()`; the new routes use them directly. Existing `get_current_user()` already rejects disabled users and does not trust the JWT role as final authorization.
@@ -57,7 +58,8 @@
 | `scripts/run_knowledge_worker.py` | Run the local index Worker once or in a polling loop; it is not a Compose service. |
 | `data/knowledge/demo/platform-neutral-rules.md` | Committed Chinese demonstration rules, explicitly marked platform-neutral and non-official. |
 | `data/knowledge/evaluation/queries.json` | Fixed Chinese queries, expected documents, expected versions, and relevant chunk assertions. |
-| `data/knowledge/evaluation/calibration.json` | Versioned deterministic fusion/threshold selection grid and selected evaluation result metadata. |
+| `data/knowledge/evaluation/calibration-candidates.json` | Committed finite dense/sparse/RRF/rerank candidate grid used by ordinary fake-data selector tests. |
+| `data/knowledge/evaluation/calibration.json` | Final selected fusion/threshold configuration, atomically produced only by Task 8's explicitly authorized real local evaluation. |
 | `tests/test_knowledge_*.py` | Unit, API, Worker, evaluation, and opt-in integration coverage described in each task. |
 
 ---
@@ -205,13 +207,13 @@ class KnowledgeDocumentVersion(Base):
     __tablename__ = "knowledge_document_versions"
     # id, document_id, version_number, sha256, original_filename, mime_type,
     # storage_path, status, attempt_count, lease_owner, lease_expires_at,
-    # parser_version, chunker_version, embedding_version, error_code,
+    # parser_version, chunker_version, embedding_version, idempotency_key, error_code,
     # created_at, updated_at
 
 class KnowledgeChunk(Base):
     __tablename__ = "knowledge_chunks"
     # id is the stable chunk_id, version_id, chunk_index, chunk_hash,
-    # canonical_text, metadata, token_count, created_at
+    # canonical_text, chunk_metadata (mapped to database column "metadata"), token_count, created_at
 ```
 
 `KnowledgeDocument.current_version_id` is nullable and references a version. The service-level activation guard, not a cross-table check, proves it belongs to the same document and is active. `KnowledgeChunk.id` is the globally stable UUID5-derived `chunk_id`; do not add a redundant second ID column.
@@ -232,7 +234,7 @@ class KnowledgeChunk(Base):
   )
   ```
 
-  Assert duplicate `(created_by, idempotency_key)`, duplicate `(document_id, version_number)`, duplicate `(document_id, sha256)`, `attempt_count=-1`, `attempt_count=4`, an invalid status value, and a non-processing row with a lease all fail. Assert a duplicate `(version_id, chunk_index)` fails, while two chunks with the same `chunk_hash` and different indexes persist. Assert `KnowledgeChunk.id` is supplied as a stable chunk ID and is globally unique.
+  Assert duplicate `(created_by, idempotency_key)`, duplicate `(document_id, idempotency_key)`, duplicate `(document_id, version_number)`, duplicate `(document_id, sha256)`, `attempt_count=-1`, `attempt_count=4`, an invalid status value, and a non-processing row with a lease all fail. Assert a duplicate `(version_id, chunk_index)` fails, while two chunks with the same `chunk_hash`, distinct indexes, and distinct `chunk_metadata` persist. Assert `KnowledgeChunk.id` is supplied as a stable chunk ID and is globally unique.
 
 - [ ] **Step 2: Run RED**
 
@@ -246,11 +248,12 @@ class KnowledgeChunk(Base):
 
 - [ ] **Step 3: Add the models and revision `0003`**
 
-  Map the three classes with the existing `String(36)` UUID convention, `utc_now` timestamps, `JSON` for chunk metadata, and explicit constraints:
+  Map the three classes with the existing `String(36)` UUID convention, `utc_now` timestamps, `JSON` for `KnowledgeChunk.chunk_metadata`, and explicit constraints. Map its database column with `mapped_column("metadata", JSON, nullable=False)`; no Python class, dataclass, persistence call, search result, or test accesses the reserved attribute name `metadata`.
 
   ```python
   UniqueConstraint("document_id", "version_number", name="uq_knowledge_document_versions_document_id_version_number")
   UniqueConstraint("document_id", "sha256", name="uq_knowledge_document_versions_document_id_sha256")
+  UniqueConstraint("document_id", "idempotency_key", name="uq_knowledge_document_versions_document_id_idempotency_key")
   UniqueConstraint("created_by", "idempotency_key", name="uq_knowledge_documents_created_by_idempotency_key")
   CheckConstraint("attempt_count BETWEEN 0 AND 3", name="ck_knowledge_document_versions_attempt_count")
   CheckConstraint(
@@ -313,7 +316,7 @@ class ChunkDraft:
     chunk_id: str
     chunk_hash: str
     canonical_text: str
-    metadata: dict[str, object]
+    chunk_metadata: dict[str, object]
     token_count: int
 
 class KnowledgeContentError(ValueError):
@@ -327,8 +330,13 @@ def store_validated_upload(
 ) -> StoredKnowledgeUpload:
     pass
 
-def parse_and_chunk(
-    stored: StoredKnowledgeUpload, *, token_count: Callable[[str], int]
+async def parse_and_chunk(
+    stored: StoredKnowledgeUpload, *, token_count: Callable[[str], int], timeout_seconds: float
+) -> list[ChunkDraft]:
+    pass
+
+def _parse_and_chunk_sync(
+    stored: StoredKnowledgeUpload, token_count: Callable[[str], int]
 ) -> list[ChunkDraft]:
     pass
 
@@ -340,7 +348,9 @@ def stable_chunk_id(version_sha256: str, chunk_index: int, chunk_hash: str) -> s
 
 - [ ] **Step 1: Write failing content-boundary tests**
 
-  Create tests with `UploadFile` backed by `io.BytesIO` and `tmp_path`. Cover accepted UTF-8 `.txt` and `.md`, malformed UTF-8, mismatched extension/MIME, empty input, input larger than 20 MiB, `../name.pdf`, absolute filenames, encrypted or over-200-page PDF, malformed PDF, malformed DOCX ZIP, a ZIP with more than 1,000 entries, an entry or total uncompressed payload over 100 MiB, and empty extracted text. Assert each failure has the exact safe code from the specification.
+  Create tests with `UploadFile` backed by `io.BytesIO` and `tmp_path`. Cover accepted UTF-8 `.txt` and `.md`, malformed UTF-8, mismatched extension/MIME, empty input, input larger than 20 MiB, `../name.pdf`, absolute filenames, encrypted or over-200-page PDF, malformed PDF, malformed DOCX ZIP, a ZIP with more than 1,000 entries, an entry or total uncompressed payload over 100 MiB, and empty extracted text. Assert each failure has the exact safe code from the specification. Construct a pre-existing generated document/version directory as a symlink to `tmp_path / "outside"`; `store_validated_upload()` must return `KNOWLEDGE_PATH_INVALID` and write no file outside the controlled upload root.
+
+  Stub the pure parser to block beyond `timeout_seconds`; assert `parse_and_chunk()` raises `KnowledgeContentError("KNOWLEDGE_PARSE_TIMEOUT")`, returns no partial draft list, and leaves no stored chunk result. Feed extracted normalized text longer than 1,000,000 characters and assert `KNOWLEDGE_PARSE_FAILED` before a `ChunkDraft` is produced.
 
   Use heading and paragraph input with `token_count=lambda text: len(text.split())`; assert chunks preserve heading path, paragraph index, stable order, 512-token maximum, 64-token overlap, deterministic Unicode fallback splitting, and equality across two calls. Assert two equal paragraphs at different positions produce different `chunk_index` and `chunk_id` values while retaining the same `chunk_hash`.
 
@@ -362,9 +372,9 @@ def stable_chunk_id(version_sha256: str, chunk_index: int, chunk_hash: str) -> s
   data/uploads/knowledge/<document-id>/<version-id>/<server-generated-name>
   ```
 
-  Use `Path.resolve()` and `is_relative_to()` to verify the generated path remains under `upload_dir`; never use the client filename in the path. Validate extension, declared MIME, and file structure before writing. Parse PDFs with `pypdf.PdfReader(BytesIO(data))`; reject encrypted files, more than 200 pages, extraction errors, and no normalized text. Inspect DOCX with `zipfile.ZipFile` before `docx.Document`, applying the stated entry and decompression limits. Decode Markdown/TXT strictly as UTF-8.
+  Use `Path.resolve()` and `is_relative_to()` to verify the generated path remains under `upload_dir`, reject a symlink in any generated parent component, and never use the client filename in the path. Validate extension, declared MIME, and file structure before writing. Parse PDFs with `pypdf.PdfReader(BytesIO(data))`; reject encrypted files, more than 200 pages, extraction errors, and no normalized text. Inspect DOCX with `zipfile.ZipFile` before `docx.Document`, applying the stated entry and decompression limits. Decode Markdown/TXT strictly as UTF-8.
 
-  Normalize whitespace, retain title hierarchy/page/paragraph metadata, split by headings then paragraphs, split oversized paragraphs by sentence boundaries with 64-token overlap, and finally use Unicode character boundaries. Derive `chunk_hash` from canonical text and derive `chunk_id` with one fixed UUID5 namespace over `version_sha256`, `chunk_index`, and `chunk_hash`.
+  Run the pure parsing/chunking function through `await asyncio.wait_for(asyncio.to_thread(_parse_and_chunk_sync, stored, token_count), timeout_seconds)` and turn only an elapsed deadline into `KNOWLEDGE_PARSE_TIMEOUT`. Build drafts in memory, normalize whitespace, retain title hierarchy/page/paragraph `chunk_metadata`, split by headings then paragraphs, split oversized paragraphs by sentence boundaries with 64-token overlap, and finally use Unicode character boundaries. Reject normalized text over 1,000,000 characters before returning any draft. Derive `chunk_hash` from canonical text and derive `chunk_id` with one fixed UUID5 namespace over `version_sha256`, `chunk_index`, and `chunk_hash`.
 
 - [ ] **Step 4: Run GREEN and parser regression tests**
 
@@ -403,6 +413,11 @@ async def create_document_version(
 
 async def find_document_version_by_sha(
     session: AsyncSession, *, document_id: str, sha256: str
+) -> KnowledgeDocumentVersion | None:
+    pass
+
+async def find_document_version_by_idempotency_key(
+    session: AsyncSession, *, document_id: str, idempotency_key: str
 ) -> KnowledgeDocumentVersion | None:
     pass
 
@@ -447,13 +462,13 @@ async def disable_knowledge_document(
     pass
 ```
 
-`create_document_version()` returns `created=False` for an existing `(document_id, sha256)` and creates no lease. A non-empty creation idempotency key is unique per creator; repeating it with the same content returns its first document/version and repeating it with a different SHA returns `KNOWLEDGE_IDEMPOTENCY_CONFLICT` without a write. `return_version_for_retry()` turns attempts 1 or 2 into `accepted`; at attempt 3 it writes `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`. `fail_knowledge_version()` is the non-retryable path. All owner mutations return `False` without committing a stale-owner change.
+`create_document_version()` returns `created=False` for an existing `(document_id, sha256)` and creates no lease. For initial document creation, a non-empty key remains unique per creator in `KnowledgeDocument`; repeating it with the same SHA returns its first document/version and repeating it with a different SHA returns `KNOWLEDGE_IDEMPOTENCY_CONFLICT` without a write. For `POST /knowledge/documents/{id}/versions`, a non-empty bounded key is stored on `KnowledgeDocumentVersion` and unique by `(document_id, idempotency_key)`: the same key plus the same SHA, or the same document plus SHA without a key match, returns the existing version; the same key plus a different SHA returns `KNOWLEDGE_IDEMPOTENCY_CONFLICT` without a write. `return_version_for_retry()` turns attempts 1 or 2 into `accepted`; at attempt 3 it writes `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`. `fail_knowledge_version()` is the non-retryable path. All owner mutations return `False` without committing a stale-owner change.
 
 - [ ] **Step 1: Write failing lease and activation tests**
 
   Create exact SQLite rows with distinct `created_at` values. Assert claim order is `(created_at, id)`, an accepted row is claimed with attempt 1, an expired attempt-2 row is reclaimed with attempt 3, and an expired attempt-3 row becomes `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED` without a fourth claim. Assert `failed` and `disabled` rows are never claimed.
 
-  Assert a retryable attempt-1 failure returns to `accepted` with cleared lease, a non-retryable failure reaches `failed`, and an old owner cannot renew, retry, fail, upsert completion metadata, or activate after a replacement owner is installed. Assert a repeated `(created_by, idempotency_key, sha256)` returns the initial document/version and a key with a different SHA returns `KNOWLEDGE_IDEMPOTENCY_CONFLICT`. Persist the same `ChunkDraft` list twice and assert count remains unchanged by `(version_id, chunk_index)`.
+  Assert a retryable attempt-1 failure returns to `accepted` with cleared lease, a non-retryable failure reaches `failed`, and an old owner cannot renew, retry, fail, upsert completion metadata, or activate after a replacement owner is installed. Assert a repeated `(created_by, idempotency_key, sha256)` returns the initial document/version and a key with a different SHA returns `KNOWLEDGE_IDEMPOTENCY_CONFLICT`. Separately, assert a repeated `(document_id, version_idempotency_key, sha256)` returns one existing version with no lease, while that same version key plus another SHA returns `KNOWLEDGE_IDEMPOTENCY_CONFLICT`. Persist a `ChunkDraft(chunk_metadata={"heading_path": ["章节"], "paragraph_index": 0})` list twice and assert count remains unchanged by `(version_id, chunk_index)`.
 
   Create versions 1 and 2 for one document. Activate version 2 first, then call `activate_knowledge_version()` as version 1's valid owner; assert it returns `False`, version 1 becomes `disabled/KNOWLEDGE_VERSION_SUPERSEDED`, version 2 remains `active`, and `document.current_version_id` stays version 2. Disable the document and assert every accepted, processing, and active version becomes disabled with no lease and `current_version_id is None`.
 
@@ -473,6 +488,8 @@ async def disable_knowledge_document(
 
   Claim in one transaction by first transitioning only expired `processing` rows with `attempt_count=3` to `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`, then selecting only `accepted` or expired processing rows with `attempt_count<3`. On each selected row write the owner, future expiry, `status=processing`, and `attempt_count + 1` before commit.
 
+  `upsert_knowledge_chunks()` maps each `ChunkDraft.chunk_metadata` to `KnowledgeChunk.chunk_metadata` (the mapped database column remains `metadata`) and upserts only by `(version_id, chunk_index)`; it never deduplicates canonical text or `chunk_hash`.
+
   Implement the activation transaction by locking the document row, checking `enabled=true`, loading the current version number, and applying this exact condition:
 
   ```python
@@ -480,6 +497,8 @@ async def disable_knowledge_document(
   ```
 
   When true, set candidate active, assign `current_version_id`, and disable the previous active version in the same transaction. When false, owner-guard the candidate to `disabled/KNOWLEDGE_VERSION_SUPERSEDED`; do not change the document current version. `disable_knowledge_document()` locks the document and atomically clears `current_version_id`, disables accepted/processing/active rows, and clears every lease.
+
+  Use `logging.getLogger("backend.knowledge")` to emit one safe state-transition event after each committed create, claim, retry, fail, activation, supersede, and disable result. Its fields are `request_id` (the route-generated ID or `-` for a Worker), `actor_id` (the route user or the document's `created_by`), document/version IDs, transition status, safe error code, and elapsed milliseconds. Add `caplog` assertions for a successful claim and failed retry: both contain the status fields and neither contains canonical text, a storage path, vectors, uploaded bytes, or a credential.
 
 - [ ] **Step 4: Run GREEN and state regression tests**
 
@@ -528,35 +547,47 @@ class KnowledgeDependencyError(RuntimeError):
     retryable: bool
 
 class LocalKnowledgeModels:
+    def __init__(
+        self, *, embedding_model_path: Path, reranker_model_path: Path, timeout_seconds: float
+    ) -> None:
+        pass
     def token_count(self, text: str) -> int:
         pass
-    def embed_documents(self, texts: list[str]) -> list[HybridVector]:
+    async def embed_documents(self, texts: list[str]) -> list[HybridVector]:
         pass
-    def embed_query(self, text: str) -> HybridVector:
+    async def embed_query(self, text: str) -> HybridVector:
         pass
-    def rerank(self, query: str, texts: list[str]) -> list[float]:
+    async def rerank(self, query: str, texts: list[str]) -> list[float]:
         pass
 
 class MilvusKnowledgeIndex:
-    def ensure_collection(self) -> None:
+    def __init__(self, *, uri: str, collection: str, timeout_seconds: float) -> None:
         pass
-    def upsert(self, chunks: list[IndexedChunk]) -> None:
+    async def ensure_collection(self) -> None:
         pass
-    def hybrid_search(
-        self, *, vector: HybridVector, version_ids: list[str], categories: list[str] | None,
-        limit: int, fusion: dict[str, object]
-    ) -> list[dict[str, object]]:
+    async def upsert(self, chunks: list[IndexedChunk]) -> None:
+        pass
+    async def dense_search(
+        self, *, vector: list[float], version_ids: list[str], limit: int
+    ) -> list[tuple[str, float]]:
+        pass
+    async def sparse_search(
+        self, *, vector: dict[int, float], version_ids: list[str], limit: int
+    ) -> list[tuple[str, float]]:
+        pass
+    async def existing_chunk_ids(self, *, chunk_ids: list[str]) -> set[str]:
+        pass
+    async def delete_chunk_ids(self, *, chunk_ids: list[str]) -> None:
         pass
 
 async def run_once(
     session_factory: async_sessionmaker[AsyncSession], *, settings: Settings,
-    lease_owner: str, models: LocalKnowledgeModels | None = None,
-    index: MilvusKnowledgeIndex | None = None,
+    lease_owner: str, models: LocalKnowledgeModels, index: MilvusKnowledgeIndex,
 ) -> str | None:
     pass
 ```
 
-`LocalKnowledgeModels` accepts only the two configured local `Path` values. It verifies that each is a directory before constructing `BGEM3FlagModel` and `FlagReranker`; a missing or load-failed path raises `KnowledgeDependencyError("KNOWLEDGE_MODEL_UNAVAILABLE", retryable=True)`, never a download request. `MilvusKnowledgeIndex` represents one fixed collection, not a pluggable provider layer.
+`LocalKnowledgeModels` accepts only the two configured local `Path` values and `knowledge_dependency_timeout_seconds`. It verifies each is a directory before constructing `BGEM3FlagModel` and `FlagReranker`; a missing or load-failed path raises `KnowledgeDependencyError("KNOWLEDGE_MODEL_UNAVAILABLE", retryable=True)`, never a download request. Every blocking embedding and reranker call runs through `asyncio.to_thread` plus `asyncio.wait_for`; expiration is `KnowledgeDependencyError("KNOWLEDGE_DEPENDENCY_TIMEOUT", retryable=True)`. `MilvusKnowledgeIndex` represents one fixed collection, not a pluggable provider layer; every collection, upsert, search, exact-key query, and exact-key deletion uses the same configured deadline and maps a deadline to that timeout code and a non-timeout dependency failure to `KNOWLEDGE_MILVUS_UNAVAILABLE`.
 
 - [ ] **Step 1: Write failing Worker tests with real SQLite facts and fake dependencies**
 
@@ -570,7 +601,7 @@ async def run_once(
   assert fake_index.upserts[0][0].chunk_id == persisted_chunk.id
   ```
 
-  Assert Milvus receives only `chunk_id`, document/version/category metadata, and dense/sparse vectors; canonical text, file path, user ID, and error code are absent. Assert upsert runs before `upsert_knowledge_chunks()` and activation, replaying the Worker does not add vector keys or chunk rows, and only an active version becomes searchable later.
+  Assert Milvus receives only `chunk_id`, document/version/category metadata, and dense/sparse vectors; canonical text, file path, user ID, and error code are absent. Assert upsert runs before `upsert_knowledge_chunks()` and activation, replaying the Worker does not add vector keys or chunk rows, and only an active version becomes searchable later. Make a fake parser, model, and index each exceed the configured deadline; assert each maps to `KNOWLEDGE_PARSE_TIMEOUT` or `KNOWLEDGE_DEPENDENCY_TIMEOUT`, emits no partial chunks/activation, and does not manufacture a success result.
 
   Make the fake model raise retryable timeout/unavailable errors on attempts 1 and 2, then assert `accepted` with its safe code; make it fail on attempt 3 and assert `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`. Make parsing raise `KnowledgeContentError("KNOWLEDGE_PARSE_FAILED")` and assert terminal failed. Replace the lease owner during renewal and assert no further model call, Milvus upsert, chunk persistence, activation, or overwrite occurs.
 
@@ -586,9 +617,9 @@ async def run_once(
 
 - [ ] **Step 3: Implement local index operations and one-version Worker**
 
-  `LocalKnowledgeModels` calls local `FlagEmbedding` APIs with the two configured filesystem paths, checks `len(dense) == 1024`, and converts BGE-M3 lexical weights into `dict[int, float]`. `MilvusKnowledgeIndex.ensure_collection()` creates one collection named by `settings.milvus_collection` with primary `chunk_id`, `document_id`, `version_id`, category, `FLOAT_VECTOR` dimension 1024, and `SPARSE_FLOAT_VECTOR`; it creates the documented dense and sparse indexes. `upsert()` uses stable `chunk_id` primary keys.
+  `LocalKnowledgeModels` calls local `FlagEmbedding` APIs with the two configured filesystem paths, checks `len(dense) == 1024`, and converts BGE-M3 lexical weights into `dict[int, float]`. `MilvusKnowledgeIndex.ensure_collection()` creates one collection named by `settings.milvus_collection` with primary `chunk_id`, `document_id`, `version_id`, category, `FLOAT_VECTOR` dimension 1024, and `SPARSE_FLOAT_VECTOR`; it creates the documented dense and sparse indexes. `upsert()` uses stable `chunk_id` primary keys. `dense_search()` and `sparse_search()` each receive only service-derived active version IDs, return their own raw `(chunk_id, score)` lists, and do not accept user categories or an arbitrary filter expression. `existing_chunk_ids()` and `delete_chunk_ids()` accept an explicit non-empty stable-ID list only; neither method accepts a document, version, wildcard, or broad collection expression.
 
-  `run_once()` claims at most one version using `claim_next_knowledge_version()`. Before parsing, embedding, and Milvus upsert, call `renew_knowledge_lease()`; a false result stops immediately. Process in this fixed order:
+  `scripts/run_knowledge_worker.py` constructs exactly one `LocalKnowledgeModels` and one `MilvusKnowledgeIndex` from `Settings` before its loop, then passes both to each `run_once()`; normal tests pass fakes explicitly. `run_once()` claims at most one version using `claim_next_knowledge_version()`. Before parsing, embedding, and Milvus upsert, call `renew_knowledge_lease()`; after parsing returns, renew again before any embedding or persistence. A false result stops immediately. Process in this fixed order:
 
   ```text
   parse + deterministic chunk -> BGE-M3 dense+sparse -> Milvus stable-ID upsert
@@ -623,13 +654,15 @@ async def run_once(
 - Create: `backend/knowledge_evaluation.py`
 - Create: `data/knowledge/demo/platform-neutral-rules.md`
 - Create: `data/knowledge/evaluation/queries.json`
-- Create: `data/knowledge/evaluation/calibration.json`
+- Create: `data/knowledge/evaluation/calibration-candidates.json`
 - Create: `tests/test_knowledge_search.py`
 - Create: `tests/test_knowledge_evaluation.py`
 
 **Interfaces:**
 
 ```python
+from functools import lru_cache
+
 @dataclass(frozen=True)
 class KnowledgeSearchHit:
     chunk_id: str
@@ -637,11 +670,27 @@ class KnowledgeSearchHit:
     version_number: int
     category: str
     canonical_text: str
+    chunk_metadata: dict[str, object]
     dense_score: float
     sparse_score: float
     fusion_score: float
     reranker_score: float
     final_score: float
+
+RetrievalPath = Literal["dense", "sparse", "hybrid", "hybrid_rerank"]
+
+@dataclass(frozen=True)
+class RetrievalQueryOutcome:
+    query_id: str
+    hits: list[KnowledgeSearchHit]
+    elapsed_ms: float
+
+@dataclass(frozen=True)
+class RetrievalMetrics:
+    recall_at_10: float
+    mrr: float
+    citation_document_version_accuracy: float
+    latency_ms: float
 
 @dataclass(frozen=True)
 class KnowledgeSearchOutcome:
@@ -655,22 +704,38 @@ async def search_active_knowledge(
 ) -> KnowledgeSearchOutcome:
     pass
 
+def fuse_rankings(
+    *, dense: list[tuple[str, float]], sparse: list[tuple[str, float]], rrf_k: int
+) -> dict[str, tuple[float, float, float]]:
+    pass
+
 def evaluate_retrieval(
-    queries: list[dict[str, object]], outcomes: dict[str, KnowledgeSearchOutcome]
+    queries: list[dict[str, object]],
+    outcomes: dict[RetrievalPath, dict[str, RetrievalQueryOutcome]],
+) -> dict[RetrievalPath, RetrievalMetrics]:
+    pass
+
+def select_calibration(
+    candidates: list[dict[str, object]], metrics_by_candidate: dict[str, RetrievalMetrics]
 ) -> dict[str, object]:
     pass
 
-def select_calibration(candidates: list[dict[str, object]]) -> dict[str, object]:
+@lru_cache
+def get_knowledge_search_dependencies() -> tuple[
+    LocalKnowledgeModels, MilvusKnowledgeIndex, dict[str, object]
+]:
     pass
 ```
 
-`select_calibration()` ranks candidate configurations by Recall@10 descending, MRR descending, lower retrieval candidate count, then lexicographic JSON form. This deterministic selector is the only way `calibration.json` receives its selected fusion strategy and threshold; no copied weight is accepted.
+`select_calibration()` ranks real candidate metrics by Recall@10 descending, MRR descending, lower retrieval candidate count, then lexicographic JSON form. It does not write a file. `get_knowledge_search_dependencies()` is the single small `functools.lru_cache` dependency: its first actual search reads `get_settings()`, constructs `LocalKnowledgeModels` and `MilvusKnowledgeIndex`, and reads the final `calibration.json`; API startup never calls it, later searches reuse it, and ordinary tests call `.cache_clear()` then override it. It is a cached dependency function, not a provider or factory framework. The Worker continues to construct and pass its two dependencies explicitly.
 
 - [ ] **Step 1: Write failing search and evaluation tests**
 
-  Add a SQLite active document/version/chunk plus an inactive old version and an orphan chunk. Use recording fake models/indexes. Assert `search_active_knowledge()` returns `zero_hit` without calling Milvus when no active IDs exist; otherwise it sends only active version IDs and optional categories to hybrid search, reloads canonical text only from PostgreSQL, rejects a Milvus `chunk_id` outside the active set, reranks only canonical texts, and includes every stage score in descending final-score order.
+  Add a SQLite active document/version/chunk plus an inactive old version and an orphan chunk. Use recording fake models/indexes. Assert `search_active_knowledge()` returns `zero_hit` without calling Milvus when no active IDs exist; otherwise it filters optional categories in PostgreSQL before deriving active version IDs, sends only those service-derived IDs to exactly one dense and one sparse Milvus search, reloads canonical text and `chunk_metadata` only from PostgreSQL, rejects a Milvus `chunk_id` outside the active set, reranks only canonical texts, and includes every stage score in descending final-score order. Use a category containing quotes and an injection-shaped string; assert it never becomes a Milvus expression or argument and causes no extra index search.
 
-  Make fakes raise `KnowledgeDependencyError("KNOWLEDGE_DEPENDENCY_TIMEOUT", retryable=True)` and `KnowledgeDependencyError("KNOWLEDGE_MILVUS_UNAVAILABLE", retryable=True)`; assert the caller can distinguish timeout from dependency error and no hit is manufactured. Test fixed labeled outcomes where two calibration candidates tie on Recall@10 and MRR; assert the lower candidate count wins. Assert evaluation emits exact `recall_at_10`, `mrr`, `citation_document_version_accuracy`, `duplicate_vector_keys`, and latency fields.
+  Make fakes raise `KnowledgeDependencyError("KNOWLEDGE_DEPENDENCY_TIMEOUT", retryable=True)` and `KnowledgeDependencyError("KNOWLEDGE_MILVUS_UNAVAILABLE", retryable=True)`; assert the caller can distinguish timeout from dependency error and no hit is manufactured. Assert dense/sparse raw scores are retained and `fuse_rankings()` creates RRF scores without a third Milvus hybrid request. Test fixed typed outcomes for all four `RetrievalPath` values, each keyed by `query_id` and carrying `elapsed_ms`; assert `evaluate_retrieval()` emits Recall@10, MRR, citation document/version accuracy, and latency for every path. Test candidate metrics where two selector candidates tie on Recall@10 and MRR; assert the lower candidate count wins. Do not infer duplicate vectors from search outcomes; that is an exact primary-key-set check in Task 8.
+
+  Test `get_knowledge_search_dependencies.cache_clear()` with monkeypatched settings and recording constructors: importing the FastAPI app causes neither constructor to run, the first explicit dependency call constructs one model/index pair and reads calibration once, and the second reuses those same objects.
 
 - [ ] **Step 2: Run RED**
 
@@ -686,9 +751,9 @@ def select_calibration(candidates: list[dict[str, object]]) -> dict[str, object]
 
   Write one concise Chinese Markdown rule pack. Its heading and every rule section must say `项目演示规则：平台中立、非官方法规或平台规范`. Include title keywords, selling-point/detail evidence, prohibited or exaggerated claims, category attributes, SKU/price/spec consistency, and after-sales/refund wording. Do not state or imply an official policy.
 
-  Add fixed Chinese queries with expected rule section/document/version assertions. Define a finite calibration grid in `calibration.json` for dense-only, sparse-only, reciprocal-rank-fusion hybrid, and hybrid-plus-rerank evaluation; write the selector's chosen values and a `config_version` only through `select_calibration()`. The file includes no secret, model output, user upload, or platform rule.
+  Add fixed Chinese queries with expected rule section/document/version assertions. Define the finite candidate grid in `calibration-candidates.json` for dense-only, sparse-only, reciprocal-rank-fusion hybrid, and hybrid-plus-rerank evaluation. The candidate file has IDs, candidate limits, `rrf_k`, and thresholds but no selected configuration. It includes no secret, model output, user upload, or platform rule. Do not create or claim a selected `calibration.json` in this task; Task 8 writes it only after the approved real local evaluation meets acceptance targets.
 
-  `search_active_knowledge()` first queries PostgreSQL for enabled documents and active version IDs. It invokes BGE-M3 query embedding, calls `MilvusKnowledgeIndex.hybrid_search()` with the selected configuration, fetches chunk text and version/document metadata by returned IDs from PostgreSQL, reranks locally, and returns `normal`, `low_confidence`, or `zero_hit`. An empty active set does not invoke Milvus. A returned ID outside active versions is discarded. A dependency exception is propagated unchanged for the API to classify; it never becomes a synthetic citation.
+  `search_active_knowledge()` first queries PostgreSQL for enabled documents, optional categories, and active version IDs. It invokes BGE-M3 query embedding, calls `dense_search()` and `sparse_search()` with the same active-ID list, retains each raw score, applies the selected deterministic RRF in process, fetches chunk text, `chunk_metadata`, and version/document metadata by returned IDs from PostgreSQL, reranks locally, and returns `normal`, `low_confidence`, or `zero_hit`. It does not perform a third Milvus hybrid call. An empty active set does not invoke Milvus. A returned ID outside active versions is discarded. A dependency exception is propagated unchanged for the API to classify; it never becomes a synthetic citation.
 
 - [ ] **Step 4: Run GREEN and retrieval regressions**
 
@@ -703,7 +768,7 @@ def select_calibration(candidates: list[dict[str, object]]) -> dict[str, object]
 - [ ] **Step 5: Commit rules and retrieval core**
 
   ```powershell
-  git add backend/knowledge_search.py backend/knowledge_evaluation.py data/knowledge/demo/platform-neutral-rules.md data/knowledge/evaluation/queries.json data/knowledge/evaluation/calibration.json tests/test_knowledge_search.py tests/test_knowledge_evaluation.py
+  git add backend/knowledge_search.py backend/knowledge_evaluation.py data/knowledge/demo/platform-neutral-rules.md data/knowledge/evaluation/queries.json data/knowledge/evaluation/calibration-candidates.json tests/test_knowledge_search.py tests/test_knowledge_evaluation.py
   git commit -m "feat: add calibrated knowledge retrieval core"
   ```
 
@@ -740,11 +805,12 @@ class KnowledgeSearchRequest(BaseModel):
 ```python
 @router.post("/knowledge/documents", status_code=status.HTTP_202_ACCEPTED)
 async def create_knowledge_document(
+    response: Response,
     name: Annotated[str, Form(min_length=1, max_length=128)],
     category: Annotated[str, Form(min_length=1, max_length=64)],
     file: UploadFile,
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    user: User = Depends(get_current_user),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key", max_length=128)] = None,
+    user: User = Depends(require_roles(UserRole.ADMIN)),
     session: AsyncSession = Depends(get_session),
 ) -> KnowledgeEnvelope:
     pass
@@ -756,16 +822,18 @@ async def list_knowledge_documents(
     category: str | None = None,
     enabled: bool | None = None,
     version_status: KnowledgeVersionStatus | None = None,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_roles(UserRole.ADMIN)),
     session: AsyncSession = Depends(get_session),
 ) -> KnowledgeEnvelope:
     pass
 
 @router.post("/knowledge/documents/{document_id}/versions", status_code=status.HTTP_202_ACCEPTED)
 async def create_knowledge_document_version(
+    response: Response,
     document_id: str,
     file: UploadFile,
-    user: User = Depends(get_current_user),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key", max_length=128)] = None,
+    user: User = Depends(require_roles(UserRole.ADMIN)),
     session: AsyncSession = Depends(get_session),
 ) -> KnowledgeEnvelope:
     pass
@@ -773,7 +841,7 @@ async def create_knowledge_document_version(
 @router.post("/knowledge/documents/{document_id}/disable")
 async def disable_knowledge_document_route(
     document_id: str,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_roles(UserRole.ADMIN)),
     session: AsyncSession = Depends(get_session),
 ) -> KnowledgeEnvelope:
     pass
@@ -781,23 +849,28 @@ async def disable_knowledge_document_route(
 @router.post("/knowledge/search")
 async def search_knowledge_route(
     request: KnowledgeSearchRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_roles(UserRole.OPERATOR, UserRole.SUPERVISOR, UserRole.ADMIN)),
     session: AsyncSession = Depends(get_session),
+    dependencies: tuple[LocalKnowledgeModels, MilvusKnowledgeIndex, dict[str, object]] = Depends(
+        get_knowledge_search_dependencies
+    ),
 ) -> KnowledgeEnvelope:
     pass
 ```
 
-The two upload routes accept `name`/`category` form fields only for document creation and an `UploadFile` field named `file`; later versions inherit document name/category. List pagination defaults to `page=1`, `page_size=20`, and rejects values outside `1..100`.
+The two upload routes accept `name`/`category` form fields only for document creation and an `UploadFile` field named `file`; later versions inherit document name/category. Both accept a header key of at most 128 characters. List pagination defaults to `page=1`, `page_size=20`, and rejects values outside `1..100`. `Response` changes a new accepted upload to `202` and an existing SHA/key hit to `200`; route decorators document the new-resource default only.
 
 Exact route map: `POST /knowledge/documents`, `GET /knowledge/documents`, `POST /knowledge/documents/{document_id}/versions`, `POST /knowledge/documents/{document_id}/disable`, and `POST /knowledge/search`.
 
 - [ ] **Step 1: Write failing ASGI API and RBAC tests**
 
-  Create `tests/test_knowledge_api.py` using the real FastAPI app, a SQLite `get_session` override, real `create_access_token()`, and actual database role changes. Use a temporary upload directory in a copied `Settings`; monkeypatch only `LocalKnowledgeModels` and `MilvusKnowledgeIndex` so no weight or service is loaded.
+  Create `tests/test_knowledge_api.py` using the real FastAPI app, a SQLite `get_session` override, real `create_access_token()`, and actual database role changes. Use a temporary upload directory in a copied `Settings`; clear and override `get_knowledge_search_dependencies` with recording fake dependencies so no weight or service is loaded.
 
-  Assert an administrator can create a Markdown document and receives a `202` envelope with `accepted`, document/version IDs, and no path. Repeat the creation with the same client idempotency key and SHA and assert it returns the existing version without a second row, upload path, or lease; repeat the key with a different SHA and assert `409/KNOWLEDGE_IDEMPOTENCY_CONFLICT`. Repeat a version SHA for an existing document and assert it returns that existing version without a second row or lease. Assert operator and supervisor receive 403 envelopes for all three modifying routes, while all three active roles may search. Remove a user's active status after issuing its JWT and assert 401.
+  Assert an administrator can create a Markdown document and receives a `202` envelope with `accepted`, document/version IDs, and no path. Repeat the creation with the same client idempotency key and SHA and assert a `200` existing version without a second row, upload path, or lease; repeat the key with a different SHA and assert `409/KNOWLEDGE_IDEMPOTENCY_CONFLICT`. Submit an existing document's version with a new bounded key and new SHA, assert `202`, repeat that key plus SHA and assert `200` with no second row/lease, repeat the document+SHA without a key and assert `200`, then reuse the version key with a different SHA and assert `409/KNOWLEDGE_IDEMPOTENCY_CONFLICT`. Assert operator and supervisor receive 403 envelopes for create, list, version, and disable, while all three active roles may search. Remove a user's active status after issuing its JWT and assert 401.
 
-  Assert list responses paginate and omit `storage_path`, `lease_owner`, and upload bytes. Assert an unknown document is 404, a disabled document rejects a new version with 409, repeated disable is 200, and disabled documents disappear from search immediately. For search, assert query length and top-k validation produce `validation_error`, no active version produces `200/zero_hit`, active fake results return PostgreSQL text plus document/version/chunk citations and stage scores, a timeout produces exactly `503` with `error.category="timeout"` and `KNOWLEDGE_DEPENDENCY_TIMEOUT`, and an unavailable fake produces exactly `503` with `error.category="dependency_error"` and `KNOWLEDGE_MILVUS_UNAVAILABLE`. Neither error returns hits.
+  Assert list responses paginate and omit `storage_path`, `lease_owner`, and upload bytes. Assert an unknown document is 404, a disabled document rejects a new version with 409, repeated disable is 200, and disabled documents disappear from search immediately. For search, assert query length and top-k validation produce a `validation_error` envelope with a non-empty `request_id` that is used consistently within that response; assert no error field contains the request path, invalid raw query, or validation detail. Assert a non-knowledge validation error retains FastAPI's existing response. Assert no active version produces `200/zero_hit`, active fake results return PostgreSQL text plus document/version/chunk citations and stage scores, a timeout produces exactly `503` with `error.category="timeout"` and `KNOWLEDGE_DEPENDENCY_TIMEOUT`, and an unavailable fake produces exactly `503` with `error.category="dependency_error"` and `KNOWLEDGE_MILVUS_UNAVAILABLE`. Neither error returns hits.
+
+  With `caplog`, assert successful create/list and an upload failure emit request ID, actor ID, document/version ID when known, action/status, safe code, and duration; assert their messages omit upload text, query text, local path, vectors, and credentials.
 
 - [ ] **Step 2: Run RED**
 
@@ -811,9 +884,9 @@ Exact route map: `POST /knowledge/documents`, `GET /knowledge/documents`, `POST 
 
 - [ ] **Step 3: Implement only the five contract routes**
 
-  Extend `backend.schemas` with concrete document, version, citation, search-result, error, and envelope models. In `backend.routes`, use `Depends(get_current_user)` then `require_roles(UserRole.ADMIN)` for mutations; search accepts `OPERATOR`, `SUPERVISOR`, or `ADMIN` through the current database `User`. Route code first calls `read_and_validate_upload()`, then checks the creation idempotency key or existing document SHA before generating IDs or writing a path. Only a new version calls `store_validated_upload()`, followed by `create_document_version()` and one database commit; a transaction failure removes only that exact just-written path. A repeated key with a different SHA returns `409/KNOWLEDGE_IDEMPOTENCY_CONFLICT` without a write.
+  Extend `backend.schemas` with concrete document, version, citation, search-result, error, and envelope models. Each knowledge route injects the current database user directly with `Depends(require_roles(UserRole.ADMIN))` for create/list/version/disable or `Depends(require_roles(UserRole.OPERATOR, UserRole.SUPERVISOR, UserRole.ADMIN))` for search. Do not inject `get_current_user` separately or hand-call `require_roles`. Route code first calls `read_and_validate_upload()`, then checks the applicable creation or version idempotency key and existing document SHA before generating IDs or writing a path. Only a new version calls `store_validated_upload()`, followed by `create_document_version()` and one database commit; a transaction failure removes only that exact just-written path. Set `response.status_code = status.HTTP_200_OK` for an existing SHA/key hit, otherwise leave the documented `202`. A repeated key with a different SHA returns `409/KNOWLEDGE_IDEMPOTENCY_CONFLICT` without a write.
 
-  Add a path-scoped HTTP exception handler in `backend.main.create_app()`: for paths beginning `/knowledge/`, map authentication, authorization, and not-found exceptions to `KnowledgeEnvelope(status="error", data=None, quality=None, error=KnowledgeError(category=category, code=code, message=message))`; delegate every non-knowledge path to FastAPI's existing HTTP exception handler. Map `KnowledgeDependencyError` timeout codes to `503/timeout`, and other dependency codes to `503/dependency_error`. Keep `zero_hit` and `low_confidence` as successful search quality values, not exceptions.
+  Add two path-scoped handlers in `backend.main.create_app()`. For `/knowledge/` HTTP exceptions, map authentication, authorization, and not-found exceptions to a single generated `KnowledgeEnvelope(status="error", data=None, quality=None, error=KnowledgeError(category=category, code=code, message=message))`; delegate every non-knowledge HTTP exception to FastAPI's existing handler. Separately register a `RequestValidationError` handler that applies the same safe `validation_error/KNOWLEDGE_REQUEST_INVALID` envelope only for `/knowledge/`, with one generated non-empty request ID and no `exc.errors()` path/input/context; delegate every non-knowledge validation exception to FastAPI's existing validation handler. Map `KnowledgeDependencyError` timeout codes to `503/timeout`, and other dependency codes to `503/dependency_error`. Keep `zero_hit` and `low_confidence` as successful search quality values, not exceptions. Log only safe audit fields with stdlib `logging`.
 
 - [ ] **Step 4: Run GREEN API and authentication regressions**
 
@@ -837,11 +910,15 @@ Exact route map: `POST /knowledge/documents`, `GET /knowledge/documents`, `POST 
 
 **Files:**
 
+- Modify: `backend/knowledge_evaluation.py`
+- Create: `scripts/calibrate_knowledge_retrieval.py`
+- Create: `data/knowledge/evaluation/calibration.json`
 - Create: `tests/test_knowledge_integration.py`
 
 **Interfaces:**
 
 ```python
+# tests/test_knowledge_integration.py
 @pytest.mark.knowledge_integration
 @pytest.mark.skipif(
     os.getenv("RUN_KNOWLEDGE_INTEGRATION") != "1",
@@ -849,9 +926,13 @@ Exact route map: `POST /knowledge/documents`, `GET /knowledge/documents`, `POST 
 )
 async def test_knowledge_vertical_slice() -> None:
     pass
+
+# backend/knowledge_evaluation.py
+def write_selected_calibration(path: Path, selection: dict[str, object]) -> None:
+    pass
 ```
 
-The test uses configured `async_session_factory`, `LocalKnowledgeModels`, and `MilvusKnowledgeIndex`. It creates document/version/chunk rows with test UUID prefixes and deletes only those exact rows and their exact stable Milvus IDs in `finally`; it never drops, truncates, resets, or broadly deletes PostgreSQL, Milvus, uploads, or local models.
+The test uses configured `async_session_factory`, `LocalKnowledgeModels`, and `MilvusKnowledgeIndex`. It creates document/version/chunk rows with test UUID prefixes and deletes only those exact rows and their exact stable Milvus IDs in `finally`; it never drops, truncates, resets, or broadly deletes PostgreSQL, Milvus, uploads, or local models. `write_selected_calibration()` serializes the selected non-secret configuration to a same-directory temporary file, `fsync`s it, and applies `os.replace()` only after all real evaluation thresholds pass; it never writes a partial JSON file.
 
 - [ ] **Step 1: Write the default-skipped vertical acceptance test**
 
@@ -859,9 +940,11 @@ The test uses configured `async_session_factory`, `LocalKnowledgeModels`, and `M
 
   Set a test version to expired attempt 2 using PostgreSQL `func.now() - text("interval '1 second'")`; assert a new owner claims attempt 3 and the old owner cannot activate it. Set another test version to expired attempt 3 and assert it becomes `failed/KNOWLEDGE_ATTEMPTS_EXHAUSTED`; assert active, failed, and disabled rows are never claimed.
 
-  Run the real local Worker on a test version, assert its Milvus entries use stable IDs, and run it again without creating additional chunk rows or vector primary keys. Create version 2, let it activate, then complete version 1 and assert version 1 is `disabled/KNOWLEDGE_VERSION_SUPERSEDED` and never appears in an active-version filtered query. Disable the document and assert its result immediately disappears even if its vectors remain.
+  Run the real local Worker on a test version, assert its Milvus entries use stable IDs, and run it again without creating additional chunk rows or vector primary keys. To prove replay rather than merely observing that an active version is not claimed, monkeypatch the exact PostgreSQL chunk-persistence call to interrupt once after successful Milvus upsert but before chunk metadata/activation; let the Worker return the version to `accepted`, reclaim it with a valid new owner, and run it again. Query `MilvusKnowledgeIndex.existing_chunk_ids(chunk_ids=expected_ids)` and query PostgreSQL stable chunk IDs; assert the two exact sets are equal, each count is unchanged by replay, and no extra Milvus key exists. Cleanup calls `delete_chunk_ids(chunk_ids=expected_ids)` only after that exact-set assertion.
 
-  Load the fixed queries, compare dense-only, sparse-only, hybrid, and hybrid+rereank outcomes through `evaluate_retrieval()`, and assert `recall_at_10 >= 0.90`, `citation_document_version_accuracy == 1.0`, and `duplicate_vector_keys == 0`. Record MRR and index/query latency in the test report without treating them as a production target.
+  Create version 2, let it activate, then complete version 1 and assert version 1 is `disabled/KNOWLEDGE_VERSION_SUPERSEDED` and never appears in an active-version filtered query. Disable the document and assert its result immediately disappears even if its vectors remain.
+
+  Load the fixed queries and candidate grid. Record dense-only, sparse-only, hybrid, and hybrid+rereank typed per-query outcomes and elapsed times through `evaluate_retrieval()`. Assert the chosen hybrid+rereank configuration has `recall_at_10 >= 0.90` and `citation_document_version_accuracy == 1.0`; record MRR and latency without treating either as a production target. The duplicate-vector acceptance is the preceding real exact-set comparison, not a search-outcome metric.
 
 - [ ] **Step 2: Run RED in the normal environment**
 
@@ -873,9 +956,9 @@ The test uses configured `async_session_factory`, `LocalKnowledgeModels`, and `M
 
   Expected: the module collects and is skipped because `RUN_KNOWLEDGE_INTEGRATION` is absent; no model path or Milvus service is accessed.
 
-- [ ] **Step 3: Run the explicitly authorized vertical acceptance**
+- [ ] **Step 3: Run calibration and vertical acceptance only after explicit authorization**
 
-  Run only after PostgreSQL and the three Compose infrastructure services are healthy and local model paths have been intentionally provisioned:
+  Stop before this step until the user explicitly authorizes PostgreSQL, Milvus, and the local model paths. Then run only after PostgreSQL and the three Compose infrastructure services are healthy and local model paths have been intentionally provisioned:
 
   ```powershell
   docker compose up -d postgres etcd minio milvus
@@ -884,13 +967,14 @@ The test uses configured `async_session_factory`, `LocalKnowledgeModels`, and `M
   .\.venv\Scripts\alembic.exe upgrade head
   .\.venv\Scripts\alembic.exe current
   $env:RUN_KNOWLEDGE_INTEGRATION = "1"
+  .\.venv\Scripts\python.exe scripts/calibrate_knowledge_retrieval.py --write-calibration
   .\.venv\Scripts\python.exe -m pytest tests/test_knowledge_integration.py -m knowledge_integration -v
   Remove-Item Env:RUN_KNOWLEDGE_INTEGRATION
   ```
 
-  Expected: the opt-in test passes the PostgreSQL lease, monotonic activation, idempotent-vector, citation, and fixed-set metrics assertions. It does not access DeepSeek or any external service.
+  The script evaluates each finite candidate across dense, sparse, hybrid, and hybrid+rereank paths, selects deterministically, and atomically writes the final `calibration.json` only if its selected hybrid+rereank metrics meet Recall@10 >= 90% and citation document/version accuracy = 100%. The opt-in test then reloads that exact file and passes the PostgreSQL lease, monotonic activation, interrupted-preactivation replay, exact-key idempotency, citation, and fixed-set metric assertions. It does not access DeepSeek or any external service. If either threshold fails, the script leaves `calibration.json` absent or unchanged, this task must not be committed or marked complete, and execution stops for review.
 
-- [ ] **Step 4: Run the full non-network regression suite**
+- [ ] **Step 4: Run the full non-network regression suite after the real gate passes**
 
   Run:
 
@@ -903,12 +987,12 @@ The test uses configured `async_session_factory`, `LocalKnowledgeModels`, and `M
   git show --check HEAD
   ```
 
-  Expected: ordinary tests pass with `knowledge_integration` skipped, compilation succeeds, Alembic has no drift, and Git checks are clean.
+  Expected: ordinary tests pass with `knowledge_integration` skipped, compilation succeeds, Alembic has no drift, and Git checks are clean. Do not reach this commit step if Step 3 has not received explicit authorization or did not write a threshold-valid `calibration.json`.
 
 - [ ] **Step 5: Commit the opt-in acceptance coverage**
 
   ```powershell
-  git add tests/test_knowledge_integration.py
+  git add backend/knowledge_evaluation.py scripts/calibrate_knowledge_retrieval.py data/knowledge/evaluation/calibration.json tests/test_knowledge_integration.py
   git commit -m "test: verify hybrid knowledge retrieval"
   ```
 
@@ -916,18 +1000,22 @@ The test uses configured `async_session_factory`, `LocalKnowledgeModels`, and `M
 
 | Approved requirement | Plan coverage |
 |---|---|
-| Local PDF/DOCX/Markdown/TXT ingestion, secure paths, parsing, deterministic chunks | Tasks 1 and 3 |
 | `/model/` and upload Git boundary, local offline BGE-M3/reranker paths | Task 1 and Task 5 |
 | Milvus Standalone, etcd, MinIO, no Compose Worker | Task 1 |
-| Three PostgreSQL tables, exact status/lease checks, explicit migration | Task 2 |
-| Retryable/non-retryable/expired/third-attempt lifecycle and owner protection | Task 4 |
-| Stable IDs, idempotent Milvus upsert, inactive/orphan invisibility | Tasks 4, 5, and 8 |
+| Three PostgreSQL tables, `0002` base to `0003_knowledge_retrieval`, named constraints, version idempotency key | Task 2 |
+| `chunk_metadata` Python mapping to column `metadata`; duplicate paragraphs retain positions | Tasks 2 through 6 |
+| Local PDF/DOCX/Markdown/TXT ingestion, 20 MiB/200-page/1,000,000-character bounds, symlink protection, parse deadline, deterministic chunks | Task 3 |
+| Retryable/non-retryable/expired/third-attempt lifecycle, version/creator idempotency, and owner protection | Task 4 |
+| Stable IDs, idempotent Milvus upsert, interrupted-preactivation replay, exact-key cleanup, inactive/orphan invisibility | Tasks 4, 5, and 8 |
 | Newer-version monotonic activation and disabled superseded version | Tasks 4 and 8 |
-| BGE-M3 dense+sparse 1024 vectors, hybrid retrieval, local reranker | Tasks 5 and 6 |
-| Active-version filtering, canonical PostgreSQL citations, calibrated quality routing | Task 6 |
-| Administrator imports/list/versions/disable, read-only role search, real-time RBAC | Task 7 |
-| Envelope with request ID, status, data, quality, stable timeout/dependency categories | Task 7 |
-| Platform-neutral Chinese rules, fixed query set, Recall@10/citation/duplicate-vector evaluation | Tasks 6 and 8 |
+| BGE-M3 dense+sparse 1024 vectors, local reranker, configured deadlines, no automatic download | Task 5 |
+| Active-version/category filtering in PostgreSQL, separate dense/sparse score collection, deterministic client RRF, canonical citations | Task 6 |
+| Lazy cached search dependency only at first search; explicit Worker construction; no per-request model load | Tasks 5 through 7 |
+| Platform-neutral Chinese rules, fixed queries, finite candidates without premature selected calibration | Task 6 |
+| Administrator imports/list/versions/disable via direct role dependencies, version `Idempotency-Key` 200/202 contract, read-only role search | Task 7 |
+| Knowledge-only HTTP and `RequestValidationError` envelopes with safe request ID, stable timeout/dependency/validation categories, non-knowledge preservation | Task 7 |
+| Stdlib safe audit logging with request/actor/resource/status/code/duration and no sensitive data | Tasks 4 and 7 |
+| Explicitly authorized real four-path evaluation, atomic final calibration, Recall@10/citation gate, exact duplicate-vector-key set | Task 8 |
 | Mock-only ordinary tests and explicit PostgreSQL/Milvus/local-model acceptance | Tasks 1 through 8 |
 | No analysis Worker change, no queues, microservices, frontend, platform integration, or optimization API | Global Constraints and every task file list |
 
@@ -935,9 +1023,9 @@ The test uses configured `async_session_factory`, `LocalKnowledgeModels`, and `M
 
 - [x] Read the approved knowledge retrieval specification section by section and map every required subsystem, state invariant, API, error category, evaluation target, and exclusion above.
 - [x] Check all task files against the repository paths and existing FastAPI, SQLAlchemy, Alembic, authentication, Worker, seed, Compose, and test patterns.
-- [x] Verify cross-task signatures: `KnowledgeVersionStatus`, `KnowledgeDocumentVersion`, `ChunkDraft`, stable chunk IDs, lease function parameters, `KnowledgeDependencyError`, search result fields, error categories, and opt-in marker name remain identical.
+- [x] Verify cross-task signatures: `KnowledgeVersionStatus`, `KnowledgeDocumentVersion.idempotency_key`, `KnowledgeChunk.chunk_metadata`, `ChunkDraft.chunk_metadata`, stable chunk IDs, lease function parameters, deadline behavior, `KnowledgeDependencyError`, separate dense/sparse score methods, typed evaluation outcomes, route dependencies, error categories, and opt-in marker name remain identical.
 - [x] Scan this plan for incomplete markers and vague cross-task directions; each task contains named files, executable RED/GREEN commands, expected outcomes, minimal implementation steps, and a standalone commit.
-- [x] Confirm the plan adds neither a provider factory nor a future queue/service abstraction and preserves the existing analysis workflow/Worker untouched.
+- [x] Confirm the plan adds neither a provider/factory framework nor a future queue/service abstraction, keeps local model creation lazy or explicit as required, and preserves the existing analysis workflow/Worker untouched.
 
 ## Full Acceptance Command Set
 
@@ -956,6 +1044,17 @@ git status --short
 ```
 
 Run `RUN_KNOWLEDGE_INTEGRATION=1` only for Task 8 after explicit local-service/model authorization. No real DeepSeek smoke or other external model request belongs to this plan.
+
+After that explicit authorization, Task 8 additionally requires the successful gate below before staging `calibration.json`:
+
+```powershell
+$env:RUN_KNOWLEDGE_INTEGRATION = "1"
+.\.venv\Scripts\python.exe scripts/calibrate_knowledge_retrieval.py --write-calibration
+.\.venv\Scripts\python.exe -m pytest tests/test_knowledge_integration.py -m knowledge_integration -v
+Remove-Item Env:RUN_KNOWLEDGE_INTEGRATION
+```
+
+If the chosen real configuration is below Recall@10 90% or citation document/version accuracy 100%, do not stage or commit `calibration.json`.
 
 ## Resume and Representation Boundary
 
