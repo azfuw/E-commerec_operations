@@ -20,6 +20,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.common import (
     AgentCallType,
+    KnowledgeVersionStatus,
     OrderStatus,
     RefundStatus,
     UserRole,
@@ -357,4 +358,132 @@ class AgentCall(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     estimated_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
     error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+    __table_args__ = (
+        UniqueConstraint(
+            "created_by",
+            "idempotency_key",
+            name="uq_knowledge_documents_created_by_idempotency_key",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    category: Mapped[str] = mapped_column(String(128), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=lambda: True, nullable=False)
+    current_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "knowledge_document_versions.id",
+            name="fk_knowledge_documents_current_version_id",
+            use_alter=True,
+        )
+    )
+    created_by: Mapped[str] = mapped_column(
+        ForeignKey("users.id", name="fk_knowledge_documents_created_by"), nullable=False
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class KnowledgeDocumentVersion(Base):
+    __tablename__ = "knowledge_document_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "version_number",
+            name="uq_knowledge_document_versions_document_id_version_number",
+        ),
+        UniqueConstraint(
+            "document_id",
+            "sha256",
+            name="uq_knowledge_document_versions_document_id_sha256",
+        ),
+        UniqueConstraint(
+            "document_id",
+            "idempotency_key",
+            name="uq_knowledge_document_versions_document_id_idempotency_key",
+        ),
+        CheckConstraint(
+            "status IN ('accepted', 'processing', 'active', 'failed', 'disabled')",
+            name="ck_knowledge_document_versions_status",
+        ),
+        CheckConstraint(
+            "attempt_count BETWEEN 0 AND 3",
+            name="ck_knowledge_document_versions_attempt_count",
+        ),
+        CheckConstraint(
+            "version_number >= 1",
+            name="ck_knowledge_document_versions_version_number",
+        ),
+        CheckConstraint(
+            "(status = 'processing' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL) "
+            "OR (status != 'processing' AND lease_owner IS NULL AND lease_expires_at IS NULL)",
+            name="ck_knowledge_document_versions_lease_state",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_documents.id", name="fk_knowledge_document_versions_document_id"),
+        nullable=False,
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    storage_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    status: Mapped[KnowledgeVersionStatus] = mapped_column(
+        Enum(
+            KnowledgeVersionStatus,
+            name="knowledge_version_status",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
+        default=lambda: KnowledgeVersionStatus.ACCEPTED,
+        nullable=False,
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, default=lambda: 0, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    parser_version: Mapped[str | None] = mapped_column(String(64))
+    chunker_version: Mapped[str | None] = mapped_column(String(64))
+    embedding_version: Mapped[str | None] = mapped_column(String(64))
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class KnowledgeChunk(Base):
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id",
+            "chunk_index",
+            name="uq_knowledge_chunks_version_id_chunk_index",
+        ),
+        CheckConstraint("chunk_index >= 0", name="ck_knowledge_chunks_chunk_index"),
+        CheckConstraint("token_count > 0", name="ck_knowledge_chunks_token_count"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    version_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_document_versions.id", name="fk_knowledge_chunks_version_id"),
+        nullable=False,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_text: Mapped[str] = mapped_column(Text, nullable=False)
+    chunk_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSON, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

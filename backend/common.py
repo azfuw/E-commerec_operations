@@ -40,6 +40,14 @@ class WorkflowQuality(StrEnum):
     DEGRADED = "degraded"
 
 
+class KnowledgeVersionStatus(StrEnum):
+    ACCEPTED = "accepted"
+    PROCESSING = "processing"
+    ACTIVE = "active"
+    FAILED = "failed"
+    DISABLED = "disabled"
+
+
 class AgentCallType(StrEnum):
     PRIMARY = "primary"
     SCHEMA_REPAIR = "schema_repair"
