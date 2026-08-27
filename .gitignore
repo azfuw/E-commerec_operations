@@ -1,4 +1,5 @@
 .env.local
+/model/
 .venv/
 __pycache__/
 .pytest_cache/

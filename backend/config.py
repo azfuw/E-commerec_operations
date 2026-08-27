@@ -1,5 +1,6 @@
 from decimal import Decimal
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,13 @@ class Settings(BaseSettings):
     deepseek_price_per_million_tokens: Decimal | None = None
     langgraph_database_url: str = "postgresql://ecommerce:ecommerce@localhost:5434/ecommerce"
     analysis_lease_seconds: int = 60
+    knowledge_upload_dir: Path = Path("data/uploads/knowledge")
+    knowledge_embedding_model_path: Path = Path("model/bge-m3")
+    knowledge_reranker_model_path: Path = Path("model/bge-reranker-v2-m3")
+    milvus_uri: str = "http://localhost:19530"
+    milvus_collection: str = "knowledge_chunks"
+    knowledge_lease_seconds: int = 60
+    knowledge_dependency_timeout_seconds: float = 30.0
 
 
 @lru_cache
