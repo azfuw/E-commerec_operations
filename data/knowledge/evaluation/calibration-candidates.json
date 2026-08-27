@@ -1,0 +1,30 @@
+[
+  {
+    "id": "dense-10",
+    "retrieval_path": "dense",
+    "candidate_limit": 10,
+    "rrf_k": 60,
+    "threshold": 0.2
+  },
+  {
+    "id": "sparse-10",
+    "retrieval_path": "sparse",
+    "candidate_limit": 10,
+    "rrf_k": 60,
+    "threshold": 0.2
+  },
+  {
+    "id": "hybrid-10",
+    "retrieval_path": "hybrid",
+    "candidate_limit": 10,
+    "rrf_k": 60,
+    "threshold": 0.03
+  },
+  {
+    "id": "hybrid-rerank-10",
+    "retrieval_path": "hybrid_rerank",
+    "candidate_limit": 10,
+    "rrf_k": 60,
+    "threshold": 0.2
+  }
+]

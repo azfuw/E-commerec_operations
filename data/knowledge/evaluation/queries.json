@@ -1,0 +1,44 @@
+[
+  {
+    "id": "title-keywords",
+    "query": "标题中应怎样写品类和规格关键词？",
+    "expected_document_name": "项目演示规则",
+    "expected_version_number": 1,
+    "expected_section": "标题关键词"
+  },
+  {
+    "id": "selling-points",
+    "query": "商品卖点可以凭空承诺效果吗？",
+    "expected_document_name": "项目演示规则",
+    "expected_version_number": 1,
+    "expected_section": "卖点详情"
+  },
+  {
+    "id": "claims",
+    "query": "如何避免夸大宣传和绝对化用语？",
+    "expected_document_name": "项目演示规则",
+    "expected_version_number": 1,
+    "expected_section": "禁限词与夸大宣传"
+  },
+  {
+    "id": "attributes",
+    "query": "类目和材质属性要如何核对？",
+    "expected_document_name": "项目演示规则",
+    "expected_version_number": 1,
+    "expected_section": "类目属性"
+  },
+  {
+    "id": "sku-consistency",
+    "query": "SKU、价格和规格说明需要保持什么关系？",
+    "expected_document_name": "项目演示规则",
+    "expected_version_number": 1,
+    "expected_section": "SKU、价格与规格一致性"
+  },
+  {
+    "id": "refunds",
+    "query": "售后退款说明应满足什么要求？",
+    "expected_document_name": "项目演示规则",
+    "expected_version_number": 1,
+    "expected_section": "售后退款"
+  }
+]
