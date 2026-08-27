@@ -1,11 +1,87 @@
-from fastapi import FastAPI
+from uuid import UUID, uuid4
+
+from fastapi import FastAPI, Request, status
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.routes import router
+from backend.schemas import KnowledgeEnvelope, KnowledgeError
+
+
+def _knowledge_error_response(
+    *, status_code: int, category: str, code: str, message: str, request_id: str, headers=None
+) -> JSONResponse:
+    envelope = KnowledgeEnvelope(
+        request_id=request_id,
+        status="error",
+        data=None,
+        quality=None,
+        error=KnowledgeError(category=category, code=code, message=message),
+    )
+    return JSONResponse(
+        status_code=status_code, content=envelope.model_dump(mode="json"), headers=headers
+    )
+
+
+def _exception_request_id(exception: StarletteHTTPException) -> str:
+    detail = exception.detail
+    value = detail.get("request_id") if isinstance(detail, dict) else None
+    if isinstance(value, str) and value:
+        try:
+            return str(UUID(value))
+        except ValueError:
+            pass
+    return str(uuid4())
+
+
+def _knowledge_http_mapping(exception: StarletteHTTPException) -> tuple[str, str, str]:
+    detail = exception.detail
+    detail_code = detail.get("code") if isinstance(detail, dict) else None
+    safe_code = detail_code if isinstance(detail_code, str) and detail_code.startswith("KNOWLEDGE_") else None
+    if exception.status_code == status.HTTP_401_UNAUTHORIZED:
+        return "authorization_error", "KNOWLEDGE_AUTHENTICATION_REQUIRED", "Authentication required"
+    if exception.status_code == status.HTTP_403_FORBIDDEN:
+        return "authorization_error", "KNOWLEDGE_AUTHORIZATION_REQUIRED", "Authorization required"
+    if exception.status_code == status.HTTP_404_NOT_FOUND:
+        return "not_found", safe_code or "KNOWLEDGE_NOT_FOUND", "Knowledge resource not found"
+    if exception.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+        if safe_code == "KNOWLEDGE_DEPENDENCY_TIMEOUT":
+            return "timeout", safe_code, "Knowledge dependency timed out"
+        return "dependency_error", safe_code or "KNOWLEDGE_DEPENDENCY_UNAVAILABLE", "Knowledge dependency unavailable"
+    return "validation_error", safe_code or "KNOWLEDGE_REQUEST_INVALID", "Knowledge request is invalid"
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="智营台 API", version="0.1.0")
     app.include_router(router)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def knowledge_http_exception(request: Request, exception: StarletteHTTPException):
+        if not request.url.path.startswith("/knowledge/"):
+            return await http_exception_handler(request, exception)
+        category, code, message = _knowledge_http_mapping(exception)
+        return _knowledge_error_response(
+            status_code=exception.status_code,
+            category=category,
+            code=code,
+            message=message,
+            request_id=_exception_request_id(exception),
+            headers=exception.headers,
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def knowledge_validation_exception(request: Request, exception: RequestValidationError):
+        if not request.url.path.startswith("/knowledge/"):
+            return await request_validation_exception_handler(request, exception)
+        return _knowledge_error_response(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            category="validation_error",
+            code="KNOWLEDGE_REQUEST_INVALID",
+            message="Knowledge request is invalid",
+            request_id=str(uuid4()),
+        )
 
     @app.get("/health/live", tags=["health"])
     async def liveness() -> dict[str, str]:

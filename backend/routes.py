@@ -1,5 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+import logging
+from time import perf_counter
+from typing import Annotated, Literal
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Response, UploadFile, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.analysis_runs import (
@@ -10,18 +15,43 @@ from backend.analysis_runs import (
 from backend.auth import (
     create_access_token,
     get_current_user,
+    require_roles,
     require_store_access,
     verify_password,
 )
-from backend.common import UserRole, UserStatus, WorkflowStatus
+from backend.common import KnowledgeVersionStatus, UserRole, UserStatus, WorkflowStatus
 from backend.config import Settings, get_settings
 from backend.database import get_session
-from backend.models import Product, Store, User, UserStoreScope
+from backend.knowledge_content import KnowledgeContentError, read_and_validate_upload, store_validated_upload
+from backend.knowledge_index import KnowledgeDependencyError
+from backend.knowledge_runs import (
+    create_document_version,
+    disable_knowledge_document,
+    find_document_by_idempotency_key,
+    find_document_version_by_idempotency_key,
+    find_document_version_by_sha,
+)
+from backend.knowledge_search import (
+    KnowledgeSearchLoader,
+    get_knowledge_search_loader,
+    search_active_knowledge,
+)
+from backend.models import (
+    KnowledgeDocument,
+    KnowledgeDocumentVersion,
+    Product,
+    Store,
+    User,
+    UserStoreScope,
+)
 from backend.schemas import (
     AccessToken,
     AnalysisCandidateView,
     AnalysisRunAccepted,
     AnalysisRunRequest,
+    KnowledgeCitation,
+    KnowledgeEnvelope,
+    KnowledgeSearchRequest,
     LoginRequest,
     ProductSummary,
     StoreSummary,
@@ -29,6 +59,71 @@ from backend.schemas import (
 )
 
 router = APIRouter()
+_logger = logging.getLogger("backend.knowledge")
+
+
+def _request_id() -> str:
+    return str(uuid4())
+
+
+def _envelope(
+    *,
+    request_id: str,
+    status_value: Literal["accepted", "success"],
+    data: dict[str, object] | None = None,
+    quality: dict[str, str] | None = None,
+) -> KnowledgeEnvelope:
+    return KnowledgeEnvelope(
+        request_id=request_id,
+        status=status_value,
+        data=data,
+        quality=quality,
+        error=None,
+    )
+
+
+def _audit(
+    *,
+    started: float,
+    request_id: str,
+    actor_id: str,
+    action: str,
+    outcome: str,
+    document_id: str | None = None,
+    version_id: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    _logger.info(
+        "knowledge_api request_id=%s actor_id=%s document_id=%s version_id=%s "
+        "action=%s status=%s error_code=%s elapsed_ms=%d",
+        request_id,
+        actor_id,
+        document_id or "-",
+        version_id or "-",
+        action,
+        outcome,
+        error_code or "-",
+        int((perf_counter() - started) * 1000),
+    )
+
+
+def _knowledge_http_error(status_code: int, code: str, *, request_id: str) -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"code": code, "request_id": request_id})
+
+
+def _version_data(document: KnowledgeDocument, version: KnowledgeDocumentVersion) -> dict[str, object]:
+    return {
+        "document_id": document.id,
+        "version_id": version.id,
+        "status": version.status.value,
+    }
+
+
+def _remove_stored_upload(path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 @router.post("/auth/login", response_model=AccessToken)
@@ -152,3 +247,470 @@ async def read_analysis_candidates(
         )
     candidates = await list_analysis_candidates(session, run.id)
     return [AnalysisCandidateView.model_validate(candidate) for candidate in candidates]
+
+
+@router.post(
+    "/knowledge/documents",
+    response_model=KnowledgeEnvelope,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_knowledge_document(
+    response: Response,
+    name: Annotated[str, Form(min_length=1, max_length=128)],
+    category: Annotated[str, Form(min_length=1, max_length=64)],
+    file: UploadFile,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key", max_length=128)] = None,
+    user: User = Depends(require_roles(UserRole.ADMIN)),
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+) -> KnowledgeEnvelope:
+    started = perf_counter()
+    request_id = _request_id()
+    actor_id = user.id
+    try:
+        upload = await read_and_validate_upload(file)
+    except KnowledgeContentError as error:
+        _audit(
+            started=started,
+            request_id=request_id,
+            actor_id=actor_id,
+            action="create",
+            outcome="error",
+            error_code=error.code,
+        )
+        raise _knowledge_http_error(
+            status.HTTP_400_BAD_REQUEST, error.code, request_id=request_id
+        ) from None
+
+    if idempotency_key:
+        existing_document = await find_document_by_idempotency_key(
+            session, created_by=actor_id, idempotency_key=idempotency_key
+        )
+        if existing_document is not None:
+            existing_version = await find_document_version_by_sha(
+                session, document_id=existing_document.id, sha256=upload.sha256
+            )
+            if existing_version is None:
+                _audit(
+                    started=started,
+                    request_id=request_id,
+                    actor_id=actor_id,
+                    action="create",
+                    outcome="error",
+                    document_id=existing_document.id,
+                    error_code="KNOWLEDGE_IDEMPOTENCY_CONFLICT",
+                )
+                raise _knowledge_http_error(
+                    status.HTTP_409_CONFLICT,
+                    "KNOWLEDGE_IDEMPOTENCY_CONFLICT",
+                    request_id=request_id,
+                )
+            response.status_code = status.HTTP_200_OK
+            _audit(
+                started=started,
+                request_id=request_id,
+                actor_id=actor_id,
+                action="create",
+                outcome="success",
+                document_id=existing_document.id,
+                version_id=existing_version.id,
+            )
+            return _envelope(
+                request_id=request_id,
+                status_value="success",
+                data=_version_data(existing_document, existing_version),
+            )
+
+    document_id, version_id = str(uuid4()), str(uuid4())
+    try:
+        stored = store_validated_upload(
+            upload,
+            upload_dir=settings.knowledge_upload_dir,
+            document_id=document_id,
+            version_id=version_id,
+        )
+    except KnowledgeContentError as error:
+        _audit(
+            started=started,
+            request_id=request_id,
+            actor_id=actor_id,
+            action="create",
+            outcome="error",
+            document_id=document_id,
+            version_id=version_id,
+            error_code=error.code,
+        )
+        raise _knowledge_http_error(
+            status.HTTP_400_BAD_REQUEST, error.code, request_id=request_id
+        ) from None
+    try:
+        document, version, created = await create_document_version(
+            session,
+            document_id=document_id,
+            version_id=version_id,
+        created_by=actor_id,
+            name=name,
+            category=category,
+            sha256=stored.sha256,
+            original_filename=str(stored.original_filename),
+            mime_type=stored.mime_type,
+            storage_path=str(stored.storage_path),
+            idempotency_key=idempotency_key,
+        )
+        if not created:
+            _remove_stored_upload(stored.storage_path)
+            response.status_code = status.HTTP_200_OK
+            result_status = "success"
+        else:
+            await session.commit()
+            result_status = "accepted"
+    except ValueError as error:
+        await session.rollback()
+        _remove_stored_upload(stored.storage_path)
+        code = str(error)
+        _audit(
+            started=started,
+            request_id=request_id,
+            actor_id=actor_id,
+            action="create",
+            outcome="error",
+            error_code=code,
+        )
+        raise _knowledge_http_error(status.HTTP_409_CONFLICT, code, request_id=request_id) from None
+    except Exception:
+        await session.rollback()
+        _remove_stored_upload(stored.storage_path)
+        _audit(
+            started=started,
+            request_id=request_id,
+            actor_id=actor_id,
+            action="create",
+            outcome="error",
+            error_code="KNOWLEDGE_WRITE_FAILED",
+        )
+        raise _knowledge_http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "KNOWLEDGE_WRITE_FAILED",
+            request_id=request_id,
+        ) from None
+
+    _audit(
+        started=started,
+        request_id=request_id,
+        actor_id=actor_id,
+        action="create",
+        outcome=result_status,
+        document_id=document.id,
+        version_id=version.id,
+    )
+    return _envelope(
+        request_id=request_id,
+        status_value=result_status,
+        data=_version_data(document, version),
+    )
+
+
+@router.get("/knowledge/documents", response_model=KnowledgeEnvelope)
+async def list_knowledge_documents(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    category: str | None = Query(default=None, min_length=1, max_length=64),
+    enabled: bool | None = None,
+    version_status: KnowledgeVersionStatus | None = None,
+    user: User = Depends(require_roles(UserRole.ADMIN)),
+    session: AsyncSession = Depends(get_session),
+) -> KnowledgeEnvelope:
+    started = perf_counter()
+    request_id = _request_id()
+    actor_id = user.id
+    statement = select(KnowledgeDocument)
+    if category is not None:
+        statement = statement.where(KnowledgeDocument.category == category)
+    if enabled is not None:
+        statement = statement.where(KnowledgeDocument.enabled.is_(enabled))
+    if version_status is not None:
+        statement = statement.where(
+            KnowledgeDocument.id.in_(
+                select(KnowledgeDocumentVersion.document_id).where(
+                    KnowledgeDocumentVersion.status == version_status
+                )
+            )
+        )
+    total = await session.scalar(select(func.count()).select_from(statement.subquery()))
+    documents = list(
+        (
+            await session.scalars(
+                statement.order_by(KnowledgeDocument.id).offset((page - 1) * page_size).limit(page_size)
+            )
+        ).all()
+    )
+    current_ids = [document.current_version_id for document in documents if document.current_version_id]
+    current_versions = {
+        version.id: version
+        for version in (
+            await session.scalars(
+                select(KnowledgeDocumentVersion).where(KnowledgeDocumentVersion.id.in_(current_ids))
+            )
+        ).all()
+    }
+    items = [
+        {
+            "document_id": document.id,
+            "name": document.name,
+            "category": document.category,
+            "enabled": document.enabled,
+            "current_version_id": document.current_version_id,
+            "current_version_status": current_versions[document.current_version_id].status.value
+            if document.current_version_id in current_versions
+            else None,
+        }
+        for document in documents
+    ]
+    _audit(
+        started=started,
+        request_id=request_id,
+        actor_id=user.id,
+        action="list",
+        outcome="success",
+    )
+    return _envelope(
+        request_id=request_id,
+        status_value="success",
+        data={"page": page, "page_size": page_size, "total": total or 0, "items": items},
+    )
+
+
+@router.post(
+    "/knowledge/documents/{document_id}/versions",
+    response_model=KnowledgeEnvelope,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_knowledge_document_version(
+    response: Response,
+    document_id: str,
+    file: UploadFile,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key", max_length=128)] = None,
+    user: User = Depends(require_roles(UserRole.ADMIN)),
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+) -> KnowledgeEnvelope:
+    started = perf_counter()
+    request_id = _request_id()
+    actor_id = user.id
+    try:
+        upload = await read_and_validate_upload(file)
+    except KnowledgeContentError as error:
+        _audit(
+            started=started,
+            request_id=request_id,
+            actor_id=actor_id,
+            action="version",
+            outcome="error",
+            document_id=document_id,
+            error_code=error.code,
+        )
+        raise _knowledge_http_error(
+            status.HTTP_400_BAD_REQUEST, error.code, request_id=request_id
+        ) from None
+
+    document = await session.get(KnowledgeDocument, document_id)
+    if document is None:
+        raise _knowledge_http_error(
+            status.HTTP_404_NOT_FOUND, "KNOWLEDGE_DOCUMENT_NOT_FOUND", request_id=request_id
+        )
+    if not document.enabled:
+        raise _knowledge_http_error(
+            status.HTTP_409_CONFLICT, "KNOWLEDGE_DOCUMENT_DISABLED", request_id=request_id
+        )
+    if idempotency_key:
+        existing_version = await find_document_version_by_idempotency_key(
+            session, document_id=document_id, idempotency_key=idempotency_key
+        )
+        if existing_version is not None:
+            if existing_version.sha256 != upload.sha256:
+                raise _knowledge_http_error(
+                    status.HTTP_409_CONFLICT,
+                    "KNOWLEDGE_IDEMPOTENCY_CONFLICT",
+                    request_id=request_id,
+                )
+            response.status_code = status.HTTP_200_OK
+            _audit(
+                started=started,
+                request_id=request_id,
+                actor_id=actor_id,
+                action="version",
+                outcome="success",
+                document_id=document.id,
+                version_id=existing_version.id,
+            )
+            return _envelope(
+                request_id=request_id,
+                status_value="success",
+                data=_version_data(document, existing_version),
+            )
+    existing_version = await find_document_version_by_sha(
+        session, document_id=document_id, sha256=upload.sha256
+    )
+    if existing_version is not None:
+        response.status_code = status.HTTP_200_OK
+        _audit(
+            started=started,
+            request_id=request_id,
+            actor_id=actor_id,
+            action="version",
+            outcome="success",
+            document_id=document.id,
+            version_id=existing_version.id,
+        )
+        return _envelope(
+            request_id=request_id,
+            status_value="success",
+            data=_version_data(document, existing_version),
+        )
+
+    version_id = str(uuid4())
+    try:
+        stored = store_validated_upload(
+            upload,
+            upload_dir=settings.knowledge_upload_dir,
+            document_id=document_id,
+            version_id=version_id,
+        )
+    except KnowledgeContentError as error:
+        _audit(
+            started=started,
+            request_id=request_id,
+            actor_id=actor_id,
+            action="version",
+            outcome="error",
+            document_id=document_id,
+            version_id=version_id,
+            error_code=error.code,
+        )
+        raise _knowledge_http_error(
+            status.HTTP_400_BAD_REQUEST, error.code, request_id=request_id
+        ) from None
+    try:
+        _, version, created = await create_document_version(
+            session,
+            document_id=document_id,
+            version_id=version_id,
+            created_by=actor_id,
+            name=None,
+            category=None,
+            sha256=stored.sha256,
+            original_filename=str(stored.original_filename),
+            mime_type=stored.mime_type,
+            storage_path=str(stored.storage_path),
+            idempotency_key=idempotency_key,
+        )
+        if not created:
+            _remove_stored_upload(stored.storage_path)
+            response.status_code = status.HTTP_200_OK
+            result_status = "success"
+        else:
+            await session.commit()
+            result_status = "accepted"
+    except ValueError as error:
+        await session.rollback()
+        _remove_stored_upload(stored.storage_path)
+        raise _knowledge_http_error(
+            status.HTTP_409_CONFLICT, str(error), request_id=request_id
+        ) from None
+    except Exception:
+        await session.rollback()
+        _remove_stored_upload(stored.storage_path)
+        raise _knowledge_http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "KNOWLEDGE_WRITE_FAILED",
+            request_id=request_id,
+        ) from None
+    _audit(
+        started=started,
+        request_id=request_id,
+        actor_id=actor_id,
+        action="version",
+        outcome=result_status,
+        document_id=document.id,
+        version_id=version.id,
+    )
+    return _envelope(
+        request_id=request_id,
+        status_value=result_status,
+        data=_version_data(document, version),
+    )
+
+
+@router.post("/knowledge/documents/{document_id}/disable", response_model=KnowledgeEnvelope)
+async def disable_knowledge_document_route(
+    document_id: str,
+    user: User = Depends(require_roles(UserRole.ADMIN)),
+    session: AsyncSession = Depends(get_session),
+) -> KnowledgeEnvelope:
+    started = perf_counter()
+    request_id = _request_id()
+    if not await disable_knowledge_document(session, document_id=document_id):
+        raise _knowledge_http_error(
+            status.HTTP_404_NOT_FOUND, "KNOWLEDGE_DOCUMENT_NOT_FOUND", request_id=request_id
+        )
+    _audit(
+        started=started,
+        request_id=request_id,
+        actor_id=user.id,
+        action="disable",
+        outcome="success",
+        document_id=document_id,
+    )
+    return _envelope(
+        request_id=request_id,
+        status_value="success",
+        data={"document_id": document_id, "enabled": False},
+    )
+
+
+@router.post("/knowledge/search", response_model=KnowledgeEnvelope)
+async def search_knowledge_route(
+    request: KnowledgeSearchRequest,
+    user: User = Depends(
+        require_roles(UserRole.OPERATOR, UserRole.SUPERVISOR, UserRole.ADMIN)
+    ),
+    session: AsyncSession = Depends(get_session),
+    load_dependencies: KnowledgeSearchLoader = Depends(get_knowledge_search_loader),
+) -> KnowledgeEnvelope:
+    started = perf_counter()
+    request_id = _request_id()
+    try:
+        outcome = await search_active_knowledge(
+            session,
+            query=request.query,
+            categories=request.categories,
+            top_k=request.top_k,
+            retrieval_path="hybrid_rerank",
+            load_dependencies=load_dependencies,
+        )
+    except KnowledgeDependencyError as error:
+        _audit(
+            started=started,
+            request_id=request_id,
+            actor_id=user.id,
+            action="search",
+            outcome="error",
+            error_code=error.code,
+        )
+        raise _knowledge_http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE, error.code, request_id=request_id
+        ) from None
+    citations = [KnowledgeCitation(**hit.__dict__).model_dump(mode="json") for hit in outcome.hits]
+    _audit(
+        started=started,
+        request_id=request_id,
+        actor_id=user.id,
+        action="search",
+        outcome="success",
+    )
+    return _envelope(
+        request_id=request_id,
+        status_value="success",
+        data={"citations": citations},
+        quality={"status": outcome.quality_status},
+    )

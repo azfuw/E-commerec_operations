@@ -189,3 +189,39 @@ class AgentAnalysisResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     candidates: list[AgentCandidateDraft]
+
+
+class KnowledgeError(BaseModel):
+    category: Literal[
+        "timeout", "dependency_error", "validation_error", "authorization_error", "not_found"
+    ]
+    code: str
+    message: str
+
+
+class KnowledgeEnvelope(BaseModel):
+    request_id: str
+    status: Literal["accepted", "success", "error"]
+    data: dict[str, object] | None
+    quality: dict[str, str] | None
+    error: KnowledgeError | None
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    categories: list[str] | None = Field(default=None, max_length=20)
+    top_k: int = Field(default=10, ge=1, le=20)
+
+
+class KnowledgeCitation(BaseModel):
+    chunk_id: str
+    document_name: str
+    version_number: int
+    category: str
+    canonical_text: str
+    chunk_metadata: dict[str, object]
+    dense_score: float | None
+    sparse_score: float | None
+    fusion_score: float | None
+    reranker_score: float | None
+    final_score: float
