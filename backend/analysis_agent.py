@@ -199,13 +199,25 @@ class DeepSeekAnalysisClient:
             return AgentInvocation(response=None, records=[], error_code="DEEPSEEK_KEY_MISSING")
 
         input_hash = _input_hash(facts)
+        instruction = (
+            "Return JSON candidates with only product_id, rank, impact_explanation, reason, "
+            "recommended_action, and confidence. impact_explanation、reason、recommended_action "
+            "必须使用简洁简体中文。"
+            if call_type is AgentCallType.PRIMARY
+            else "仅基于提供的可信 facts 重新生成 JSON。顶层对象只能是 candidates。"
+            "facts.candidates 中每个 product_id 恰好一项且 ID 原样使用。"
+            "字段只能为 product_id、rank、impact_explanation、reason、recommended_action、confidence。"
+            "rank 恰为 1..N 且不重复。confidence 是 0..1 数字。"
+            "impact_explanation、reason、recommended_action 必须使用简洁简体中文。"
+            "仅输出 JSON、无 Markdown、无额外字段。"
+        )
         payload = {
             "model": self.settings.deepseek_model,
             "response_format": {"type": "json_object"},
             "messages": [
                 {
                     "role": "system",
-                    "content": "Return JSON candidates with only product_id, rank, impact_explanation, reason, recommended_action, and confidence. impact_explanation、reason、recommended_action 必须使用简洁简体中文。",
+                    "content": instruction,
                 },
                 {
                     "role": "user",

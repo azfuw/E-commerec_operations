@@ -271,7 +271,7 @@ async def test_client_retries_rate_limits_and_renews_before_each_attempt() -> No
     assert {record.node_name for record in invocation.records} == {"call_analysis_agent"}
 
 
-async def test_client_post_contract_requires_concise_simplified_chinese_explanations() -> None:
+async def test_client_post_contract_separates_primary_and_schema_repair_instructions() -> None:
     facts = make_facts()
     requests: list[dict[str, object]] = []
 
@@ -280,25 +280,49 @@ async def test_client_post_contract_requires_concise_simplified_chinese_explanat
         requests.append(json.loads(request.content))
         return completion(response_content(facts))
 
-    invocation = await client(httpx.MockTransport(handler)).request(
+    primary = await client(httpx.MockTransport(handler)).request(
         facts, call_type=AgentCallType.PRIMARY
     )
+    repair = await client(httpx.MockTransport(handler)).request(
+        facts, call_type=AgentCallType.SCHEMA_REPAIR
+    )
 
-    assert invocation.response is not None
-    assert requests[0]["response_format"] == {"type": "json_object"}
-    assert requests[0]["model"] == "deepseek-v4-flash"
-    instruction = requests[0]["messages"][0]["content"]
-    assert "impact_explanation、reason、recommended_action 必须使用简洁简体中文。" in instruction
+    assert primary.response is not None
+    assert repair.response is not None
+    assert len(requests) == 2
+    primary_payload, repair_payload = requests
+    assert primary_payload["response_format"] == repair_payload["response_format"] == {
+        "type": "json_object"
+    }
+    assert primary_payload["model"] == repair_payload["model"] == "deepseek-v4-flash"
+    primary_instruction = primary_payload["messages"][0]["content"]
+    assert primary_instruction == (
+        "Return JSON candidates with only product_id, rank, impact_explanation, reason, "
+        "recommended_action, and confidence. impact_explanation、reason、recommended_action "
+        "必须使用简洁简体中文。"
+    )
+    repair_instruction = repair_payload["messages"][0]["content"]
+    assert repair_instruction != primary_instruction
     assert all(
-        field in instruction
-        for field in (
-            "product_id",
-            "rank",
-            "impact_explanation",
-            "reason",
-            "recommended_action",
-            "confidence",
+        rule in repair_instruction
+        for rule in (
+            "仅基于提供的可信 facts 重新生成 JSON。",
+            "顶层对象只能是 candidates。",
+            "facts.candidates 中每个 product_id 恰好一项且 ID 原样使用。",
+            "字段只能为 product_id、rank、impact_explanation、reason、recommended_action、confidence。",
+            "rank 恰为 1..N 且不重复。",
+            "confidence 是 0..1 数字。",
+            "impact_explanation、reason、recommended_action 必须使用简洁简体中文。",
+            "仅输出 JSON、无 Markdown、无额外字段。",
         )
+    )
+    assert primary_payload["messages"][1]["content"] == repair_payload["messages"][1]["content"]
+    assert json.loads(repair_payload["messages"][1]["content"]) == {
+        "facts": facts.model_dump(mode="json")
+    }
+    assert repair.records[0].node_name == "validate_and_reconcile"
+    assert not {"headers", "prompt", "raw_response", "key", "authorization"} & set(
+        vars(repair.records[0])
     )
 
 
