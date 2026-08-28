@@ -70,7 +70,7 @@ class KnowledgeContentError(ValueError):
 
 async def read_and_validate_upload(upload: UploadFile) -> ValidatedKnowledgeUpload:
     filename = _validate_client_filename(upload.filename)
-    suffix = filename.suffix.lower()
+    suffix = Path(filename).suffix.lower()
     expected_mime = _MIME_BY_SUFFIX.get(suffix)
     if expected_mime is None:
         raise KnowledgeContentError("KNOWLEDGE_FILE_TYPE_INVALID")
@@ -186,7 +186,7 @@ def stable_chunk_id(version_sha256: str, chunk_index: int, chunk_hash: str) -> s
     return str(uuid5(_CHUNK_NAMESPACE, f"{version_sha256}:{chunk_index}:{chunk_hash}"))
 
 
-def _validate_client_filename(filename: str | None) -> Path:
+def _validate_client_filename(filename: str | None) -> str:
     if not filename:
         raise KnowledgeContentError("KNOWLEDGE_PATH_INVALID")
     posix = PurePosixPath(filename)
@@ -198,7 +198,7 @@ def _validate_client_filename(filename: str | None) -> Path:
         or windows.name != filename
     ):
         raise KnowledgeContentError("KNOWLEDGE_PATH_INVALID")
-    return Path(filename)
+    return filename
 
 
 def _validate_storage_component(component: str) -> None:

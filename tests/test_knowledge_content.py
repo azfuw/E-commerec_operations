@@ -86,6 +86,15 @@ async def test_accepts_strict_utf8_text_and_markdown() -> None:
     assert text.sha256 != markdown.sha256
 
 
+async def test_validated_upload_normalizes_the_client_basename_to_str() -> None:
+    validated = await read_and_validate_upload(
+        _upload("规则".encode(), "client-name.md", "text/markdown")
+    )
+
+    assert type(validated.original_filename) is str
+    assert validated.original_filename == "client-name.md"
+
+
 @pytest.mark.parametrize(
     ("data", "filename", "content_type", "code"),
     [
