@@ -462,6 +462,41 @@ async def test_local_models_use_local_bge_vectors_with_exactly_1024_dense_values
     assert models.token_count("本地文本") == 2
 
 
+async def test_local_models_normalize_a_single_list_reranker_score(tmp_path, monkeypatch) -> None:
+    class FakeEmbedding:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    class FakeReranker:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def compute_score(self, _pairs):
+            return [0.75]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "FlagEmbedding",
+        SimpleNamespace(BGEM3FlagModel=FakeEmbedding, FlagReranker=FakeReranker),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
+    )
+    embedding_path = tmp_path / "embedding"
+    reranker_path = tmp_path / "reranker"
+    embedding_path.mkdir()
+    reranker_path.mkdir()
+    models = LocalKnowledgeModels(
+        embedding_model_path=embedding_path,
+        reranker_model_path=reranker_path,
+        timeout_seconds=1.0,
+    )
+
+    assert await models.rerank("查询", ["候选内容"]) == [0.75]
+
+
 async def test_local_model_blocking_call_maps_deadline_to_retryable_timeout(tmp_path, monkeypatch) -> None:
     class SleepingEmbedding:
         def __init__(self, *_args, **_kwargs) -> None:

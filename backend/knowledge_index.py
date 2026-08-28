@@ -97,7 +97,7 @@ class LocalKnowledgeModels:
     async def rerank(self, query: str, texts: list[str]) -> list[float]:
         def score() -> list[float]:
             values = self._reranker.compute_score([[query, text] for text in texts])
-            return [float(values)] if len(texts) == 1 else [float(value) for value in values]
+            return [float(value) for value in values] if isinstance(values, list) else [float(values)]
 
         return await _with_deadline(
             score,
