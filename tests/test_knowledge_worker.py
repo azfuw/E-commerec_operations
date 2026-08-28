@@ -387,6 +387,45 @@ def test_local_models_reject_missing_local_directories_without_loading_weights(t
     assert (error.value.code, error.value.retryable) == ("KNOWLEDGE_MODEL_UNAVAILABLE", True)
 
 
+@pytest.mark.parametrize(("cuda_available", "expected_fp16"), [(True, True), (False, False)])
+def test_local_models_select_fp16_only_when_cuda_is_available(
+    tmp_path, monkeypatch, cuda_available, expected_fp16
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeEmbedding:
+        def __init__(self, *_args, **kwargs) -> None:
+            calls.append(kwargs)
+
+    class FakeReranker:
+        def __init__(self, *_args, **kwargs) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "FlagEmbedding",
+        SimpleNamespace(BGEM3FlagModel=FakeEmbedding, FlagReranker=FakeReranker),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: cuda_available)),
+    )
+    embedding_path = tmp_path / "embedding"
+    reranker_path = tmp_path / "reranker"
+    embedding_path.mkdir()
+    reranker_path.mkdir()
+
+    LocalKnowledgeModels(
+        embedding_model_path=embedding_path,
+        reranker_model_path=reranker_path,
+        timeout_seconds=1.0,
+    )
+
+    assert [call["use_fp16"] for call in calls] == [expected_fp16, expected_fp16]
+    assert all(call["local_files_only"] is True for call in calls)
+
+
 async def test_local_models_use_local_bge_vectors_with_exactly_1024_dense_values(
     tmp_path, monkeypatch
 ) -> None:

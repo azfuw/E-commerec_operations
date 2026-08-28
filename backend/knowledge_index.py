@@ -50,13 +50,15 @@ class LocalKnowledgeModels:
         if not embedding_model_path.is_dir() or not reranker_model_path.is_dir():
             raise KnowledgeDependencyError("KNOWLEDGE_MODEL_UNAVAILABLE", retryable=True)
         try:
+            import torch
             from FlagEmbedding import BGEM3FlagModel, FlagReranker
 
+            use_fp16 = torch.cuda.is_available()
             self._embedding = BGEM3FlagModel(
-                str(embedding_model_path), use_fp16=False, local_files_only=True
+                str(embedding_model_path), use_fp16=use_fp16, local_files_only=True
             )
             self._reranker = FlagReranker(
-                str(reranker_model_path), use_fp16=False, local_files_only=True
+                str(reranker_model_path), use_fp16=use_fp16, local_files_only=True
             )
         except Exception as error:
             raise KnowledgeDependencyError("KNOWLEDGE_MODEL_UNAVAILABLE", retryable=True) from error
