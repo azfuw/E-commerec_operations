@@ -60,6 +60,31 @@ def test_evaluation_reports_each_path_recall_mrr_citation_and_latency() -> None:
         )
 
 
+def test_evaluation_matches_expected_section_within_full_heading() -> None:
+    queries = [
+        {
+            "id": "q-title",
+            "expected_document_name": "项目演示规则",
+            "expected_version_number": 1,
+            "expected_section": "标题关键词",
+        }
+    ]
+    outcomes = {
+        path: {
+            "q-title": RetrievalQueryOutcome(
+                query_id="q-title",
+                hits=[_hit("right", heading="标题关键词｜项目演示规则：平台中立")],
+                elapsed_ms=12.5,
+            )
+        }
+        for path in ("dense", "sparse", "hybrid", "hybrid_rerank")
+    }
+
+    metrics = evaluate_retrieval(queries, outcomes)
+
+    assert all(value.recall_at_10 == value.mrr == 1.0 for value in metrics.values())
+
+
 def test_calibration_selection_prefers_metrics_then_lower_limit_then_json_order() -> None:
     candidates = [
         {"id": "wide", "candidate_limit": 20, "rrf_k": 60, "threshold": 0.1},

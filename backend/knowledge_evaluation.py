@@ -1,5 +1,8 @@
 import json
 from dataclasses import dataclass
+import os
+from pathlib import Path
+import tempfile
 
 from backend.knowledge_search import KnowledgeSearchHit, RetrievalPath
 
@@ -23,7 +26,10 @@ def _matches(hit: KnowledgeSearchHit, query: dict[str, object]) -> bool:
     return (
         hit.document_name == query["expected_document_name"]
         and hit.version_number == query["expected_version_number"]
-        and query["expected_section"] in hit.chunk_metadata.get("heading_path", [])
+        and any(
+            str(query["expected_section"]) in heading
+            for heading in hit.chunk_metadata.get("heading_path", [])
+        )
     )
 
 
@@ -68,3 +74,25 @@ def select_calibration(
             json.dumps(candidate, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         ),
     )
+
+
+def write_selected_calibration(path: Path, selection: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as output:
+            temp_path = output.name
+            json.dump(selection, output, ensure_ascii=False, sort_keys=True, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        if temp_path is not None:
+            try:
+                Path(temp_path).unlink()
+            except FileNotFoundError:
+                pass
+        raise

@@ -1,0 +1,33 @@
+{
+  "candidate_id": "hybrid-rerank-10",
+  "candidate_limit": 10,
+  "metrics": {
+    "dense": {
+      "citation_document_version_accuracy": 0.0,
+      "latency_ms": 47.114199999972094,
+      "mrr": 0.0,
+      "recall_at_10": 0.0
+    },
+    "hybrid": {
+      "citation_document_version_accuracy": 1.0,
+      "latency_ms": 57.90741666714894,
+      "mrr": 1.0,
+      "recall_at_10": 1.0
+    },
+    "hybrid_rerank": {
+      "citation_document_version_accuracy": 1.0,
+      "latency_ms": 335.53051666604006,
+      "mrr": 1.0,
+      "recall_at_10": 1.0
+    },
+    "sparse": {
+      "citation_document_version_accuracy": 1.0,
+      "latency_ms": 38.596749999669555,
+      "mrr": 1.0,
+      "recall_at_10": 1.0
+    }
+  },
+  "retrieval_path": "hybrid_rerank",
+  "rrf_k": 60,
+  "threshold": 0.2
+}
