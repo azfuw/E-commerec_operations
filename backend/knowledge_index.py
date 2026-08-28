@@ -197,7 +197,7 @@ class MilvusKnowledgeIndex:
             )
         )
         return [
-            (str(hit.get("entity", {}).get("chunk_id", hit["id"])), float(hit["distance"]))
+            (str(hit.get("entity", {}).get("chunk_id") or hit["id"]), float(hit["distance"]))
             for hit in rows[0]
         ]
 

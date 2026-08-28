@@ -631,6 +631,24 @@ async def test_milvus_adapter_forwards_deadline_and_uses_only_safe_exact_operati
     assert client.delete_calls[0]["filter"] == 'chunk_id in ["chunk-1", "chunk-2"]'
 
 
+async def test_milvus_search_reads_entity_chunk_id_without_a_top_level_id() -> None:
+    class EntityOnlyClient:
+        def search(self, **_kwargs):
+            return [[{"entity": {"chunk_id": "canonical-chunk"}, "distance": 0.75}]]
+
+    index = object.__new__(MilvusKnowledgeIndex)
+    index._client = EntityOnlyClient()
+    index._collection = "knowledge_chunks"
+    index._timeout_seconds = 1.0
+
+    assert await index.dense_search(
+        vector=[0.5] * 1024, version_ids=["version-1"], limit=1
+    ) == [("canonical-chunk", 0.75)]
+    assert await index.sparse_search(
+        vector={7: 0.25}, version_ids=["version-1"], limit=1
+    ) == [("canonical-chunk", 0.75)]
+
+
 async def test_milvus_blocking_call_maps_deadline_to_retryable_timeout(monkeypatch) -> None:
     class SleepingClient:
         def __init__(self, **_kwargs) -> None:
