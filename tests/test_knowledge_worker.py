@@ -602,7 +602,11 @@ async def test_milvus_adapter_forwards_deadline_and_uses_only_safe_exact_operati
     assert await index.dense_search(
         vector=[0.5] * 1024, version_ids=["version-2", "version-1"], limit=3
     ) == [("chunk-1", 0.75)]
+    assert await index.sparse_search(
+        vector={7: 0.25}, version_ids=["version-2", "version-1"], limit=3
+    ) == [("chunk-1", 0.75)]
     assert await index.existing_chunk_ids(chunk_ids=["chunk-2", "chunk-1"]) == {"chunk-1"}
+    assert await index.list_chunk_ids_for_version(version_id="version-1") == {"chunk-1"}
     await index.delete_chunk_ids(chunk_ids=["chunk-2", "chunk-1"])
 
     assert client.init_kwargs == {"uri": "http://unused", "timeout": 0.25}
@@ -626,8 +630,12 @@ async def test_milvus_adapter_forwards_deadline_and_uses_only_safe_exact_operati
         "dense_vector",
         "sparse_vector",
     }
-    assert client.search_calls[0]["filter"] == 'version_id in ["version-1", "version-2"]'
+    assert len(client.search_calls) == 2
+    assert all(call["filter"] == 'version_id in ["version-1", "version-2"]' for call in client.search_calls)
+    assert [call["consistency_level"] for call in client.search_calls] == ["Strong", "Strong"]
     assert client.query_calls[0]["filter"] == 'chunk_id in ["chunk-1", "chunk-2"]'
+    assert client.query_calls[1]["filter"] == 'version_id == "version-1"'
+    assert [call["consistency_level"] for call in client.query_calls] == ["Strong", "Strong"]
     assert client.delete_calls[0]["filter"] == 'chunk_id in ["chunk-1", "chunk-2"]'
 
 

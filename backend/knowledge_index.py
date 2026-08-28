@@ -193,6 +193,7 @@ class MilvusKnowledgeIndex:
                 limit=limit,
                 anns_field=field,
                 output_fields=["chunk_id"],
+                consistency_level="Strong",
                 timeout=self._timeout_seconds,
             )
         )
@@ -224,6 +225,7 @@ class MilvusKnowledgeIndex:
                 collection_name=self._collection,
                 filter=identifiers,
                 output_fields=["chunk_id"],
+                consistency_level="Strong",
                 timeout=self._timeout_seconds,
             )
         )
@@ -237,6 +239,7 @@ class MilvusKnowledgeIndex:
                 collection_name=self._collection,
                 filter=f"version_id == {json.dumps(version_id)}",
                 output_fields=["chunk_id"],
+                consistency_level="Strong",
                 timeout=self._timeout_seconds,
             )
         )
