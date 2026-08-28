@@ -1,8 +1,8 @@
 # 商品优化与合规阶段设计
 
-> 状态：已批准的阶段四设计，尚未实施  
-> 日期：2026-08-28  
-> 项目路径：`D:\E-commerce_operations`  
+> 状态：已批准的阶段四设计，尚未实施
+> 日期：2026-08-28
+> 项目路径：`D:\E-commerce_operations`
 > 上游：[总设计](2026-08-25-ecommerce-operations-design.md)、[持久经营分析 Agent 设计](2026-08-26-durable-analysis-agent-design.md)、[知识库与 Milvus 混合检索设计](2026-08-27-knowledge-rag-design.md)
 
 ## 1. 目标与范围
