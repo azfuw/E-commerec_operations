@@ -1,9 +1,17 @@
+import asyncio
+import json
+from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+import httpx
 import pytest
+import pytest_asyncio
 from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import event
+from langgraph.checkpoint.memory import InMemorySaver
 
 from backend.common import (
     AgentCallType,
@@ -33,6 +41,7 @@ from backend.models import (
     WorkflowRun,
 )
 from backend.optimization_agent import OptimizationAgentCallRecord
+import backend.optimization_worker as optimization_worker
 from backend.optimization_runs import (
     OptimizationClaim,
     claim_next_optimization_run,
@@ -45,6 +54,8 @@ from backend.optimization_runs import (
     renew_optimization_lease,
     update_optimization_step,
 )
+from backend.config import Settings
+from backend.database import Base
 from backend.optimization_validation import (
     DeterministicComplianceResult,
     DeterministicViolation,
@@ -1586,3 +1597,1217 @@ async def test_multi_call_race_reaches_the_controlled_flush_before_any_autoflush
     assert result.disposition == "replayed"
     assert len(list(await session.scalars(select(ProposalRevision)))) == 1
     assert len(list(await session.scalars(select(AgentCall)))) == 2
+
+
+@pytest_asyncio.fixture
+async def optimization_worker_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine("sqlite+aiosqlite://")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def enable_foreign_keys(dbapi_connection: object, _connection_record: object) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+
+
+def _worker_settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        jwt_secret_key="test-only-secret-at-least-32-characters",
+        deepseek_api_key="mock-key",
+        deepseek_base_url="https://mock.deepseek.invalid",
+        optimization_lease_seconds=60,
+    )
+
+
+class _RecordingSaver(InMemorySaver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.thread_ids: set[str] = set()
+        self.states: list[dict[str, object]] = []
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        self.thread_ids.add(config["configurable"]["thread_id"])
+        values = checkpoint.get("channel_values", {})
+        self.states.append(dict(values))
+        return await super().aput(config, checkpoint, metadata, new_versions)
+
+
+class _TrustedLoader:
+    def __init__(self, trusted: TrustedOptimizationInput, error_code: str | None = None) -> None:
+        self.trusted = trusted
+        self.error_code = error_code
+        self.calls = 0
+        self.boundaries = 0
+
+    async def __call__(self, context, before_external) -> TrustedOptimizationInput:
+        self.calls += 1
+        await before_external()
+        self.boundaries += 1
+        if self.error_code is not None:
+            raise optimization_worker.TrustedInputLoadFailure(self.error_code)
+        return self.trusted
+
+
+async def _worker_chain(
+    factory: async_sessionmaker[AsyncSession], *, live: bool = False
+) -> dict[str, object]:
+    async with factory() as session:
+        return await _chain(session, live=live)
+
+
+async def _worker_counts(factory: async_sessionmaker[AsyncSession]) -> tuple[int, int, int]:
+    async with factory() as session:
+        return (
+            len(list(await session.scalars(select(ProposalRevision)))),
+            len(list(await session.scalars(select(ComplianceReview)))),
+            len(list(await session.scalars(select(AgentCall)))),
+        )
+
+
+async def _worker_run(factory: async_sessionmaker[AsyncSession]) -> WorkflowRun:
+    async with factory() as session:
+        run = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+        assert run is not None
+        return run
+
+
+def _worker_transport(
+    output: OptimizationProposalOutput,
+    compliance: ComplianceAgentResponse,
+    requests: list[dict[str, object]],
+    *,
+    schema_invalid: bool = False,
+) -> httpx.MockTransport:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)["messages"][1]["content"]
+        request_payload = json.loads(payload)
+        requests.append(request_payload)
+        content = (
+            compliance.model_dump_json()
+            if "candidate_output" in request_payload
+            else output.model_dump_json()
+        )
+        if schema_invalid:
+            content = "{}"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+            },
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def _passing_compliance() -> ComplianceAgentResponse:
+    return ComplianceAgentResponse(
+        passed=True,
+        risk_level=ComplianceRiskLevel.LOW,
+        violations=[],
+        required_changes=[],
+        citations=[OutputCitation(chunk_id="chunk-1")],
+        confidence=Decimal("0.8"),
+        degraded=False,
+    )
+
+
+async def _reset_to_accepted(factory: async_sessionmaker[AsyncSession]) -> None:
+    async with factory() as session:
+        await session.execute(
+            update(WorkflowRun)
+            .where(WorkflowRun.id == "optimization-1")
+            .values(
+                status=WorkflowStatus.ACCEPTED,
+                lease_owner=None,
+                lease_expires_at=None,
+                current_step="claimed",
+                error_code=None,
+            )
+        )
+        await session.commit()
+
+
+async def _seed_actionable_revision(
+    factory: async_sessionmaker[AsyncSession], *, add_second_revision: bool = False
+) -> TrustedOptimizationInput:
+    chain = await _worker_chain(factory, live=True)
+    trusted = _trusted(chain)
+    async with factory() as session:
+        first = await persist_optimization_revision(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            iteration=0,
+            trusted=trusted,
+            output=_output(),
+            canonical_citations=[_citation()],
+            calls=_optimization_calls(0),
+        )
+        assert first.revision_id is not None
+        deterministic, semantic, changes = _normal_failed_review()
+        review = await persist_compliance_review(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            revision_id=first.revision_id,
+            iteration=0,
+            deterministic=deterministic,
+            semantic=semantic,
+            required_changes=changes,
+            canonical_citations=[_citation()],
+            calls=_compliance_calls(0),
+        )
+        assert review.review_id is not None
+        if add_second_revision:
+            second = await persist_optimization_revision(
+                session,
+                workflow_run_id="optimization-1",
+                lease_owner="worker-a",
+                iteration=1,
+                trusted=trusted,
+                output=_output(),
+                canonical_citations=[_citation()],
+                calls=_optimization_calls(1),
+            )
+            assert second.revision_id is not None
+    await _reset_to_accepted(factory)
+    return trusted
+
+
+async def test_optimization_worker_iteration_zero_finalizes_with_only_safe_checkpoint_progress(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain)
+    requests: list[dict[str, object]] = []
+    saver = _RecordingSaver()
+
+    processed = await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=saver,
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert processed == "optimization-1"
+    assert (run.status, run.quality_status) == (WorkflowStatus.DRAFT_READY, WorkflowQuality.NORMAL)
+    assert await _worker_counts(optimization_worker_factory) == (1, 1, 2)
+    assert saver.thread_ids == {"optimization-1"}
+    allowed = {
+        "workflow_run_id", "iteration", "revision_id", "review_id", "review_passed",
+        "review_quality_status", "error_code", "next_node",
+    }
+    for state in saver.states:
+        business_keys = {
+            key for key in state
+            if key != "__start__" and not key.startswith("branch:") and not key.startswith("start:")
+        }
+        assert business_keys <= allowed
+        assert "普通手机" not in json.dumps(state, ensure_ascii=False, default=str)
+    assert ["candidate_output" in request for request in requests] == [False, True]
+
+
+async def test_optimization_worker_uses_database_review_to_call_iteration_one_without_cycle(
+    optimization_worker_factory,
+) -> None:
+    trusted = await _seed_actionable_revision(optimization_worker_factory)
+    requests: list[dict[str, object]] = []
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    assert [request["iteration"] for request in requests] == [1, 1]
+    assert await _worker_counts(optimization_worker_factory) == (2, 2, 4)
+    assert (await _worker_run(optimization_worker_factory)).status is WorkflowStatus.DRAFT_READY
+
+
+async def test_optimization_worker_skips_existing_target_revision_and_only_reviews_database_iteration(
+    optimization_worker_factory,
+) -> None:
+    trusted = await _seed_actionable_revision(optimization_worker_factory, add_second_revision=True)
+    requests: list[dict[str, object]] = []
+    saver = _RecordingSaver()
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=saver,
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    assert len(requests) == 1 and "candidate_output" in requests[0]
+    assert requests[0]["iteration"] == 1
+    assert await _worker_counts(optimization_worker_factory) == (2, 2, 4)
+
+
+@pytest.mark.parametrize(
+    ("rag_quality", "error_code"),
+    [("zero_hit", "KNOWLEDGE_ZERO_HIT"), ("low_confidence", "KNOWLEDGE_LOW_CONFIDENCE")],
+)
+async def test_optimization_worker_low_quality_before_revision_degrades_without_agent_or_immutable_rows(
+    optimization_worker_factory, rag_quality, error_code
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain).model_copy(update={"rag_quality": rag_quality})
+    requests: list[dict[str, object]] = []
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL, WorkflowQuality.DEGRADED, error_code
+    )
+    assert not requests
+    assert await _worker_counts(optimization_worker_factory) == (0, 0, 0)
+
+
+async def test_optimization_worker_persists_pre_revision_schema_attempts_before_manual_defer(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain)
+    requests: list[dict[str, object]] = []
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), requests, schema_invalid=True),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL, WorkflowQuality.DEGRADED, "DEEPSEEK_SCHEMA_INVALID"
+    )
+    assert len(requests) == 2
+    assert await _worker_counts(optimization_worker_factory) == (0, 0, 2)
+
+
+async def test_optimization_worker_lease_loss_before_loader_boundary_stops_without_request_or_terminal_write(
+    optimization_worker_factory, monkeypatch
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain)
+    requests: list[dict[str, object]] = []
+
+    async def lost_renew(*args, **kwargs) -> bool:
+        return False
+
+    monkeypatch.setattr(optimization_worker, "renew_optimization_lease", lost_renew)
+    loader = _TrustedLoader(trusted)
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=loader,
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert loader.calls == 1 and loader.boundaries == 0
+    assert not requests and await _worker_counts(optimization_worker_factory) == (0, 0, 0)
+    assert (run.status, run.lease_owner, run.error_code) == (
+        WorkflowStatus.PROCESSING, "worker-a", None
+    )
+
+
+async def test_optimization_worker_propagates_cancelled_loader_without_terminal_write(
+    optimization_worker_factory,
+) -> None:
+    await _worker_chain(optimization_worker_factory)
+
+    async def cancelled_loader(context, before_external) -> TrustedOptimizationInput:
+        await before_external()
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await optimization_worker.run_once(
+            optimization_worker_factory,
+            settings=_worker_settings(),
+            lease_owner="worker-a",
+            checkpointer=_RecordingSaver(),
+            trusted_input_loader=cancelled_loader,
+            transport=_worker_transport(_output(), _passing_compliance(), []),
+            max_agent_attempts=1,
+        )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.lease_owner, run.error_code) == (
+        WorkflowStatus.PROCESSING, "worker-a", None
+    )
+
+
+def test_trusted_input_load_failure_only_accepts_knowledge_dependency_codes() -> None:
+    with pytest.raises(ValueError, match="unsupported knowledge load error"):
+        optimization_worker.TrustedInputLoadFailure("DEEPSEEK_TIMEOUT")
+    assert optimization_worker.TrustedInputLoadFailure(
+        "KNOWLEDGE_DEPENDENCY_ERROR"
+    ).error_code == "KNOWLEDGE_DEPENDENCY_ERROR"
+
+
+async def test_optimization_worker_rejects_invalid_attempt_cap_before_claiming_a_run(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    with pytest.raises(ValueError, match="max_agent_attempts"):
+        await optimization_worker.run_once(
+            optimization_worker_factory,
+            settings=_worker_settings(),
+            lease_owner="worker-a",
+            checkpointer=_RecordingSaver(),
+            trusted_input_loader=_TrustedLoader(_trusted(chain)),
+            max_agent_attempts=0,
+        )
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.attempt_count, run.lease_owner) == (
+        WorkflowStatus.ACCEPTED, 0, None
+    )
+
+
+async def test_optimization_worker_bounds_normal_failed_reviews_at_iteration_two(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain)
+    requests: list[dict[str, object]] = []
+    _deterministic, semantic, _changes = _normal_failed_review()
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), semantic, requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL,
+        WorkflowQuality.DEGRADED,
+        "OPTIMIZATION_ITERATION_LIMIT",
+    )
+    assert [request["iteration"] for request in requests] == [0, 0, 1, 1, 2, 2]
+    assert await _worker_counts(optimization_worker_factory) == (3, 3, 6)
+
+
+@pytest.mark.parametrize("degraded", [False, True])
+async def test_optimization_worker_never_reopens_unavailable_or_degraded_review(
+    optimization_worker_factory, degraded
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory, live=True)
+    trusted = _trusted(chain)
+    async with optimization_worker_factory() as session:
+        revision = await persist_optimization_revision(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            iteration=0,
+            trusted=trusted,
+            output=_output(),
+            canonical_citations=[_citation()],
+            calls=_optimization_calls(0),
+        )
+        assert revision.revision_id is not None
+        deterministic = validate_optimization_output(trusted, _output())
+        if degraded:
+            semantic = ComplianceAgentResponse(
+                passed=False,
+                risk_level=ComplianceRiskLevel.HIGH,
+                violations=[],
+                required_changes=[],
+                citations=[OutputCitation(chunk_id="chunk-1")],
+                confidence=Decimal("0.8"),
+                degraded=True,
+            )
+            review = await persist_compliance_review(
+                session,
+                workflow_run_id="optimization-1",
+                lease_owner="worker-a",
+                revision_id=revision.revision_id,
+                iteration=0,
+                deterministic=deterministic,
+                semantic=semantic,
+                required_changes=[],
+                canonical_citations=[_citation()],
+                calls=_compliance_calls(0),
+            )
+            expected_error = "COMPLIANCE_AGENT_DEGRADED"
+        else:
+            review = await persist_compliance_failure(
+                session,
+                workflow_run_id="optimization-1",
+                lease_owner="worker-a",
+                revision_id=revision.revision_id,
+                iteration=0,
+                deterministic=deterministic,
+                error_code="DEEPSEEK_TIMEOUT",
+                required_changes=[],
+                canonical_citations=[_citation()],
+                calls=(),
+            )
+            expected_error = "DEEPSEEK_TIMEOUT"
+        assert review.review_id is not None
+    await _reset_to_accepted(optimization_worker_factory)
+    requests: list[dict[str, object]] = []
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert not requests
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL, WorkflowQuality.DEGRADED, expected_error
+    )
+
+
+class _FailingReadSaver(InMemorySaver):
+    async def aget_tuple(self, *args, **kwargs):
+        raise RuntimeError("checkpoint read failed")
+
+
+async def test_optimization_worker_checkpoint_failure_uses_guarded_fresh_failure_session(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    result = await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_FailingReadSaver(),
+        trusted_input_loader=_TrustedLoader(_trusted(chain)),
+        max_agent_attempts=1,
+    )
+    assert result == "optimization-1"
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.error_code, run.lease_owner) == (
+        WorkflowStatus.FAILED, "OPTIMIZATION_CHECKPOINT_ERROR", None
+    )
+
+
+async def test_optimization_worker_http_lease_loss_stops_before_post_or_write(
+    optimization_worker_factory, monkeypatch
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain)
+    requests: list[dict[str, object]] = []
+    renewals = 0
+
+    async def renew_once(*args, **kwargs) -> bool:
+        nonlocal renewals
+        renewals += 1
+        return renewals == 1
+
+    monkeypatch.setattr(optimization_worker, "renew_optimization_lease", renew_once)
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert renewals == 2
+    assert not requests and await _worker_counts(optimization_worker_factory) == (0, 0, 0)
+    assert (run.status, run.lease_owner, run.error_code) == (
+        WorkflowStatus.PROCESSING, "worker-a", None
+    )
+
+
+async def test_optimization_worker_compliance_http_lease_loss_stops_before_post_or_write(
+    optimization_worker_factory, monkeypatch
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory, live=True)
+    trusted = _trusted(chain)
+    async with optimization_worker_factory() as session:
+        revision = await persist_optimization_revision(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            iteration=0,
+            trusted=trusted,
+            output=_output(),
+            canonical_citations=[_citation()],
+            calls=_optimization_calls(0),
+        )
+        assert revision.revision_id is not None
+    await _reset_to_accepted(optimization_worker_factory)
+    requests: list[dict[str, object]] = []
+    renewals = 0
+
+    async def renew_once(*args, **kwargs) -> bool:
+        nonlocal renewals
+        renewals += 1
+        return renewals == 1
+
+    monkeypatch.setattr(optimization_worker, "renew_optimization_lease", renew_once)
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert renewals == 2
+    assert not requests and await _worker_counts(optimization_worker_factory) == (1, 0, 1)
+    assert (run.status, run.lease_owner, run.error_code) == (
+        WorkflowStatus.PROCESSING, "worker-a", None
+    )
+
+
+async def test_optimization_worker_persists_unavailable_review_after_revision_before_manual_defer(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory, live=True)
+    trusted = _trusted(chain)
+    async with optimization_worker_factory() as session:
+        revision = await persist_optimization_revision(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            iteration=0,
+            trusted=trusted,
+            output=_output(),
+            canonical_citations=[_citation()],
+            calls=_optimization_calls(0),
+        )
+        assert revision.revision_id is not None
+    await _reset_to_accepted(optimization_worker_factory)
+    requests: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)["messages"][1]["content"]
+        requests.append(json.loads(payload))
+        content = "{}" if "candidate_output" in requests[-1] else _output().model_dump_json()
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=httpx.MockTransport(handler),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert ["candidate_output" in request for request in requests] == [True, True]
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL, WorkflowQuality.DEGRADED, "DEEPSEEK_SCHEMA_INVALID"
+    )
+    assert await _worker_counts(optimization_worker_factory) == (1, 1, 3)
+
+
+@pytest.mark.parametrize("change", ["owner", "version"])
+async def test_optimization_worker_reloads_context_after_loader_before_any_agent_request(
+    optimization_worker_factory, change
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain)
+    requests: list[dict[str, object]] = []
+
+    async def stale_loader(context, before_external) -> TrustedOptimizationInput:
+        await before_external()
+        async with optimization_worker_factory() as replacement_session:
+            if change == "owner":
+                await replacement_session.execute(
+                    update(WorkflowRun)
+                    .where(WorkflowRun.id == "optimization-1")
+                    .values(lease_owner="worker-b")
+                )
+            else:
+                await replacement_session.execute(
+                    update(Product).where(Product.id == "product-1").values(current_version=8)
+                )
+            await replacement_session.commit()
+        return trusted
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=stale_loader,
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert not requests and await _worker_counts(optimization_worker_factory) == (0, 0, 0)
+    if change == "owner":
+        assert (run.status, run.lease_owner, run.error_code) == (
+            WorkflowStatus.PROCESSING, "worker-b", None
+        )
+    else:
+        assert (run.status, run.lease_owner, run.error_code) == (
+            WorkflowStatus.FAILED, None, "PRODUCT_VERSION_CONFLICT"
+        )
+
+
+async def test_optimization_worker_checkpoint_uses_persisted_degraded_review_fields(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain)
+    semantic = ComplianceAgentResponse(
+        passed=False,
+        risk_level=ComplianceRiskLevel.HIGH,
+        violations=[],
+        required_changes=[],
+        citations=[OutputCitation(chunk_id="chunk-1")],
+        confidence=Decimal("0.8"),
+        degraded=True,
+    )
+    saver = _RecordingSaver()
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=saver,
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), semantic, []),
+        max_agent_attempts=1,
+    )
+
+    review_states = [state for state in saver.states if state.get("review_id")]
+    assert review_states
+    assert all(
+        state.get("review_quality_status") == "degraded"
+        and state.get("error_code") == "COMPLIANCE_AGENT_DEGRADED"
+        for state in review_states
+    )
+
+
+class _CancelAfterRevisionSaver(_RecordingSaver):
+    def __init__(self, method: str) -> None:
+        super().__init__()
+        self.method = method
+        self.cancelled = False
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        if (
+            self.method == "aput"
+            and not self.cancelled
+            and checkpoint.get("channel_values", {}).get("revision_id")
+        ):
+            self.cancelled = True
+            raise asyncio.CancelledError()
+        return await super().aput(config, checkpoint, metadata, new_versions)
+
+    async def aput_writes(self, *args, **kwargs):
+        writes = kwargs.get("writes") or args[1]
+        if (
+            self.method == "aput_writes"
+            and not self.cancelled
+            and any(channel == "revision_id" and value for channel, value in writes)
+        ):
+            self.cancelled = True
+            raise asyncio.CancelledError()
+        return await super().aput_writes(*args, **kwargs)
+
+
+@pytest.mark.parametrize("method", ["aput", "aput_writes"])
+async def test_optimization_worker_reclaims_after_cancelled_checkpoint_without_repeating_revision(
+    optimization_worker_factory, method
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain)
+    saver = _CancelAfterRevisionSaver(method)
+    first_requests: list[dict[str, object]] = []
+
+    with pytest.raises(asyncio.CancelledError):
+        await optimization_worker.run_once(
+            optimization_worker_factory,
+            settings=_worker_settings(),
+            lease_owner="worker-a",
+            checkpointer=saver,
+            trusted_input_loader=_TrustedLoader(trusted),
+            transport=_worker_transport(_output(), _passing_compliance(), first_requests),
+            max_agent_attempts=1,
+        )
+
+    first_run = await _worker_run(optimization_worker_factory)
+    assert (first_run.status, first_run.lease_owner) == (WorkflowStatus.PROCESSING, "worker-a")
+    assert await _worker_counts(optimization_worker_factory) == (1, 0, 1)
+    assert ["candidate_output" in request for request in first_requests] == [False]
+    async with optimization_worker_factory() as session:
+        await session.execute(
+            update(WorkflowRun)
+            .where(WorkflowRun.id == "optimization-1")
+            .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await session.commit()
+    resumed_requests: list[dict[str, object]] = []
+
+    resumed = await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-b",
+        checkpointer=saver,
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), resumed_requests),
+        max_agent_attempts=1,
+    )
+
+    assert resumed == "optimization-1"
+    assert ["candidate_output" in request for request in resumed_requests] == [True]
+    assert await _worker_counts(optimization_worker_factory) == (1, 1, 2)
+    assert saver.thread_ids == {"optimization-1"}
+
+
+class _FailingWriteSaver(InMemorySaver):
+    def __init__(self, method: str) -> None:
+        super().__init__()
+        self.method = method
+
+    async def aput(self, *args, **kwargs):
+        if self.method == "aput":
+            raise RuntimeError("checkpoint write failed")
+        return await super().aput(*args, **kwargs)
+
+    async def aput_writes(self, *args, **kwargs):
+        if self.method == "aput_writes":
+            raise RuntimeError("checkpoint writes failed")
+        return await super().aput_writes(*args, **kwargs)
+
+
+@pytest.mark.parametrize("method", ["aput", "aput_writes"])
+async def test_optimization_worker_checkpoint_write_failure_marks_live_owner_failed(
+    optimization_worker_factory, method
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    result = await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_FailingWriteSaver(method),
+        trusted_input_loader=_TrustedLoader(_trusted(chain)),
+        max_agent_attempts=1,
+    )
+
+    assert result == "optimization-1"
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.error_code, run.lease_owner) == (
+        WorkflowStatus.FAILED, "OPTIMIZATION_CHECKPOINT_ERROR", None
+    )
+
+
+async def test_optimization_worker_checkpoint_failure_after_owner_change_writes_nothing(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+
+    class _StaleOwnerWriteSaver(InMemorySaver):
+        async def aput(self, *args, **kwargs):
+            async with optimization_worker_factory() as replacement_session:
+                await replacement_session.execute(
+                    update(WorkflowRun)
+                    .where(WorkflowRun.id == "optimization-1")
+                    .values(lease_owner="worker-b")
+                )
+                await replacement_session.commit()
+            raise RuntimeError("checkpoint write failed")
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_StaleOwnerWriteSaver(),
+        trusted_input_loader=_TrustedLoader(_trusted(chain)),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.error_code, run.lease_owner) == (
+        WorkflowStatus.PROCESSING, None, "worker-b"
+    )
+    assert await _worker_counts(optimization_worker_factory) == (0, 0, 0)
+
+
+async def test_optimization_worker_database_failure_uses_distinct_fresh_failure_session(
+    optimization_worker_factory, monkeypatch
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    graph_session_ids: list[int] = []
+    failure_session_ids: list[int] = []
+    original_fail = optimization_worker.fail_optimization_run
+
+    async def broken_load(session, **kwargs):
+        graph_session_ids.append(id(session))
+        raise SQLAlchemyError("graph database failure")
+
+    async def record_fail(session, **kwargs):
+        failure_session_ids.append(id(session))
+        return await original_fail(session, **kwargs)
+
+    monkeypatch.setattr(optimization_worker, "load_owned_optimization_context", broken_load)
+    monkeypatch.setattr(optimization_worker, "fail_optimization_run", record_fail)
+    result = await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(_trusted(chain)),
+        max_agent_attempts=1,
+    )
+
+    assert result == "optimization-1"
+    assert graph_session_ids and failure_session_ids
+    assert graph_session_ids[0] != failure_session_ids[0]
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.error_code) == (WorkflowStatus.FAILED, "OPTIMIZATION_DATABASE_ERROR")
+
+
+async def test_optimization_worker_propagates_second_database_failure_from_fresh_failure_session(
+    optimization_worker_factory, monkeypatch
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+
+    async def broken_load(session, **kwargs):
+        raise SQLAlchemyError("graph database failure")
+
+    async def broken_fail(session, **kwargs):
+        raise SQLAlchemyError("fresh database failure")
+
+    monkeypatch.setattr(optimization_worker, "load_owned_optimization_context", broken_load)
+    monkeypatch.setattr(optimization_worker, "fail_optimization_run", broken_fail)
+    with pytest.raises(SQLAlchemyError, match="fresh database failure"):
+        await optimization_worker.run_once(
+            optimization_worker_factory,
+            settings=_worker_settings(),
+            lease_owner="worker-a",
+            checkpointer=_RecordingSaver(),
+            trusted_input_loader=_TrustedLoader(_trusted(chain)),
+            max_agent_attempts=1,
+        )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert (run.status, run.lease_owner, run.error_code) == (
+        WorkflowStatus.PROCESSING, "worker-a", None
+    )
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "KNOWLEDGE_MODEL_UNAVAILABLE",
+        "KNOWLEDGE_DEPENDENCY_TIMEOUT",
+        "KNOWLEDGE_DEPENDENCY_ERROR",
+        "KNOWLEDGE_ZERO_HIT",
+        "KNOWLEDGE_LOW_CONFIDENCE",
+    ],
+)
+async def test_optimization_worker_loader_dependency_failures_defer_without_agent_or_immutable_rows(
+    optimization_worker_factory, error_code
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    requests: list[dict[str, object]] = []
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(_trusted(chain), error_code),
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert not requests and await _worker_counts(optimization_worker_factory) == (0, 0, 0)
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL, WorkflowQuality.DEGRADED, error_code
+    )
+
+
+async def test_optimization_worker_existing_revision_loader_failure_defers_without_review(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory, live=True)
+    trusted = _trusted(chain)
+    async with optimization_worker_factory() as session:
+        revision = await persist_optimization_revision(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            iteration=0,
+            trusted=trusted,
+            output=_output(),
+            canonical_citations=[_citation()],
+            calls=_optimization_calls(0),
+        )
+        assert revision.revision_id is not None
+    await _reset_to_accepted(optimization_worker_factory)
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted, "KNOWLEDGE_DEPENDENCY_ERROR"),
+        transport=_worker_transport(_output(), _passing_compliance(), []),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert await _worker_counts(optimization_worker_factory) == (1, 0, 1)
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL,
+        WorkflowQuality.DEGRADED,
+        "KNOWLEDGE_DEPENDENCY_ERROR",
+    )
+
+
+@pytest.mark.parametrize(
+    ("rag_quality", "error_code"),
+    [("zero_hit", "KNOWLEDGE_ZERO_HIT"), ("low_confidence", "KNOWLEDGE_LOW_CONFIDENCE")],
+)
+async def test_optimization_worker_iteration_one_low_quality_rag_skips_agent_and_new_immutable_rows(
+    optimization_worker_factory, rag_quality, error_code
+) -> None:
+    trusted = await _seed_actionable_revision(optimization_worker_factory)
+    low_quality = trusted.model_copy(update={"rag_quality": rag_quality})
+    requests: list[dict[str, object]] = []
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(low_quality),
+        transport=_worker_transport(_output(), _passing_compliance(), requests),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert not requests and await _worker_counts(optimization_worker_factory) == (1, 1, 2)
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL, WorkflowQuality.DEGRADED, error_code
+    )
+
+
+async def test_optimization_worker_iteration_one_schema_failure_persists_only_safe_calls_with_manual_terminal(
+    optimization_worker_factory,
+) -> None:
+    trusted = await _seed_actionable_revision(optimization_worker_factory)
+    requests: list[dict[str, object]] = []
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=_worker_transport(_output(), _passing_compliance(), requests, schema_invalid=True),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert [request["iteration"] for request in requests] == [1, 1]
+    assert await _worker_counts(optimization_worker_factory) == (1, 1, 4)
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL,
+        WorkflowQuality.DEGRADED,
+        "DEEPSEEK_SCHEMA_INVALID",
+    )
+
+
+async def test_optimization_worker_timeout_before_revision_persists_one_safe_call_only(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    requests = 0
+
+    async def timeout(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(_trusted(chain)),
+        transport=httpx.MockTransport(timeout),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert requests == 1 and await _worker_counts(optimization_worker_factory) == (0, 0, 1)
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.PENDING_MANUAL, WorkflowQuality.DEGRADED, "DEEPSEEK_TIMEOUT"
+    )
+
+
+@pytest.mark.parametrize("change", ["owner", "version"])
+async def test_optimization_worker_terminal_guard_discards_safe_calls_when_owner_or_version_changes(
+    optimization_worker_factory, change
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    trusted = _trusted(chain)
+    requests = 0
+
+    async def timeout_after_change(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        async with optimization_worker_factory() as replacement_session:
+            if change == "owner":
+                await replacement_session.execute(
+                    update(WorkflowRun)
+                    .where(WorkflowRun.id == "optimization-1")
+                    .values(lease_owner="worker-b")
+                )
+            else:
+                await replacement_session.execute(
+                    update(Product).where(Product.id == "product-1").values(current_version=8)
+                )
+            await replacement_session.commit()
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    await optimization_worker.run_once(
+        optimization_worker_factory,
+        settings=_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=_RecordingSaver(),
+        trusted_input_loader=_TrustedLoader(trusted),
+        transport=httpx.MockTransport(timeout_after_change),
+        max_agent_attempts=1,
+    )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert requests == 1 and await _worker_counts(optimization_worker_factory) == (0, 0, 0)
+    if change == "owner":
+        assert (run.status, run.lease_owner, run.error_code) == (
+            WorkflowStatus.PROCESSING, "worker-b", None
+        )
+    else:
+        assert (run.status, run.lease_owner, run.error_code) == (
+            WorkflowStatus.FAILED, None, "PRODUCT_VERSION_CONFLICT"
+        )
+
+
+async def test_optimization_worker_propagates_cancelled_transport_without_terminal_write(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+
+    async def cancelled(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await optimization_worker.run_once(
+            optimization_worker_factory,
+            settings=_worker_settings(),
+            lease_owner="worker-a",
+            checkpointer=_RecordingSaver(),
+            trusted_input_loader=_TrustedLoader(_trusted(chain)),
+            transport=httpx.MockTransport(cancelled),
+            max_agent_attempts=1,
+        )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert await _worker_counts(optimization_worker_factory) == (0, 0, 0)
+    assert (run.status, run.lease_owner, run.error_code) == (
+        WorkflowStatus.PROCESSING, "worker-a", None
+    )
+
+
+async def test_optimization_worker_forced_passed_review_defer_uses_task_seven_replay_guard(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory, live=True)
+    trusted = _trusted(chain)
+    async with optimization_worker_factory() as session:
+        revision = await persist_optimization_revision(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            iteration=0,
+            trusted=trusted,
+            output=_output(),
+            canonical_citations=[_citation()],
+            calls=_optimization_calls(0),
+        )
+        assert revision.revision_id is not None
+        semantic = _passing_compliance()
+        review = await persist_compliance_review(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            revision_id=revision.revision_id,
+            iteration=0,
+            deterministic=validate_optimization_output(trusted, _output()),
+            semantic=semantic,
+            required_changes=[],
+            canonical_citations=[_citation()],
+            calls=_compliance_calls(0),
+        )
+        assert review.review_id is not None
+        graph = optimization_worker.build_optimization_graph(
+            session=session,
+            settings=_worker_settings(),
+            lease_owner="worker-a",
+            checkpointer=_RecordingSaver(),
+            trusted_input_loader=_TrustedLoader(trusted),
+            max_agent_attempts=1,
+        )
+        state = await graph.nodes["defer_manual"].node.steps[0].ainvoke(
+            {"workflow_run_id": "optimization-1"}
+        )
+
+    run = await _worker_run(optimization_worker_factory)
+    assert state["error_code"] == "OPTIMIZATION_REPLAY_CONFLICT"
+    assert (run.status, run.error_code) == (
+        WorkflowStatus.FAILED, "OPTIMIZATION_REPLAY_CONFLICT"
+    )
