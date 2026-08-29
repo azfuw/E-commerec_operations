@@ -1,6 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
+import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -210,6 +211,97 @@ class OptimizationProposalOutput(BaseModel):
     citations: list[OutputCitation] = Field(max_length=50)
     price_suggestions: list[PriceSuggestion] = Field(max_length=50)
     sku_suggestions: list[SkuSuggestion] = Field(max_length=50)
+
+
+class ValidatedRequiredChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_track: Literal["deterministic", "semantic"]
+    source_violation_code: Literal[
+        "MISSING_TRUSTED_FACT",
+        "OUTPUT_BUSINESS_LENGTH",
+        "TITLE_LANGUAGE",
+        "RESTRICTED_PHRASE",
+        "CHANGE_TARGET_DUPLICATE",
+        "CHANGE_CURRENT_MISMATCH",
+        "CHANGE_SUGGESTED_MISMATCH",
+        "OUTPUT_CHANGE_UNDECLARED",
+        "EVIDENCE_MISSING",
+        "EVIDENCE_FACT_PATH_INVALID",
+        "EVIDENCE_CITATION_INVALID",
+        "CITATION_DUPLICATE",
+        "CITATION_UNKNOWN",
+        "CITATION_EVIDENCE_UNLISTED",
+        "ATTRIBUTE_TARGET_DUPLICATE",
+        "ATTRIBUTE_CURRENT_MISMATCH",
+        "ATTRIBUTE_SOURCE_MISSING",
+        "SKU_TARGET_DUPLICATE",
+        "SKU_UNKNOWN",
+        "SKU_CURRENT_MISMATCH",
+        "PRICE_TARGET_DUPLICATE",
+        "PRICE_SKU_UNKNOWN",
+        "PRICE_CURRENT_MISMATCH",
+        "PRICE_CURRENT_NONPOSITIVE",
+        "PRICE_NONPOSITIVE",
+        "PRICE_PRECISION",
+        "PRICE_RANGE",
+        "RAG_QUALITY_INSUFFICIENT",
+        "EXAGGERATION",
+        "MEDICALIZATION",
+        "MISLEADING",
+        "SEMANTIC_CONTRADICTION",
+        "UNPROVABLE_PROMISE",
+        "INSUFFICIENT_EVIDENCE",
+    ]
+    field: str = Field(min_length=1, max_length=64)
+    instruction: str = Field(min_length=1, max_length=240)
+    citation_chunk_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        max_length=20
+    )
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "ValidatedRequiredChange":
+        deterministic_codes = {
+            "MISSING_TRUSTED_FACT",
+            "OUTPUT_BUSINESS_LENGTH",
+            "TITLE_LANGUAGE",
+            "RESTRICTED_PHRASE",
+            "CHANGE_TARGET_DUPLICATE",
+            "CHANGE_CURRENT_MISMATCH",
+            "CHANGE_SUGGESTED_MISMATCH",
+            "OUTPUT_CHANGE_UNDECLARED",
+            "EVIDENCE_MISSING",
+            "EVIDENCE_FACT_PATH_INVALID",
+            "EVIDENCE_CITATION_INVALID",
+            "CITATION_DUPLICATE",
+            "CITATION_UNKNOWN",
+            "CITATION_EVIDENCE_UNLISTED",
+            "ATTRIBUTE_TARGET_DUPLICATE",
+            "ATTRIBUTE_CURRENT_MISMATCH",
+            "ATTRIBUTE_SOURCE_MISSING",
+            "SKU_TARGET_DUPLICATE",
+            "SKU_UNKNOWN",
+            "SKU_CURRENT_MISMATCH",
+            "PRICE_TARGET_DUPLICATE",
+            "PRICE_SKU_UNKNOWN",
+            "PRICE_CURRENT_MISMATCH",
+            "PRICE_CURRENT_NONPOSITIVE",
+            "PRICE_NONPOSITIVE",
+            "PRICE_PRECISION",
+            "PRICE_RANGE",
+            "RAG_QUALITY_INSUFFICIENT",
+        }
+        if (self.source_track == "deterministic") != (
+            self.source_violation_code in deterministic_codes
+        ):
+            raise ValueError("source track and violation code mismatch")
+        if len(self.citation_chunk_ids) != len(set(self.citation_chunk_ids)):
+            raise ValueError("citation chunk IDs must be unique")
+        if not any("\u4e00" <= character <= "\u9fff" for character in self.instruction):
+            raise ValueError("instruction must contain Chinese text")
+        if any(unicodedata.category(character).startswith("C") for character in self.instruction):
+            raise ValueError("instruction contains a control character")
+        return self
 
 
 class InventoryRisk(BaseModel):
