@@ -4,7 +4,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from time import perf_counter
 from typing import Literal
 
 import httpx
@@ -20,6 +19,7 @@ from backend.analytics import (
 )
 from backend.common import AgentCallType
 from backend.config import Settings
+from backend.deepseek_runtime import DeepSeekJsonRuntime
 from backend.schemas import (
     AgentAnalysisResponse,
     AgentCandidateDraft,
@@ -170,22 +170,12 @@ def _node_name(call_type: AgentCallType) -> Literal["call_analysis_agent", "vali
     )
 
 
-def _nonnegative_token(value: object) -> int:
-    if isinstance(value, bool):
-        return 0
-    try:
-        token = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return token if token >= 0 else 0
-
-
 class DeepSeekAnalysisClient:
     def __init__(
         self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None
     ) -> None:
         self.settings = settings
-        self.transport = transport
+        self.runtime = DeepSeekJsonRuntime(settings, transport=transport)
 
     async def request(
         self,
@@ -194,11 +184,6 @@ class DeepSeekAnalysisClient:
         call_type: AgentCallType,
         before_http_attempt: BeforeHttpAttempt | None = None,
     ) -> AgentInvocation:
-        api_key = self.settings.deepseek_api_key
-        if api_key is None or not api_key.get_secret_value().strip():
-            return AgentInvocation(response=None, records=[], error_code="DEEPSEEK_KEY_MISSING")
-
-        input_hash = _input_hash(facts)
         instruction = (
             "Return JSON candidates with only product_id, rank, impact_explanation, reason, "
             "recommended_action, and confidence. impact_explanation、reason、recommended_action "
@@ -211,118 +196,34 @@ class DeepSeekAnalysisClient:
             "impact_explanation、reason、recommended_action 必须使用简洁简体中文。"
             "仅输出 JSON、无 Markdown、无额外字段。"
         )
-        payload = {
-            "model": self.settings.deepseek_model,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {
-                    "role": "system",
-                    "content": instruction,
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {"facts": facts.model_dump(mode="json")}, ensure_ascii=False, separators=(",", ":")
-                    ),
-                },
-            ],
-        }
-        records: list[AgentCallRecord] = []
-        headers = {"Authorization": f"Bearer {api_key.get_secret_value()}"}
-        timeout = httpx.Timeout(self.settings.deepseek_timeout_seconds)
-        async with httpx.AsyncClient(
-            base_url=self.settings.deepseek_base_url.rstrip("/"),
-            headers=headers,
-            timeout=timeout,
-            transport=self.transport,
-        ) as http_client:
-            for attempt in range(1, 4):
-                if before_http_attempt is not None and not await before_http_attempt(call_type, attempt):
-                    return AgentInvocation(response=None, records=records, error_code="LEASE_LOST")
-                started = perf_counter()
-                try:
-                    response = await http_client.post("/chat/completions", json=payload)
-                except httpx.TimeoutException:
-                    error_code = "DEEPSEEK_TIMEOUT"
-                except httpx.TransportError:
-                    error_code = "DEEPSEEK_TRANSPORT"
-                else:
-                    if response.status_code == 429:
-                        error_code = "DEEPSEEK_RATE_LIMIT"
-                    elif 500 <= response.status_code <= 599:
-                        error_code = "DEEPSEEK_SERVER_ERROR"
-                    elif response.status_code == 401:
-                        error_code = "DEEPSEEK_UNAUTHORIZED"
-                    elif response.status_code == 403:
-                        error_code = "DEEPSEEK_FORBIDDEN"
-                    elif response.is_success:
-                        try:
-                            content = response.json()["choices"][0]["message"]["content"]
-                            parsed = parse_agent_response(content)
-                        except (KeyError, IndexError, TypeError, ValueError):
-                            error_code = "DEEPSEEK_SCHEMA_INVALID"
-                        else:
-                            records.append(
-                                self._record(
-                                    call_type, attempt, input_hash, "succeeded", None, response, started
-                                )
-                            )
-                            return AgentInvocation(response=parsed, records=records, error_code=None)
-                    else:
-                        error_code = "DEEPSEEK_HTTP_ERROR"
+        async def renew(attempt: int) -> bool:
+            return before_http_attempt is None or await before_http_attempt(call_type, attempt)
 
-                records.append(
-                    self._record(call_type, attempt, input_hash, "failed", error_code, None, started)
-                )
-                if error_code not in {
-                    "DEEPSEEK_TIMEOUT",
-                    "DEEPSEEK_TRANSPORT",
-                    "DEEPSEEK_RATE_LIMIT",
-                    "DEEPSEEK_SERVER_ERROR",
-                } or attempt == 3:
-                    return AgentInvocation(response=None, records=records, error_code=error_code)
-
-        raise AssertionError("request loop must return")
-
-    def _record(
-        self,
-        call_type: AgentCallType,
-        attempt: int,
-        input_hash: str,
-        status: str,
-        error_code: str | None,
-        response: httpx.Response | None,
-        started: float,
-    ) -> AgentCallRecord:
-        try:
-            body = response.json() if response is not None else {}
-        except ValueError:
-            body = {}
-        usage = body.get("usage") if isinstance(body, dict) else None
-        usage = usage if isinstance(usage, dict) else {}
-        prompt_tokens = _nonnegative_token(usage.get("prompt_tokens"))
-        completion_tokens = _nonnegative_token(usage.get("completion_tokens"))
-        total_tokens = _nonnegative_token(usage.get("total_tokens"))
-        price = self.settings.deepseek_price_per_million_tokens
-        estimated_cost = (
-            None
-            if price is None
-            else (Decimal(total_tokens) * max(price, Decimal("0")) / Decimal(1_000_000)).quantize(
-                Decimal("0.000001")
-            )
+        result = await self.runtime.request(
+            system_prompt=instruction,
+            user_payload={"facts": facts.model_dump(mode="json")},
+            parse_response=parse_agent_response,
+            before_http_attempt=renew if before_http_attempt is not None else None,
         )
-        return AgentCallRecord(
-            node_name=_node_name(call_type),
-            call_type=call_type,
-            attempt=attempt,
-            model=self.settings.deepseek_model,
-            prompt_version=PROMPT_VERSION,
-            status=status,
-            input_hash=input_hash,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            duration_ms=int((perf_counter() - started) * 1000),
-            estimated_cost=estimated_cost,
-            error_code=error_code,
+        return AgentInvocation(
+            response=result.response,
+            records=[
+                AgentCallRecord(
+                    node_name=_node_name(call_type),
+                    call_type=call_type,
+                    attempt=record.attempt,
+                    model=record.model,
+                    prompt_version=PROMPT_VERSION,
+                    status=record.status,
+                    input_hash=record.input_hash,
+                    prompt_tokens=record.prompt_tokens,
+                    completion_tokens=record.completion_tokens,
+                    total_tokens=record.total_tokens,
+                    duration_ms=record.duration_ms,
+                    estimated_cost=record.estimated_cost,
+                    error_code=record.error_code,
+                )
+                for record in result.records
+            ],
+            error_code=result.error_code,
         )

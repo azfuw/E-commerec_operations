@@ -245,32 +245,6 @@ def test_validate_response_rejects_trusted_set_or_rank_mismatches(changes: dict[
         validate_agent_response(facts, response)
 
 
-async def test_client_retries_rate_limits_and_renews_before_each_attempt() -> None:
-    facts = make_facts()
-    responses = iter([httpx.Response(429), httpx.Response(429), completion(response_content(facts))])
-    callback_calls: list[tuple[AgentCallType, int]] = []
-    paths: list[str] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
-        return next(responses)
-
-    async def before_attempt(call_type: AgentCallType, attempt: int) -> bool:
-        callback_calls.append((call_type, attempt))
-        return True
-
-    invocation = await client(httpx.MockTransport(handler)).request(
-        facts, call_type=AgentCallType.PRIMARY, before_http_attempt=before_attempt
-    )
-
-    assert invocation.error_code is None
-    assert invocation.response is not None
-    assert callback_calls == [(AgentCallType.PRIMARY, 1), (AgentCallType.PRIMARY, 2), (AgentCallType.PRIMARY, 3)]
-    assert paths == ["/chat/completions", "/chat/completions", "/chat/completions"]
-    assert len(invocation.records) == 3
-    assert {record.node_name for record in invocation.records} == {"call_analysis_agent"}
-
-
 async def test_client_post_contract_separates_primary_and_schema_repair_instructions() -> None:
     facts = make_facts()
     requests: list[dict[str, object]] = []
@@ -326,66 +300,6 @@ async def test_client_post_contract_separates_primary_and_schema_repair_instruct
     )
 
 
-@pytest.mark.parametrize(
-    ("failure", "error_code"),
-    [
-        ("timeout", "DEEPSEEK_TIMEOUT"),
-        ("transport", "DEEPSEEK_TRANSPORT"),
-        ("server", "DEEPSEEK_SERVER_ERROR"),
-    ],
-)
-async def test_client_retries_only_transient_failures_three_times(
-    failure: str, error_code: str
-) -> None:
-    facts = make_facts()
-    requests = 0
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal requests
-        requests += 1
-        if failure == "timeout":
-            raise httpx.TimeoutException("timeout", request=request)
-        if failure == "transport":
-            raise httpx.ConnectError("transport", request=request)
-        return httpx.Response(500)
-
-    invocation = await client(httpx.MockTransport(handler)).request(
-        facts, call_type=AgentCallType.PRIMARY
-    )
-
-    assert invocation.response is None
-    assert invocation.error_code == error_code
-    assert requests == len(invocation.records) == 3
-
-
-@pytest.mark.parametrize(
-    ("status_code", "error_code"),
-    [
-        (400, "DEEPSEEK_HTTP_ERROR"),
-        (401, "DEEPSEEK_UNAUTHORIZED"),
-        (403, "DEEPSEEK_FORBIDDEN"),
-    ],
-)
-async def test_client_does_not_retry_model_authentication_failures(
-    status_code: int, error_code: str
-) -> None:
-    facts = make_facts()
-    requests = 0
-
-    async def handler(_request: httpx.Request) -> httpx.Response:
-        nonlocal requests
-        requests += 1
-        return httpx.Response(status_code)
-
-    invocation = await client(httpx.MockTransport(handler)).request(
-        facts, call_type=AgentCallType.PRIMARY
-    )
-
-    assert invocation.response is None
-    assert invocation.error_code == error_code
-    assert requests == len(invocation.records) == 1
-
-
 @pytest.mark.parametrize("kind", ["invalid_json", "extra_field", "low_confidence", "high_confidence"])
 async def test_client_handles_schema_errors_and_schema_repair_node_mapping(kind: str) -> None:
     facts = make_facts()
@@ -416,90 +330,6 @@ async def test_client_handles_schema_errors_and_schema_repair_node_mapping(kind:
     )
     assert repair.response is not None
     assert repair.records[0].node_name == "validate_and_reconcile"
-
-
-async def test_client_stops_before_http_when_lease_is_lost_or_key_is_missing() -> None:
-    facts = make_facts()
-    requests = 0
-
-    async def handler(_request: httpx.Request) -> httpx.Response:
-        nonlocal requests
-        requests += 1
-        return completion(response_content(facts))
-
-    async def lost_lease(_call_type: AgentCallType, _attempt: int) -> bool:
-        return False
-
-    lease_lost = await client(httpx.MockTransport(handler)).request(
-        facts, call_type=AgentCallType.PRIMARY, before_http_attempt=lost_lease
-    )
-    missing_key = await client(httpx.MockTransport(handler), api_key=None).request(
-        facts, call_type=AgentCallType.PRIMARY
-    )
-    blank_key = await client(httpx.MockTransport(handler), api_key="   ").request(
-        facts, call_type=AgentCallType.PRIMARY
-    )
-
-    assert lease_lost.error_code == "LEASE_LOST"
-    assert lease_lost.records == []
-    assert missing_key.error_code == "DEEPSEEK_KEY_MISSING"
-    assert missing_key.records == []
-    assert blank_key.error_code == "DEEPSEEK_KEY_MISSING"
-    assert blank_key.records == []
-    assert requests == 0
-
-
-async def test_client_records_safe_hash_and_optional_cost() -> None:
-    facts = make_facts()
-
-    async def handler(_request: httpx.Request) -> httpx.Response:
-        return completion(response_content(facts), total_tokens=8)
-
-    without_price = await client(httpx.MockTransport(handler)).request(
-        facts, call_type=AgentCallType.PRIMARY
-    )
-    with_price = await client(
-        httpx.MockTransport(handler), price=Decimal("2.5")
-    ).request(facts, call_type=AgentCallType.PRIMARY)
-
-    assert without_price.records[0].estimated_cost is None
-    assert with_price.records[0].estimated_cost == Decimal("0.000020")
-    for record in (*without_price.records, *with_price.records):
-        assert record.model == "deepseek-v4-flash"
-        assert len(record.input_hash) == 64
-        assert not {"headers", "prompt", "raw_response", "key", "authorization"} & set(vars(record))
-
-
-@pytest.mark.parametrize(
-    "usage",
-    [
-        None,
-        [],
-        {"prompt_tokens": "invalid", "completion_tokens": "invalid", "total_tokens": "invalid"},
-        {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1},
-    ],
-)
-async def test_client_normalizes_untrusted_usage_without_breaking_success(usage: object) -> None:
-    facts = make_facts()
-
-    async def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "choices": [{"message": {"content": response_content(facts)}}],
-                "usage": usage,
-            },
-        )
-
-    invocation = await client(
-        httpx.MockTransport(handler), price=Decimal("2.5")
-    ).request(facts, call_type=AgentCallType.PRIMARY)
-
-    assert invocation.response is not None
-    assert invocation.error_code is None
-    record = invocation.records[0]
-    assert (record.prompt_tokens, record.completion_tokens, record.total_tokens) == (0, 0, 0)
-    assert record.estimated_cost == Decimal("0.000000")
 
 
 def test_degraded_drafts_are_fixed_chinese_and_cover_trusted_candidates() -> None:
