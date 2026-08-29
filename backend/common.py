@@ -31,7 +31,15 @@ class WorkflowStatus(StrEnum):
     ACCEPTED = "accepted"
     PROCESSING = "processing"
     AWAITING_SELECTION = "awaiting_selection"
+    COMPLETED = "completed"
+    DRAFT_READY = "draft_ready"
+    PENDING_MANUAL = "pending_manual"
     FAILED = "failed"
+
+
+class WorkflowType(StrEnum):
+    ANALYSIS = "analysis"
+    OPTIMIZATION = "optimization"
 
 
 class WorkflowQuality(StrEnum):
@@ -51,6 +59,12 @@ class KnowledgeVersionStatus(StrEnum):
 class AgentCallType(StrEnum):
     PRIMARY = "primary"
     SCHEMA_REPAIR = "schema_repair"
+
+
+class ComplianceRiskLevel(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
 
 
 def utc_now() -> datetime:

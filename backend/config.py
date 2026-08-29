@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     deepseek_price_per_million_tokens: Decimal | None = None
     langgraph_database_url: str = "postgresql://ecommerce:ecommerce@localhost:5434/ecommerce"
     analysis_lease_seconds: int = 60
+    optimization_lease_seconds: int = 60
     knowledge_upload_dir: Path = Path("data/uploads/knowledge")
     knowledge_embedding_model_path: Path = Path("model/bge-m3")
     knowledge_reranker_model_path: Path = Path("model/bge-reranker-v2-m3")

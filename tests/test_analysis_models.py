@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from backend.common import AgentCallType, UserRole, WorkflowQuality, WorkflowStatus
+from backend.common import AgentCallType, UserRole, WorkflowQuality, WorkflowStatus, WorkflowType
 from backend.models import AnalysisCandidate, AgentCall, Product, Store, User, WorkflowRun
 
 
@@ -36,7 +36,7 @@ async def _add_references(session) -> None:
 def _workflow_run(run_id: str, **changes: object) -> WorkflowRun:
     values: dict[str, object] = {
         "id": run_id,
-        "workflow_type": "analysis",
+        "workflow_type": WorkflowType.ANALYSIS,
         "store_id": "store-1",
         "created_by": "user-1",
         "start_date": date(2026, 7, 26),
@@ -116,6 +116,7 @@ async def test_valid_analysis_persistence_rows_have_defaults(session) -> None:
     assert candidate.business_impact == Decimal("1.00")
     assert candidate.confidence == Decimal("0.8000")
     assert call.estimated_cost is None
+    assert call.iteration == 0
     assert call.created_at.tzinfo is UTC
 
 

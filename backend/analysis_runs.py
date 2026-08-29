@@ -206,6 +206,7 @@ async def persist_analysis_completion(
             "workflow_run_id": workflow_run_id,
             "node_name": call.node_name,
             "call_type": call.call_type,
+            "iteration": 0,
             "attempt": call.attempt,
             "model": call.model,
             "prompt_version": call.prompt_version,
@@ -221,7 +222,7 @@ async def persist_analysis_completion(
         insert = _insert_for(session, AgentCall).values(values)
         await session.execute(
             insert.on_conflict_do_update(
-                index_elements=["workflow_run_id", "node_name", "call_type", "attempt"],
+                index_elements=["workflow_run_id", "node_name", "call_type", "iteration", "attempt"],
                 set_={key: insert.excluded[key] for key in values if key not in {"id", "workflow_run_id"}},
             )
         )

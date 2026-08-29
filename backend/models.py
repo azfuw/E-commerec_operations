@@ -20,6 +20,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.common import (
     AgentCallType,
+    ComplianceRiskLevel,
     KnowledgeVersionStatus,
     OrderStatus,
     RefundStatus,
@@ -27,6 +28,7 @@ from backend.common import (
     UserStatus,
     WorkflowQuality,
     WorkflowStatus,
+    WorkflowType,
     utc_now,
 )
 from backend.database import Base
@@ -214,16 +216,17 @@ class InventorySnapshot(Base):
 class WorkflowRun(Base):
     __tablename__ = "workflow_runs"
     __table_args__ = (
-        CheckConstraint("workflow_type = 'analysis'", name="ck_workflow_runs_type"),
         CheckConstraint(
-            "status IN ('accepted', 'processing', 'awaiting_selection', 'failed')",
-            name="ck_workflow_runs_status",
+            "((workflow_type = 'analysis' AND start_date IS NOT NULL AND end_date IS NOT NULL "
+            "AND start_date <= end_date AND status IN ('accepted', 'processing', 'awaiting_selection', 'completed', 'failed')) "
+            "OR (workflow_type = 'optimization' AND start_date IS NULL AND end_date IS NULL "
+            "AND status IN ('accepted', 'processing', 'draft_ready', 'pending_manual', 'failed')))",
+            name="ck_workflow_runs_type_status_dates",
         ),
         CheckConstraint(
             "quality_status IN ('normal', 'partial', 'degraded')",
             name="ck_workflow_runs_quality_status",
         ),
-        CheckConstraint("start_date <= end_date", name="ck_workflow_runs_dates"),
         CheckConstraint(
             "attempt_count BETWEEN 0 AND 3", name="ck_workflow_runs_attempt_count"
         ),
@@ -235,11 +238,21 @@ class WorkflowRun(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    workflow_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    workflow_type: Mapped[WorkflowType] = mapped_column(
+        Enum(
+            WorkflowType,
+            name="workflow_type",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=32,
+        ),
+        nullable=False,
+    )
     store_id: Mapped[str] = mapped_column(ForeignKey("stores.id"), nullable=False)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
-    start_date: Mapped[date] = mapped_column(Date, nullable=False)
-    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    start_date: Mapped[date | None] = mapped_column(Date)
+    end_date: Mapped[date | None] = mapped_column(Date)
     status: Mapped[WorkflowStatus] = mapped_column(
         Enum(
             WorkflowStatus,
@@ -320,14 +333,16 @@ class AgentCall(Base):
             "workflow_run_id",
             "node_name",
             "call_type",
+            "iteration",
             "attempt",
-            name="uq_agent_calls_workflow_run_id_node_name_call_type_attempt",
+            name="uq_agent_calls_run_node_type_iteration_attempt",
         ),
         CheckConstraint(
             "call_type IN ('primary', 'schema_repair')",
             name="ck_agent_calls_call_type",
         ),
         CheckConstraint("attempt >= 0", name="ck_agent_calls_attempt"),
+        CheckConstraint("iteration >= 0", name="ck_agent_calls_iteration"),
         CheckConstraint("prompt_tokens >= 0", name="ck_agent_calls_prompt_tokens"),
         CheckConstraint("completion_tokens >= 0", name="ck_agent_calls_completion_tokens"),
         CheckConstraint("total_tokens >= 0", name="ck_agent_calls_total_tokens"),
@@ -347,6 +362,9 @@ class AgentCall(Base):
         ),
         nullable=False,
     )
+    iteration: Mapped[int] = mapped_column(
+        Integer, default=lambda: 0, server_default="0", nullable=False
+    )
     attempt: Mapped[int] = mapped_column(Integer, nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -358,6 +376,126 @@ class AgentCall(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     estimated_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
     error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ProductProposal(Base):
+    __tablename__ = "product_proposals"
+    __table_args__ = (
+        UniqueConstraint("analysis_run_id", name="uq_product_proposals_analysis_run_id"),
+        UniqueConstraint("analysis_candidate_id", name="uq_product_proposals_analysis_candidate_id"),
+        UniqueConstraint("optimization_run_id", name="uq_product_proposals_optimization_run_id"),
+        CheckConstraint("base_product_version >= 1", name="ck_product_proposals_base_product_version"),
+        CheckConstraint(
+            "length(selection_idempotency_hash) = 64",
+            name="ck_product_proposals_selection_idempotency_hash_length",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    analysis_run_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_runs.id", name="fk_product_proposals_analysis_run_id"), nullable=False
+    )
+    analysis_candidate_id: Mapped[str] = mapped_column(
+        ForeignKey("analysis_candidates.id", name="fk_product_proposals_analysis_candidate_id"), nullable=False
+    )
+    optimization_run_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_runs.id", name="fk_product_proposals_optimization_run_id"), nullable=False
+    )
+    store_id: Mapped[str] = mapped_column(
+        ForeignKey("stores.id", name="fk_product_proposals_store_id"), nullable=False
+    )
+    product_id: Mapped[str] = mapped_column(
+        ForeignKey("products.id", name="fk_product_proposals_product_id"), nullable=False
+    )
+    base_product_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    selection_idempotency_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    current_revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "proposal_revisions.id",
+            name="fk_product_proposals_current_revision_id",
+            use_alter=True,
+        )
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ProposalRevision(Base):
+    __tablename__ = "proposal_revisions"
+    __table_args__ = (
+        UniqueConstraint("proposal_id", "iteration", name="uq_proposal_revisions_proposal_id_iteration"),
+        CheckConstraint("iteration BETWEEN 0 AND 2", name="ck_proposal_revisions_iteration"),
+        CheckConstraint("base_product_version >= 1", name="ck_proposal_revisions_base_product_version"),
+        CheckConstraint(
+            "length(trusted_fact_hash) = 64", name="ck_proposal_revisions_trusted_fact_hash_length"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    proposal_id: Mapped[str] = mapped_column(
+        ForeignKey("product_proposals.id", name="fk_proposal_revisions_proposal_id"), nullable=False
+    )
+    iteration: Mapped[int] = mapped_column(Integer, nullable=False)
+    base_product_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    trusted_fact_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    proposal_output: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    citations: Mapped[list[dict[str, object]]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ComplianceReview(Base):
+    __tablename__ = "compliance_reviews"
+    __table_args__ = (
+        UniqueConstraint("proposal_revision_id", name="uq_compliance_reviews_proposal_revision_id"),
+        UniqueConstraint("proposal_id", "iteration", name="uq_compliance_reviews_proposal_id_iteration"),
+        CheckConstraint("iteration BETWEEN 0 AND 2", name="ck_compliance_reviews_iteration"),
+        CheckConstraint(
+            "risk_level IN ('low', 'medium', 'high')", name="ck_compliance_reviews_risk_level"
+        ),
+        CheckConstraint(
+            "quality_status IN ('normal', 'partial', 'degraded')",
+            name="ck_compliance_reviews_quality_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    proposal_id: Mapped[str] = mapped_column(
+        ForeignKey("product_proposals.id", name="fk_compliance_reviews_proposal_id"), nullable=False
+    )
+    proposal_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("proposal_revisions.id", name="fk_compliance_reviews_proposal_revision_id"),
+        nullable=False,
+    )
+    iteration: Mapped[int] = mapped_column(Integer, nullable=False)
+    deterministic_checks: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    semantic_review: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    risk_level: Mapped[ComplianceRiskLevel] = mapped_column(
+        Enum(
+            ComplianceRiskLevel,
+            name="compliance_risk_level",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
+        nullable=False,
+    )
+    required_changes: Mapped[list[dict[str, object]]] = mapped_column(JSON, nullable=False)
+    citations: Mapped[list[dict[str, object]]] = mapped_column(JSON, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    quality_status: Mapped[WorkflowQuality] = mapped_column(
+        Enum(
+            WorkflowQuality,
+            name="workflow_quality",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
