@@ -19,7 +19,7 @@ from backend.auth import (
     require_store_access,
     verify_password,
 )
-from backend.common import KnowledgeVersionStatus, UserRole, UserStatus, WorkflowStatus
+from backend.common import KnowledgeVersionStatus, UserRole, UserStatus, WorkflowStatus, WorkflowType
 from backend.config import Settings, get_settings
 from backend.database import get_session
 from backend.knowledge_content import KnowledgeContentError, read_and_validate_upload, store_validated_upload
@@ -44,16 +44,28 @@ from backend.models import (
     User,
     UserStoreScope,
 )
+from backend.proposals import (
+    ProposalDomainError,
+    get_proposal_for_actor,
+    select_product_for_optimization,
+)
 from backend.schemas import (
     AccessToken,
     AnalysisCandidateView,
     AnalysisRunAccepted,
     AnalysisRunRequest,
+    ComplianceReviewView,
     KnowledgeCitation,
     KnowledgeEnvelope,
     KnowledgeSearchRequest,
     LoginRequest,
+    OptimizationWorkflowSummary,
+    ProductSelectionRequest,
+    ProductSelectionView,
     ProductSummary,
+    ProposalDetailView,
+    ProposalRevisionView,
+    ProposalView,
     StoreSummary,
     WorkflowRunView,
 )
@@ -214,7 +226,7 @@ async def read_workflow_run(
     await require_store_access(run.store_id, user, session)
     return WorkflowRunView(
         id=run.id,
-        workflow_type="analysis",
+        workflow_type=run.workflow_type,
         store_id=run.store_id,
         start_date=run.start_date,
         end_date=run.end_date,
@@ -222,7 +234,10 @@ async def read_workflow_run(
         quality_status=run.quality_status,
         current_step=run.current_step,
         attempt_count=run.attempt_count,
-        candidates_ready=run.status is WorkflowStatus.AWAITING_SELECTION,
+        candidates_ready=(
+            run.workflow_type is WorkflowType.ANALYSIS
+            and run.status is WorkflowStatus.AWAITING_SELECTION
+        ),
         error_code=run.error_code,
     )
 
@@ -247,6 +262,96 @@ async def read_analysis_candidates(
         )
     candidates = await list_analysis_candidates(session, run.id)
     return [AnalysisCandidateView.model_validate(candidate) for candidate in candidates]
+
+
+@router.post(
+    "/analysis-runs/{analysis_run_id}/select-product",
+    response_model=ProductSelectionView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def select_product_route(
+    response: Response,
+    analysis_run_id: str,
+    request: ProductSelectionRequest,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ProductSelectionView:
+    try:
+        result = await select_product_for_optimization(
+            session,
+            user.id,
+            analysis_run_id,
+            request.candidate_id,
+            idempotency_key,
+        )
+    except ProposalDomainError as error:
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code}) from None
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return ProductSelectionView(
+        proposal_id=result.proposal.id,
+        optimization_workflow_run_id=result.optimization_run.id,
+        status="accepted",
+    )
+
+
+@router.get("/proposals/{proposal_id}", response_model=ProposalDetailView)
+async def read_proposal_route(
+    proposal_id: str,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ProposalDetailView:
+    try:
+        result = await get_proposal_for_actor(session, user.id, proposal_id)
+    except ProposalDomainError as error:
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code}) from None
+    revision = result.current_revision
+    review = result.current_review
+    return ProposalDetailView(
+        proposal=ProposalView(
+            id=result.proposal.id,
+            analysis_run_id=result.proposal.analysis_run_id,
+            analysis_candidate_id=result.proposal.analysis_candidate_id,
+            optimization_run_id=result.proposal.optimization_run_id,
+            store_id=result.proposal.store_id,
+            product_id=result.proposal.product_id,
+            base_product_version=result.proposal.base_product_version,
+            current_revision_id=result.proposal.current_revision_id,
+            created_at=result.proposal.created_at,
+            updated_at=result.proposal.updated_at,
+        ),
+        optimization_run=OptimizationWorkflowSummary(
+            id=result.optimization_run.id,
+            workflow_type=result.optimization_run.workflow_type,
+            status=result.optimization_run.status,
+            quality_status=result.optimization_run.quality_status,
+            error_code=result.optimization_run.error_code,
+        ),
+        current_revision=None
+        if revision is None
+        else ProposalRevisionView(
+            id=revision.id,
+            iteration=revision.iteration,
+            base_product_version=revision.base_product_version,
+            proposal_output=revision.proposal_output,
+            citations=revision.citations,
+        ),
+        current_review=None
+        if review is None
+        else ComplianceReviewView(
+            id=review.id,
+            iteration=review.iteration,
+            deterministic_checks=review.deterministic_checks,
+            semantic_review=review.semantic_review,
+            passed=review.passed,
+            risk_level=review.risk_level,
+            quality_status=review.quality_status,
+            required_changes=review.required_changes,
+            citations=review.citations,
+            error_code=review.error_code,
+        ),
+    )
 
 
 @router.post(

@@ -1,10 +1,10 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from backend.common import WorkflowQuality, WorkflowStatus
+from backend.common import ComplianceRiskLevel, WorkflowQuality, WorkflowStatus, WorkflowType
 
 
 class LoginRequest(BaseModel):
@@ -132,16 +132,77 @@ class WorkflowRunView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    workflow_type: Literal["analysis"]
+    workflow_type: WorkflowType
     store_id: str
-    start_date: date
-    end_date: date
+    start_date: date | None
+    end_date: date | None
     status: WorkflowStatus
     quality_status: WorkflowQuality
     current_step: str | None
     attempt_count: int
     candidates_ready: bool
     error_code: str | None
+
+
+class ProductSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str = Field(min_length=1, max_length=36)
+
+
+class ProductSelectionView(BaseModel):
+    proposal_id: str
+    optimization_workflow_run_id: str
+    status: Literal["accepted"]
+
+
+class OptimizationWorkflowSummary(BaseModel):
+    id: str
+    workflow_type: WorkflowType
+    status: WorkflowStatus
+    quality_status: WorkflowQuality
+    error_code: str | None
+
+
+class ProposalRevisionView(BaseModel):
+    id: str
+    iteration: int
+    base_product_version: int
+    proposal_output: dict[str, object]
+    citations: list[dict[str, object]]
+
+
+class ComplianceReviewView(BaseModel):
+    id: str
+    iteration: int
+    deterministic_checks: dict[str, object]
+    semantic_review: dict[str, object]
+    passed: bool
+    risk_level: ComplianceRiskLevel
+    quality_status: WorkflowQuality
+    required_changes: list[dict[str, object]]
+    citations: list[dict[str, object]]
+    error_code: str | None
+
+
+class ProposalView(BaseModel):
+    id: str
+    analysis_run_id: str
+    analysis_candidate_id: str
+    optimization_run_id: str
+    store_id: str
+    product_id: str
+    base_product_version: int
+    current_revision_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProposalDetailView(BaseModel):
+    proposal: ProposalView
+    optimization_run: OptimizationWorkflowSummary
+    current_revision: ProposalRevisionView | None
+    current_review: ComplianceReviewView | None
 
 
 class AnalysisCandidateView(BaseModel):
