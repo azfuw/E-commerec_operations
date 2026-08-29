@@ -1,41 +1,20 @@
 from datetime import date
 from uuid import uuid4
 
-from sqlalchemy import and_, func, literal, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.analysis_agent import AgentCallRecord
-from backend.common import WorkflowQuality, WorkflowStatus
+from backend.common import WorkflowQuality, WorkflowStatus, WorkflowType
 from backend.models import AgentCall, AnalysisCandidate, WorkflowRun
 from backend.schemas import AnalysisCandidateView
-
-
-def _lease_expiry(session: AsyncSession, lease_seconds: int):
-    if session.bind is not None and session.bind.dialect.name == "postgresql":
-        return func.now() + text("make_interval(secs => :lease_seconds)").bindparams(
-            lease_seconds=lease_seconds
-        )
-    return func.datetime(func.now(), literal(f"+{lease_seconds} seconds"))
-
-
-def _owned_lease(workflow_run_id: str, lease_owner: str):
-    return (
-        WorkflowRun.id == workflow_run_id,
-        WorkflowRun.status == WorkflowStatus.PROCESSING,
-        WorkflowRun.lease_owner == lease_owner,
-        WorkflowRun.lease_expires_at > func.now(),
-    )
-
-
-async def _commit_owned_update(session: AsyncSession, statement) -> bool:
-    result = await session.execute(statement)
-    if result.rowcount:
-        await session.commit()
-        return True
-    await session.rollback()
-    return False
+from backend.workflow_leases import (
+    commit_owned_workflow_update,
+    owned_workflow_lease,
+    workflow_lease_expiry,
+)
 
 
 async def create_analysis_run(
@@ -47,7 +26,7 @@ async def create_analysis_run(
     end_date: date,
 ) -> WorkflowRun:
     run = WorkflowRun(
-        workflow_type="analysis",
+        workflow_type=WorkflowType.ANALYSIS,
         store_id=store_id,
         created_by=created_by,
         start_date=start_date,
@@ -89,6 +68,7 @@ async def claim_next_analysis_run(
     await session.execute(
         update(WorkflowRun)
         .where(
+            WorkflowRun.workflow_type == WorkflowType.ANALYSIS,
             WorkflowRun.status == WorkflowStatus.PROCESSING,
             WorkflowRun.lease_expires_at < func.now(),
             WorkflowRun.attempt_count >= 3,
@@ -110,7 +90,11 @@ async def claim_next_analysis_run(
     )
     run = await session.scalar(
         select(WorkflowRun)
-        .where(eligible, WorkflowRun.attempt_count < 3)
+        .where(
+            WorkflowRun.workflow_type == WorkflowType.ANALYSIS,
+            eligible,
+            WorkflowRun.attempt_count < 3,
+        )
         .order_by(WorkflowRun.created_at, WorkflowRun.id)
         .with_for_update(skip_locked=True)
         .limit(1)
@@ -120,7 +104,7 @@ async def claim_next_analysis_run(
         return None
     run.status = WorkflowStatus.PROCESSING
     run.lease_owner = lease_owner
-    run.lease_expires_at = _lease_expiry(session, lease_seconds)
+    run.lease_expires_at = workflow_lease_expiry(session, lease_seconds)
     run.attempt_count += 1
     run.current_step = "claimed"
     run.error_code = None
@@ -131,21 +115,21 @@ async def claim_next_analysis_run(
 async def renew_analysis_lease(
     session: AsyncSession, *, workflow_run_id: str, lease_owner: str, lease_seconds: int
 ) -> bool:
-    return await _commit_owned_update(
+    return await commit_owned_workflow_update(
         session,
         update(WorkflowRun)
-        .where(*_owned_lease(workflow_run_id, lease_owner))
-        .values(lease_expires_at=_lease_expiry(session, lease_seconds)),
+        .where(*owned_workflow_lease(workflow_run_id, WorkflowType.ANALYSIS, lease_owner))
+        .values(lease_expires_at=workflow_lease_expiry(session, lease_seconds)),
     )
 
 
 async def update_analysis_step(
     session: AsyncSession, *, workflow_run_id: str, lease_owner: str, current_step: str
 ) -> bool:
-    return await _commit_owned_update(
+    return await commit_owned_workflow_update(
         session,
         update(WorkflowRun)
-        .where(*_owned_lease(workflow_run_id, lease_owner))
+        .where(*owned_workflow_lease(workflow_run_id, WorkflowType.ANALYSIS, lease_owner))
         .values(current_step=current_step),
     )
 
@@ -169,7 +153,7 @@ async def persist_analysis_completion(
 ) -> bool:
     run = await session.scalar(
         select(WorkflowRun)
-        .where(*_owned_lease(workflow_run_id, lease_owner))
+        .where(*owned_workflow_lease(workflow_run_id, WorkflowType.ANALYSIS, lease_owner))
         .with_for_update()
     )
     if run is None:
@@ -248,10 +232,10 @@ async def finalize_analysis_run(
     quality_status: WorkflowQuality,
     quality: dict[str, object],
 ) -> bool:
-    return await _commit_owned_update(
+    return await commit_owned_workflow_update(
         session,
         update(WorkflowRun)
-        .where(*_owned_lease(workflow_run_id, lease_owner))
+        .where(*owned_workflow_lease(workflow_run_id, WorkflowType.ANALYSIS, lease_owner))
         .values(
             status=WorkflowStatus.AWAITING_SELECTION,
             quality_status=quality_status,
@@ -274,10 +258,10 @@ async def fail_analysis_run(
         "CHECKPOINT_ERROR",
     }:
         return False
-    return await _commit_owned_update(
+    return await commit_owned_workflow_update(
         session,
         update(WorkflowRun)
-        .where(*_owned_lease(workflow_run_id, lease_owner))
+        .where(*owned_workflow_lease(workflow_run_id, WorkflowType.ANALYSIS, lease_owner))
         .values(
             status=WorkflowStatus.FAILED,
             lease_owner=None,

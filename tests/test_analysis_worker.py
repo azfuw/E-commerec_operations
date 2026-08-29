@@ -25,7 +25,7 @@ from backend.analysis_runs import (
     renew_analysis_lease,
     update_analysis_step,
 )
-from backend.common import AgentCallType, WorkflowQuality, WorkflowStatus
+from backend.common import AgentCallType, WorkflowQuality, WorkflowStatus, WorkflowType
 from backend.config import Settings
 from backend.database import Base
 from backend.models import AgentCall, AnalysisCandidate, Store, User, WorkflowRun
@@ -267,6 +267,98 @@ async def test_claim_orders_accepted_reclaims_expired_and_never_claims_terminal_
         None,
     )
     assert terminal.status is WorkflowStatus.AWAITING_SELECTION
+
+
+async def test_analysis_worker_never_claims_or_mutates_optimization_runs(
+    seeded_worker, settings, valid_transport
+) -> None:
+    factory = seeded_worker["factory"]
+    assert isinstance(factory, async_sessionmaker)
+    analysis_id = await _new_run(seeded_worker)
+    optimization_ids = ("optimization-accepted", "optimization-expired", "optimization-exhausted")
+    async with factory() as session:
+        analysis = await session.get(WorkflowRun, analysis_id)
+        assert analysis is not None
+        analysis.created_at = datetime(2026, 8, 25, tzinfo=UTC)
+        optimization_rows = [
+            WorkflowRun(
+                id=optimization_ids[0],
+                workflow_type=WorkflowType.OPTIMIZATION,
+                store_id=str(seeded_worker["store_id"]),
+                created_by=str(seeded_worker["user_id"]),
+                start_date=None,
+                end_date=None,
+                status=WorkflowStatus.ACCEPTED,
+                quality_status=WorkflowQuality.NORMAL,
+                current_step="optimization-accepted",
+            ),
+            WorkflowRun(
+                id=optimization_ids[1],
+                workflow_type=WorkflowType.OPTIMIZATION,
+                store_id=str(seeded_worker["store_id"]),
+                created_by=str(seeded_worker["user_id"]),
+                start_date=None,
+                end_date=None,
+                status=WorkflowStatus.PROCESSING,
+                quality_status=WorkflowQuality.NORMAL,
+                attempt_count=2,
+                lease_owner="optimization-old-owner",
+                lease_expires_at=datetime.now(UTC) - timedelta(seconds=5),
+                current_step="optimization-expired",
+            ),
+            WorkflowRun(
+                id=optimization_ids[2],
+                workflow_type=WorkflowType.OPTIMIZATION,
+                store_id=str(seeded_worker["store_id"]),
+                created_by=str(seeded_worker["user_id"]),
+                start_date=None,
+                end_date=None,
+                status=WorkflowStatus.PROCESSING,
+                quality_status=WorkflowQuality.NORMAL,
+                attempt_count=3,
+                lease_owner="optimization-exhausted-owner",
+                lease_expires_at=datetime.now(UTC) - timedelta(seconds=5),
+                current_step="optimization-exhausted",
+            ),
+        ]
+        session.add_all(optimization_rows)
+        await session.commit()
+
+    expected = {}
+    async with factory() as session:
+        for workflow_run_id in optimization_ids:
+            run = await session.get(WorkflowRun, workflow_run_id)
+            assert run is not None
+            expected[workflow_run_id] = (
+                run.status,
+                run.attempt_count,
+                run.lease_owner,
+                run.lease_expires_at,
+                run.current_step,
+                run.error_code,
+            )
+
+    assert await analysis_worker.run_once(
+        factory,
+        settings=settings,
+        lease_owner="analysis-worker",
+        checkpointer=InMemorySaver(),
+        transport=valid_transport,
+    ) == analysis_id
+    analysis = await _read_run(factory, analysis_id)
+    assert (analysis.status, analysis.attempt_count) == (WorkflowStatus.AWAITING_SELECTION, 1)
+    async with factory() as session:
+        for workflow_run_id, snapshot in expected.items():
+            run = await session.get(WorkflowRun, workflow_run_id)
+            assert run is not None
+            assert (
+                run.status,
+                run.attempt_count,
+                run.lease_owner,
+                run.lease_expires_at,
+                run.current_step,
+                run.error_code,
+            ) == snapshot
 
 
 async def test_stale_owner_cannot_renew_persist_or_fail_and_completion_is_idempotent(
