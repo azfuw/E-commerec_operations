@@ -91,6 +91,127 @@ class ProductMetrics(BaseModel):
         )
 
 
+class CanonicalRuleCitation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str = Field(max_length=36)
+    version_id: str = Field(max_length=36)
+    chunk_id: str = Field(max_length=128)
+    document_name: str = Field(max_length=255)
+    version_number: int
+    category: str = Field(max_length=64)
+    canonical_text: str = Field(max_length=12000)
+    active: bool
+    applicable: bool
+
+
+class TrustedProductSku(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(max_length=36)
+    code: str = Field(max_length=64)
+    spec: dict[str, str] = Field(max_length=50)
+    price: Decimal
+    stock: int
+
+
+class TrustedOptimizationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    store_id: str = Field(max_length=36)
+    product_id: str = Field(max_length=36)
+    base_product_version: int
+    title: str = Field(max_length=512)
+    category: str = Field(max_length=128)
+    brand: str = Field(max_length=128)
+    selling_points: list[str] = Field(max_length=20)
+    description: str = Field(max_length=8000)
+    search_keywords: list[str] = Field(max_length=100)
+    attributes: dict[str, str] = Field(max_length=50)
+    skus: list[TrustedProductSku] = Field(max_length=100)
+    candidate_metrics: ProductMetrics
+    candidate_evidence: list[str] = Field(max_length=50)
+    rag_quality: Literal["normal", "zero_hit", "low_confidence"]
+    canonical_rule_citations: list[CanonicalRuleCitation] = Field(max_length=50)
+
+
+class EvidenceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["fact", "citation"]
+    value: str = Field(min_length=1, max_length=128)
+
+
+class OutputCitation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_id: str = Field(min_length=1, max_length=128)
+
+
+class DescriptionSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    heading: str = Field(max_length=256)
+    body: str = Field(max_length=4000)
+    evidence: list[EvidenceRef] = Field(max_length=20)
+
+
+class OptimizationChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: Literal["title", "selling_points", "description", "keywords"]
+    current_value: str | list[str] | list[DescriptionSection]
+    suggested_value: str | list[str] | list[DescriptionSection]
+    reason: str = Field(max_length=1024)
+    evidence: list[EvidenceRef] = Field(max_length=20)
+
+
+class AttributeCompletion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_attribute: str = Field(min_length=1, max_length=64)
+    current_value: str | None = Field(max_length=512)
+    suggested_value: str = Field(max_length=512)
+    reason: str = Field(max_length=1024)
+    evidence: list[EvidenceRef] = Field(max_length=20)
+
+
+class PriceSuggestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_sku_id: str = Field(min_length=1, max_length=36)
+    current_price: Decimal
+    suggested_price: Decimal
+    reason: str = Field(max_length=1024)
+    evidence: list[EvidenceRef] = Field(max_length=20)
+
+
+class SkuSuggestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_sku_id: str = Field(min_length=1, max_length=36)
+    current_code: str = Field(max_length=64)
+    current_spec: dict[str, str] = Field(max_length=50)
+    suggested_code: str = Field(max_length=64)
+    suggested_spec: dict[str, str] = Field(max_length=50)
+    reason: str = Field(max_length=1024)
+    evidence: list[EvidenceRef] = Field(max_length=20)
+
+
+class OptimizationProposalOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(max_length=512)
+    selling_points: list[str] = Field(max_length=20)
+    description: list[DescriptionSection] = Field(max_length=20)
+    keywords: list[str] = Field(max_length=100)
+    attribute_completions: list[AttributeCompletion] = Field(max_length=50)
+    changes: list[OptimizationChange] = Field(max_length=50)
+    citations: list[OutputCitation] = Field(max_length=50)
+    price_suggestions: list[PriceSuggestion] = Field(max_length=50)
+    sku_suggestions: list[SkuSuggestion] = Field(max_length=50)
+
+
 class InventoryRisk(BaseModel):
     product_id: str
     snapshot_date: date | None
