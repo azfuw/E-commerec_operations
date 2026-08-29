@@ -1,5 +1,5 @@
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -202,27 +202,39 @@ async def search_active_knowledge(
     top_k: int,
     retrieval_path: RetrievalPath,
     load_dependencies: KnowledgeSearchLoader,
+    before_external_attempt: Callable[[], Awaitable[None]] | None = None,
 ) -> "KnowledgeSearchOutcome":
     version_ids = await _active_version_ids(session, categories)
     if not version_ids:
         return KnowledgeSearchOutcome("zero_hit", [])
+
+    async def await_before_external() -> None:
+        if before_external_attempt is not None:
+            await before_external_attempt()
+
+    await await_before_external()
     models, index, calibration = load_dependencies()
+    await await_before_external()
     vector = await models.embed_query(query)
     candidate_limit = int(calibration["candidate_limit"])
     if retrieval_path == "dense":
+        await await_before_external()
         dense = await index.dense_search(
             vector=vector.dense, version_ids=version_ids, limit=candidate_limit
         )
         candidates = _dense_candidates(dense)
     elif retrieval_path == "sparse":
+        await await_before_external()
         sparse = await index.sparse_search(
             vector=vector.sparse, version_ids=version_ids, limit=candidate_limit
         )
         candidates = _sparse_candidates(sparse)
     else:
+        await await_before_external()
         dense = await index.dense_search(
             vector=vector.dense, version_ids=version_ids, limit=candidate_limit
         )
+        await await_before_external()
         sparse = await index.sparse_search(
             vector=vector.sparse, version_ids=version_ids, limit=candidate_limit
         )
@@ -232,6 +244,7 @@ async def search_active_knowledge(
     )
     hits = _hits_from_candidates(candidates, canonical, path=retrieval_path)
     if retrieval_path == "hybrid_rerank" and hits:
+        await await_before_external()
         reranker_scores = await models.rerank(query, [hit.canonical_text for hit in hits])
         if len(reranker_scores) != len(hits):
             raise KnowledgeDependencyError("KNOWLEDGE_MODEL_UNAVAILABLE", retryable=True)

@@ -429,3 +429,148 @@ async def test_loader_is_cheap_until_the_first_active_search(monkeypatch, sessio
         )
     assert constructed == ["models", "index"] and reads == 1
     get_knowledge_search_dependencies.cache_clear()
+
+
+async def test_search_renews_before_each_hybrid_rerank_external_boundary(session) -> None:
+    await _seed(session)
+    events: list[str] = []
+
+    class RecordingModels(_Models):
+        async def embed_query(self, query: str) -> HybridVector:
+            events.append("embed")
+            return await super().embed_query(query)
+
+        async def rerank(self, query: str, texts: list[str]) -> list[float]:
+            events.append("rerank")
+            return await super().rerank(query, texts)
+
+    class RecordingIndex(_Index):
+        async def dense_search(self, **kwargs) -> list[tuple[str, float]]:
+            events.append("dense")
+            return await super().dense_search(**kwargs)
+
+        async def sparse_search(self, **kwargs) -> list[tuple[str, float]]:
+            events.append("sparse")
+            return await super().sparse_search(**kwargs)
+
+    models = RecordingModels()
+    index = RecordingIndex(dense=[("chunk-a", 0.5)], sparse=[("chunk-a", 0.5)])
+
+    def loader():
+        events.append("dependency_init")
+        return models, index, {"candidate_limit": 3, "rrf_k": 60, "threshold": 0.0}
+
+    async def renew() -> None:
+        events.append("renew")
+
+    await search_active_knowledge(
+        session,
+        query="规则",
+        categories=None,
+        top_k=3,
+        retrieval_path="hybrid_rerank",
+        load_dependencies=loader,
+        before_external_attempt=renew,
+    )
+
+    assert events == [
+        "renew", "dependency_init", "renew", "embed", "renew", "dense", "renew", "sparse", "renew", "rerank",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("retrieval_path", "expected_events"),
+    (
+        ("dense", ["renew", "dependency_init", "renew", "embed", "renew", "dense"]),
+        ("sparse", ["renew", "dependency_init", "renew", "embed", "renew", "sparse"]),
+    ),
+)
+async def test_search_renews_only_before_active_single_path_boundaries(
+    session, retrieval_path, expected_events
+) -> None:
+    await _seed(session)
+    events: list[str] = []
+
+    class RecordingModels(_Models):
+        async def embed_query(self, query: str) -> HybridVector:
+            events.append("embed")
+            return await super().embed_query(query)
+
+    class RecordingIndex(_Index):
+        async def dense_search(self, **kwargs) -> list[tuple[str, float]]:
+            events.append("dense")
+            return await super().dense_search(**kwargs)
+
+        async def sparse_search(self, **kwargs) -> list[tuple[str, float]]:
+            events.append("sparse")
+            return await super().sparse_search(**kwargs)
+
+    def loader():
+        events.append("dependency_init")
+        return RecordingModels(), RecordingIndex(dense=[("chunk-a", 0.5)], sparse=[("chunk-a", 0.5)]), {
+            "candidate_limit": 3,
+            "rrf_k": 60,
+            "threshold": 0.0,
+        }
+
+    async def renew() -> None:
+        events.append("renew")
+
+    await search_active_knowledge(
+        session,
+        query="规则",
+        categories=None,
+        top_k=3,
+        retrieval_path=retrieval_path,
+        load_dependencies=loader,
+        before_external_attempt=renew,
+    )
+
+    assert events == expected_events
+
+
+async def test_search_propagates_renewal_failure_before_dependency_initialization(session) -> None:
+    await _seed(session)
+    initialized = False
+
+    def loader():
+        nonlocal initialized
+        initialized = True
+        raise AssertionError("renewal failure must stop dependency initialization")
+
+    async def fail_renewal() -> None:
+        raise RuntimeError("lease lost")
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        await search_active_knowledge(
+            session,
+            query="规则",
+            categories=None,
+            top_k=3,
+            retrieval_path="dense",
+            load_dependencies=loader,
+            before_external_attempt=fail_renewal,
+        )
+
+    assert not initialized
+
+
+async def test_zero_active_search_does_not_renew(session) -> None:
+    await _seed(session, include_active=False)
+    renewals = 0
+
+    async def renew() -> None:
+        nonlocal renewals
+        renewals += 1
+
+    outcome = await search_active_knowledge(
+        session,
+        query="规则",
+        categories=None,
+        top_k=3,
+        retrieval_path="dense",
+        load_dependencies=lambda: (_Models(), _Index(dense=[], sparse=[]), {}),
+        before_external_attempt=renew,
+    )
+
+    assert outcome.quality_status == "zero_hit" and renewals == 0

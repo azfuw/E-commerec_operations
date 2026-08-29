@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.common import (
     AgentCallType,
     ComplianceRiskLevel,
+    KnowledgeVersionStatus,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -27,6 +28,9 @@ from backend.models import (
     AgentCall,
     AnalysisCandidate,
     ComplianceReview,
+    KnowledgeChunk,
+    KnowledgeDocument,
+    KnowledgeDocumentVersion,
     Product,
     ProductProposal,
     ProductSku,
@@ -354,6 +358,10 @@ async def _locked_context(
         context = await _context_progress(session, run, proposal, product, candidate, skus, metrics)
     except (TypeError, ValueError, ValidationError):
         return "OPTIMIZATION_CONTEXT_INCONSISTENT"
+    if not await _recheck_canonical_citations(
+        session, product, context.current_canonical_citations
+    ):
+        return "OPTIMIZATION_FACT_ERROR"
     return _Locked(run, proposal, product, context)
 
 
@@ -511,6 +519,48 @@ def _citation_values(values: Sequence[CanonicalRuleCitation]) -> list[dict[str, 
     ):
         return None
     return [citation.model_dump(mode="json") for citation in citations]
+
+
+async def _recheck_canonical_citations(
+    session: AsyncSession,
+    product: Product,
+    citations: Sequence[CanonicalRuleCitation],
+) -> bool:
+    citation_ids = [citation.chunk_id for citation in citations]
+    if len(citation_ids) != len(set(citation_ids)):
+        return False
+    if not citation_ids:
+        return True
+    rows = (
+        await session.execute(
+            select(KnowledgeChunk, KnowledgeDocumentVersion, KnowledgeDocument)
+            .join(KnowledgeDocumentVersion, KnowledgeChunk.version_id == KnowledgeDocumentVersion.id)
+            .join(KnowledgeDocument, KnowledgeDocument.current_version_id == KnowledgeDocumentVersion.id)
+            .where(
+                KnowledgeChunk.id.in_(citation_ids),
+                KnowledgeChunk.version_id == KnowledgeDocumentVersion.id,
+                KnowledgeDocumentVersion.document_id == KnowledgeDocument.id,
+                KnowledgeDocument.enabled.is_(True),
+                KnowledgeDocumentVersion.status == KnowledgeVersionStatus.ACTIVE,
+                KnowledgeDocument.category.in_((product.category, "通用规则")),
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+    ).all()
+    current = {chunk.id: (chunk, version, document) for chunk, version, document in rows}
+    if len(current) != len(citation_ids):
+        return False
+    return all(
+        (row := current.get(citation.chunk_id)) is not None
+        and citation.document_id == row[2].id
+        and citation.version_id == row[1].id
+        and citation.document_name == row[2].name
+        and citation.version_number == row[1].version_number
+        and citation.category == row[2].category
+        and citation.canonical_text == row[0].canonical_text
+        for citation in citations
+    )
 
 
 def _audit_values(call: OptimizationAgentCallRecord | ComplianceAgentCallRecord) -> dict[str, object]:
@@ -674,6 +724,9 @@ async def _persist_optimization_revision(
     trusted_citations = _citation_values(trusted.canonical_rule_citations)
     stored_citations = _citation_values(canonical_citations)
     if trusted_citations is None or stored_citations is None or _json(trusted_citations) != _json(stored_citations):
+        await _fail_locked(session, locked.run, "OPTIMIZATION_FACT_ERROR")
+        return RevisionPersistenceResult("failed", None, "OPTIMIZATION_FACT_ERROR")
+    if not await _recheck_canonical_citations(session, locked.product, canonical_citations):
         await _fail_locked(session, locked.run, "OPTIMIZATION_FACT_ERROR")
         return RevisionPersistenceResult("failed", None, "OPTIMIZATION_FACT_ERROR")
     fact_hash = hashlib.sha256(_json(trusted).encode("utf-8")).hexdigest()
@@ -901,7 +954,12 @@ async def _review_input(
         return None
     saved_values = _citation_values(saved)
     passed_values = _citation_values(canonical_citations)
-    if saved_values is None or passed_values is None or _json(saved_values) != _json(passed_values):
+    if (
+        saved_values is None
+        or passed_values is None
+        or _json(saved_values) != _json(passed_values)
+        or not await _recheck_canonical_citations(session, locked.product, saved)
+    ):
         return None
     return revision, saved_values, _trusted_from_context(locked.context, saved)
 

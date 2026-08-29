@@ -7,7 +7,7 @@ from decimal import Decimal
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy import event
@@ -16,6 +16,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from backend.common import (
     AgentCallType,
     ComplianceRiskLevel,
+    KnowledgeVersionStatus,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -31,6 +32,9 @@ from backend.models import (
     AgentCall,
     AnalysisCandidate,
     ComplianceReview,
+    KnowledgeChunk,
+    KnowledgeDocument,
+    KnowledgeDocumentVersion,
     Product,
     ProductProposal,
     ProductSku,
@@ -75,7 +79,9 @@ from backend.schemas import (
 )
 
 
-async def _chain(session, *, live: bool = False) -> dict[str, object]:
+async def _chain(
+    session, *, live: bool = False, seed_citation: bool = True
+) -> dict[str, object]:
     store = Store(id="store-1", name="旗舰店", code="flagship", enabled=True)
     user = User(
         id="user-1",
@@ -189,6 +195,8 @@ async def _chain(session, *, live: bool = False) -> dict[str, object]:
     await session.flush()
     session.add(proposal)
     await session.commit()
+    if seed_citation:
+        await _seed_current_citation(session)
     return {
         "store": store,
         "user": user,
@@ -2811,3 +2819,296 @@ async def test_optimization_worker_forced_passed_review_defer_uses_task_seven_re
     assert (run.status, run.error_code) == (
         WorkflowStatus.FAILED, "OPTIMIZATION_REPLAY_CONFLICT"
     )
+
+
+async def _seed_current_citation(session: AsyncSession) -> CanonicalRuleCitation:
+    document = KnowledgeDocument(
+        id="document-1", name="通用规则", category="通用规则", enabled=True,
+        created_by="user-1", idempotency_key="optimization-citation",
+    )
+    session.add(document)
+    await session.flush()
+    version = KnowledgeDocumentVersion(
+        id="version-1", document_id=document.id, version_number=1, sha256="a" * 64,
+        original_filename="rules.md", mime_type="text/markdown", storage_path="d:/test/rules.md",
+        status=KnowledgeVersionStatus.ACTIVE,
+    )
+    session.add(version)
+    await session.flush()
+    session.add(KnowledgeChunk(
+        id="chunk-1", version_id=version.id, chunk_index=0, chunk_hash="b" * 64,
+        canonical_text="商品描述应当真实准确。", chunk_metadata={}, token_count=1,
+    ))
+    document.current_version_id = version.id
+    await session.commit()
+    return _citation()
+
+
+async def _seed_cross_owned_citation(session: AsyncSession) -> CanonicalRuleCitation:
+    owner = KnowledgeDocument(
+        id="document-version-owner", name="版本所有者", category="通用规则", enabled=True,
+        created_by="user-1", idempotency_key="optimization-cross-owner",
+    )
+    session.add(owner)
+    await session.flush()
+    version = KnowledgeDocumentVersion(
+        id="version-1", document_id=owner.id, version_number=1, sha256="c" * 64,
+        original_filename="rules.md", mime_type="text/markdown", storage_path="d:/test/rules.md",
+        status=KnowledgeVersionStatus.ACTIVE,
+    )
+    session.add(version)
+    await session.flush()
+    session.add(KnowledgeChunk(
+        id="chunk-1", version_id=version.id, chunk_index=0, chunk_hash="d" * 64,
+        canonical_text="商品描述应当真实准确。", chunk_metadata={}, token_count=1,
+    ))
+    session.add(KnowledgeDocument(
+        id="document-1", name="通用规则", category="通用规则", enabled=True,
+        created_by="user-1", idempotency_key="optimization-cross-current",
+        current_version_id=version.id,
+    ))
+    await session.commit()
+    return _citation()
+
+
+async def test_context_reload_rejects_saved_citation_that_is_no_longer_current(
+    session,
+) -> None:
+    chain = await _chain(session, live=True)
+    citation = _citation()
+    revision = await persist_optimization_revision(
+        session,
+        workflow_run_id="optimization-1",
+        lease_owner="worker-a",
+        iteration=0,
+        trusted=_trusted(chain),
+        output=_output(),
+        canonical_citations=[citation],
+        calls=_optimization_calls(0),
+    )
+    assert revision.revision_id is not None
+    await session.execute(
+        update(KnowledgeDocument).where(KnowledgeDocument.id == citation.document_id).values(enabled=False)
+    )
+    await session.commit()
+
+    loaded = await load_owned_optimization_context(
+        session, workflow_run_id="optimization-1", lease_owner="worker-a"
+    )
+
+    assert (loaded.disposition, loaded.error_code) == ("failed", "OPTIMIZATION_FACT_ERROR")
+    run = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    assert run is not None and (run.status, run.error_code) == (
+        WorkflowStatus.FAILED, "OPTIMIZATION_FACT_ERROR"
+    )
+
+
+async def test_revision_persistence_rejects_cross_document_current_version_pointer(session) -> None:
+    chain = await _chain(session, live=True, seed_citation=False)
+    citation = await _seed_cross_owned_citation(session)
+
+    result = await persist_optimization_revision(
+        session,
+        workflow_run_id="optimization-1",
+        lease_owner="worker-a",
+        iteration=0,
+        trusted=_trusted(chain),
+        output=_output(),
+        canonical_citations=[citation],
+        calls=_optimization_calls(0),
+    )
+
+    assert (result.disposition, result.error_code) == ("failed", "OPTIMIZATION_FACT_ERROR")
+    assert not list(await session.scalars(select(ProposalRevision)))
+    assert not list(await session.scalars(select(AgentCall)))
+
+
+async def test_revision_persistence_rechecks_current_citation_facts_before_audit_or_insert(session) -> None:
+    chain = await _chain(session, live=True)
+    citation = _citation()
+    await session.execute(
+        update(KnowledgeDocument).where(KnowledgeDocument.id == citation.document_id).values(enabled=False)
+    )
+    await session.commit()
+
+    result = await persist_optimization_revision(
+        session,
+        workflow_run_id="optimization-1",
+        lease_owner="worker-a",
+        iteration=0,
+        trusted=_trusted(chain),
+        output=_output(),
+        canonical_citations=[citation],
+        calls=_optimization_calls(0),
+    )
+
+    assert (result.disposition, result.error_code) == ("failed", "OPTIMIZATION_FACT_ERROR")
+    assert not list(await session.scalars(select(ProposalRevision)))
+    assert not list(await session.scalars(select(AgentCall)))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "current_version", "inactive_version", "outside_category", "document_name",
+        "version_number", "canonical_text", "orphan_chunk",
+    ],
+)
+async def test_revision_persistence_rechecks_each_current_citation_database_fact(
+    session, mutation: str
+) -> None:
+    chain = await _chain(session, live=True)
+    citation = _citation()
+    if mutation == "current_version":
+        session.add(KnowledgeDocumentVersion(
+            id="version-2", document_id=citation.document_id, version_number=2, sha256="e" * 64,
+            original_filename="rules.md", mime_type="text/markdown", storage_path="d:/test/rules-v2.md",
+            status=KnowledgeVersionStatus.ACTIVE,
+        ))
+        await session.flush()
+        await session.execute(
+            update(KnowledgeDocument)
+            .where(KnowledgeDocument.id == citation.document_id)
+            .values(current_version_id="version-2")
+        )
+    elif mutation == "inactive_version":
+        await session.execute(
+            update(KnowledgeDocumentVersion)
+            .where(KnowledgeDocumentVersion.id == citation.version_id)
+            .values(status=KnowledgeVersionStatus.DISABLED)
+        )
+    elif mutation == "outside_category":
+        await session.execute(
+            update(KnowledgeDocument)
+            .where(KnowledgeDocument.id == citation.document_id)
+            .values(category="服饰")
+        )
+    elif mutation == "document_name":
+        await session.execute(
+            update(KnowledgeDocument)
+            .where(KnowledgeDocument.id == citation.document_id)
+            .values(name="已变更规则")
+        )
+    elif mutation == "version_number":
+        await session.execute(
+            update(KnowledgeDocumentVersion)
+            .where(KnowledgeDocumentVersion.id == citation.version_id)
+            .values(version_number=2)
+        )
+    elif mutation == "canonical_text":
+        await session.execute(
+            update(KnowledgeChunk)
+            .where(KnowledgeChunk.id == citation.chunk_id)
+            .values(canonical_text="已变更规则文本。")
+        )
+    else:
+        await session.execute(delete(KnowledgeChunk).where(KnowledgeChunk.id == citation.chunk_id))
+    await session.commit()
+
+    result = await persist_optimization_revision(
+        session,
+        workflow_run_id="optimization-1",
+        lease_owner="worker-a",
+        iteration=0,
+        trusted=_trusted(chain),
+        output=_output(),
+        canonical_citations=[citation],
+        calls=_optimization_calls(0),
+    )
+
+    assert (result.disposition, result.error_code) == ("failed", "OPTIMIZATION_FACT_ERROR")
+    assert not list(await session.scalars(select(ProposalRevision)))
+    assert not list(await session.scalars(select(AgentCall)))
+
+
+async def test_invalid_citation_with_a_replaced_owner_writes_nothing(session) -> None:
+    chain = await _chain(session, live=True)
+    citation = _citation()
+    await session.execute(
+        update(KnowledgeDocument)
+        .where(KnowledgeDocument.id == citation.document_id)
+        .values(enabled=False)
+    )
+    await session.execute(
+        update(WorkflowRun)
+        .where(WorkflowRun.id == "optimization-1")
+        .values(lease_owner="worker-b")
+    )
+    await session.commit()
+
+    result = await persist_optimization_revision(
+        session,
+        workflow_run_id="optimization-1",
+        lease_owner="worker-a",
+        iteration=0,
+        trusted=_trusted(chain),
+        output=_output(),
+        canonical_citations=[citation],
+        calls=_optimization_calls(0),
+    )
+
+    assert result.disposition == "lease_lost"
+    assert not list(await session.scalars(select(ProposalRevision)))
+    assert not list(await session.scalars(select(AgentCall)))
+    run = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    assert run is not None and (run.status, run.lease_owner, run.error_code) == (
+        WorkflowStatus.PROCESSING, "worker-b", None
+    )
+
+
+@pytest.mark.parametrize("failure_review", [False, True])
+async def test_review_persistence_rechecks_current_citation_facts_before_review_or_audit(
+    session, failure_review
+) -> None:
+    chain = await _chain(session, live=True)
+    citation = _citation()
+    trusted = _trusted(chain)
+    revision = await persist_optimization_revision(
+        session,
+        workflow_run_id="optimization-1",
+        lease_owner="worker-a",
+        iteration=0,
+        trusted=trusted,
+        output=_output(),
+        canonical_citations=[citation],
+        calls=_optimization_calls(0),
+    )
+    assert revision.revision_id is not None
+    await session.execute(
+        update(KnowledgeDocument).where(KnowledgeDocument.id == citation.document_id).values(enabled=False)
+    )
+    await session.commit()
+    deterministic = validate_optimization_output(trusted, _output())
+    if failure_review:
+        result = await persist_compliance_failure(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            revision_id=revision.revision_id,
+            iteration=0,
+            deterministic=deterministic,
+            error_code="DEEPSEEK_TIMEOUT",
+            required_changes=[],
+            canonical_citations=[citation],
+            calls=_compliance_calls(0),
+        )
+    else:
+        result = await persist_compliance_review(
+            session,
+            workflow_run_id="optimization-1",
+            lease_owner="worker-a",
+            revision_id=revision.revision_id,
+            iteration=0,
+            deterministic=deterministic,
+            semantic=_passing_compliance(),
+            required_changes=[],
+            canonical_citations=[citation],
+            calls=_compliance_calls(0),
+        )
+
+    assert (result.disposition, result.error_code) == ("failed", "OPTIMIZATION_FACT_ERROR")
+    assert not list(await session.scalars(select(ComplianceReview)))
+    calls = list(await session.scalars(select(AgentCall)))
+    assert [(call.node_name, call.iteration) for call in calls] == [
+        ("call_product_optimization_agent", 0)
+    ]
