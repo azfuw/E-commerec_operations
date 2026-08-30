@@ -241,8 +241,27 @@ def test_optimization_prompts_declare_the_complete_json_contract() -> None:
         )
 
 
+def test_optimization_primary_prompt_requires_complete_json_skeleton() -> None:
+    skeleton = (
+        '{"title":"<string>","selling_points":[],"description":[],"keywords":[],'
+        '"attribute_completions":[],"changes":[],"citations":[],'
+        '"price_suggestions":[],"sku_suggestions":[]}'
+    )
+    assert OPTIMIZATION_PROMPT_VERSION == "product-optimization-v3"
+    assert skeleton in OPTIMIZATION_PRIMARY_PROMPT
+    assert skeleton not in OPTIMIZATION_SCHEMA_REPAIR_PROMPT
+    assert "所有九字段不得省略" in OPTIMIZATION_PRIMARY_PROMPT
+    assert "无建议时对应数组必须输出 []" in OPTIMIZATION_PRIMARY_PROMPT
+    assert "不得输出 null" in OPTIMIZATION_PRIMARY_PROMPT
+    assert "response_template 是完整最小合法结构" in OPTIMIZATION_PRIMARY_PROMPT
+    assert "不得删改键或 evidence 形状" in OPTIMIZATION_PRIMARY_PROMPT
+    assert "只能基于允许事实改值" in OPTIMIZATION_PRIMARY_PROMPT
+
+
 async def test_optimization_client_uses_distinct_nodes_and_safe_equal_shape_payloads() -> None:
     trusted = trusted_input()
+    primary_required_changes = [semantic_change()]
+    repair_required_changes = [deterministic_change()]
     posts: list[dict[str, object]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -253,19 +272,19 @@ async def test_optimization_client_uses_distinct_nodes_and_safe_equal_shape_payl
     client = ProductOptimizationAgentClient(_settings(), httpx.MockTransport(handler))
     primary = await client.request(
         trusted,
-        required_changes=[semantic_change()],
+        required_changes=primary_required_changes,
         call_type=AgentCallType.PRIMARY,
         iteration=0,
     )
     repair = await client.request(
         trusted,
-        required_changes=[deterministic_change()],
+        required_changes=repair_required_changes,
         call_type=AgentCallType.SCHEMA_REPAIR,
         iteration=1,
     )
     final_iteration = await client.request(
         trusted,
-        required_changes=[semantic_change()],
+        required_changes=primary_required_changes,
         call_type=AgentCallType.PRIMARY,
         iteration=2,
     )
@@ -292,13 +311,38 @@ async def test_optimization_client_uses_distinct_nodes_and_safe_equal_shape_payl
         "allowed_fact_paths",
         "allowed_rule_chunk_ids",
         "required_changes",
+        "response_template",
     }
     assert primary_user["trusted_facts"] == repair_user["trusted_facts"] == trusted.model_dump(mode="json")
     assert primary_user["allowed_rule_chunk_ids"] == repair_user["allowed_rule_chunk_ids"] == [RULE_CHUNK]
     assert "product.title" in primary_user["allowed_fact_paths"]
     assert "product.skus.sku-1.price" in primary_user["allowed_fact_paths"]
-    assert primary_user["required_changes"] == [semantic_change().model_dump(mode="json")]
-    assert repair_user["required_changes"] == [deterministic_change().model_dump(mode="json")]
+    assert primary_user["required_changes"] == [change.model_dump(mode="json") for change in primary_required_changes]
+    assert repair_user["required_changes"] == [change.model_dump(mode="json") for change in repair_required_changes]
+    response_template = {
+        "title": trusted.title,
+        "selling_points": trusted.selling_points,
+        "description": [
+            {
+                "heading": "商品详情",
+                "body": trusted.description,
+                "evidence": [{"kind": "fact", "value": "product.description"}],
+            }
+        ],
+        "keywords": trusted.search_keywords,
+        "attribute_completions": [],
+        "changes": [],
+        "citations": [],
+        "price_suggestions": [],
+        "sku_suggestions": [],
+    }
+    assert primary_user["response_template"] == repair_user["response_template"] == response_template
+    for payload, required_changes in (
+        (primary_user, primary_required_changes),
+        (repair_user, repair_required_changes),
+    ):
+        typed_template = OptimizationProposalOutput.model_validate(payload["response_template"])
+        assert validate_optimization_response(trusted, required_changes, typed_template) == typed_template
     assert "建议" in posts[0]["messages"][0]["content"]
     assert "建议" in posts[1]["messages"][0]["content"]
     forbidden = {
@@ -313,6 +357,29 @@ async def test_optimization_client_uses_distinct_nodes_and_safe_equal_shape_payl
         "chain_of_thought",
     }
     assert not forbidden & _payload_keys(primary_user)
+
+
+async def test_optimization_client_response_template_truncates_legal_long_description() -> None:
+    trusted = trusted_input(description="中" * 8000)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        response_template = json.loads(json.loads(request.content)["messages"][1]["content"])["response_template"]
+        typed_template = OptimizationProposalOutput.model_validate(response_template)
+        assert validate_optimization_response(trusted, [], typed_template) == typed_template
+        assert response_template["description"][0]["body"] == "中" * 4000
+        assert response_template["description"][0]["evidence"] == [
+            {"kind": "fact", "value": "product.description"}
+        ]
+        return _completion(legal_output().model_dump_json())
+
+    invocation = await ProductOptimizationAgentClient(_settings(), httpx.MockTransport(handler)).request(
+        trusted,
+        required_changes=[],
+        call_type=AgentCallType.PRIMARY,
+        iteration=0,
+    )
+
+    assert invocation.response == legal_output()
 
 
 async def test_optimization_client_rejects_invalid_server_changes_and_iterations_before_post() -> None:

@@ -17,7 +17,7 @@ from backend.schemas import (
 )
 
 
-OPTIMIZATION_PROMPT_VERSION = "product-optimization-v1"
+OPTIMIZATION_PROMPT_VERSION = "product-optimization-v3"
 OPTIMIZATION_PRIMARY_PROMPT = (
     "你是商品优化助手。只输出纯 JSON 对象，不要 Markdown，禁止额外字段。"
     "顶层必须且仅有 title、selling_points、description、keywords、attribute_completions、"
@@ -32,6 +32,9 @@ OPTIMIZATION_PRIMARY_PROMPT = (
     "reason、evidence；citations 每项仅含 chunk_id。evidence 只能使用 allowed_fact_paths 中的事实"
     "路径或 allowed_rule_chunk_ids 中的规则 chunk_id；引用证据的 chunk_id 必须也在 citations 中。"
     "价格和 SKU 仅是建议，不得声称已修改商品、SKU、发布或平台。"
+    "完整 JSON 骨架：{\"title\":\"<string>\",\"selling_points\":[],\"description\":[],\"keywords\":[],\"attribute_completions\":[],\"changes\":[],\"citations\":[],\"price_suggestions\":[],\"sku_suggestions\":[]}。"
+    "所有九字段不得省略；无建议时对应数组必须输出 []；不得输出 null。"
+    "response_template 是完整最小合法结构；不得删改键或 evidence 形状，只能基于允许事实改值。"
 )
 OPTIMIZATION_SCHEMA_REPAIR_PROMPT = (
     "你是商品优化助手。仅基于给定可信输入重新生成纯 JSON 对象，不要 Markdown，禁止额外字段。"
@@ -235,12 +238,30 @@ class ProductOptimizationAgentClient:
 
         allowed_citation_ids = _allowed_citation_ids(trusted)
         _validate_required_changes(required_changes, allowed_citation_ids)
+        response_template = {
+            "title": trusted.title,
+            "selling_points": trusted.selling_points,
+            "description": [
+                {
+                    "heading": "商品详情",
+                    "body": trusted.description[:4000],
+                    "evidence": [{"kind": "fact", "value": "product.description"}],
+                }
+            ],
+            "keywords": trusted.search_keywords,
+            "attribute_completions": [],
+            "changes": [],
+            "citations": [],
+            "price_suggestions": [],
+            "sku_suggestions": [],
+        }
         user_payload = {
             "iteration": iteration,
             "trusted_facts": trusted.model_dump(mode="json"),
             "allowed_fact_paths": _allowed_fact_paths(trusted),
             "allowed_rule_chunk_ids": sorted(allowed_citation_ids),
             "required_changes": [change.model_dump(mode="json") for change in required_changes],
+            "response_template": response_template,
         }
         system_prompt = (
             OPTIMIZATION_PRIMARY_PROMPT

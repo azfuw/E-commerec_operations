@@ -365,3 +365,22 @@ def test_settings_default_and_model_override(monkeypatch, tmp_path) -> None:
     get_settings.cache_clear()
     assert get_settings().deepseek_model == "deepseek-custom"
     get_settings.cache_clear()
+
+
+def test_settings_default_and_override_deepseek_timeout(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-only-secret-at-least-32-characters")
+    monkeypatch.delenv("DEEPSEEK_TIMEOUT_SECONDS", raising=False)
+    get_settings.cache_clear()
+    try:
+        settings = get_settings()
+        assert settings.deepseek_timeout_seconds == 45.0
+        assert settings.analysis_lease_seconds == settings.optimization_lease_seconds == 60
+        assert settings.deepseek_timeout_seconds < settings.analysis_lease_seconds
+        assert settings.deepseek_timeout_seconds < settings.optimization_lease_seconds
+
+        monkeypatch.setenv("DEEPSEEK_TIMEOUT_SECONDS", "12.5")
+        get_settings.cache_clear()
+        assert get_settings().deepseek_timeout_seconds == 12.5
+    finally:
+        get_settings.cache_clear()
