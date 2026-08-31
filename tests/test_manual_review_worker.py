@@ -1,5 +1,6 @@
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -1529,6 +1530,154 @@ async def test_manual_review_dependency_failure_is_fixed_degraded_review(session
         WorkflowQuality.DEGRADED,
         "DEEPSEEK_TIMEOUT",
     )
+
+
+@pytest.mark.parametrize(
+    ("rag_quality", "error_code"),
+    [
+        ("normal", "KNOWLEDGE_ZERO_HIT"),
+        ("normal", "KNOWLEDGE_LOW_CONFIDENCE"),
+        ("zero_hit", "KNOWLEDGE_LOW_CONFIDENCE"),
+        ("zero_hit", "DEEPSEEK_TIMEOUT"),
+        ("low_confidence", "KNOWLEDGE_ZERO_HIT"),
+        ("low_confidence", "DEEPSEEK_TIMEOUT"),
+    ],
+)
+async def test_manual_review_rejects_unreplayable_rag_failure_pair_before_insert(
+    session, rag_quality: str, error_code: str
+) -> None:
+    await _seed_manual_chain(session)
+    trusted = _trusted_seed().model_copy(update={"rag_quality": rag_quality})
+
+    result = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=validate_optimization_output(trusted, _proposal_output()),
+        response=None,
+        calls=[],
+        error_code=error_code,
+    )
+
+    assert (result.disposition, result.error_code) == (
+        "failed",
+        "MANUAL_REVIEW_FACT_ERROR",
+    )
+    assert await session.scalar(
+        select(ComplianceReview.id).where(ComplianceReview.iteration.is_(None))
+    ) is None
+    assert await session.scalar(
+        select(AgentCall.id).where(
+            AgentCall.workflow_run_id == "manual-workflow-1"
+        )
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("rag_quality", "error_code"),
+    [
+        ("zero_hit", "KNOWLEDGE_ZERO_HIT"),
+        ("low_confidence", "KNOWLEDGE_LOW_CONFIDENCE"),
+    ],
+)
+async def test_manual_review_rag_failure_pair_creates_replays_and_finalizes(
+    session, rag_quality: str, error_code: str
+) -> None:
+    await _seed_manual_chain(session)
+    trusted = _trusted_seed().model_copy(update={"rag_quality": rag_quality})
+    deterministic = validate_optimization_output(trusted, _proposal_output())
+
+    created = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=None,
+        calls=[],
+        error_code=error_code,
+    )
+    replayed = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=None,
+        calls=[],
+        error_code=error_code,
+    )
+    terminal = await manual.finalize_manual_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+    )
+
+    assert (created.disposition, created.error_code) == ("created", error_code)
+    assert (replayed.disposition, replayed.review_id, replayed.error_code) == (
+        "replayed",
+        created.review_id,
+        error_code,
+    )
+    assert (terminal.disposition, terminal.error_code) == (
+        "pending_manual",
+        error_code,
+    )
+    original = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    assert original is not None
+    assert (original.quality_status, original.current_step, original.error_code) == (
+        WorkflowQuality.DEGRADED,
+        "manual_review_degraded",
+        error_code,
+    )
+
+
+@pytest.mark.parametrize(
+    "call_shape",
+    ["empty", "repair_only", "double_primary", "third_call", "reversed"],
+)
+async def test_manual_review_semantic_response_rejects_impossible_call_sequence(
+    session, call_shape: str
+) -> None:
+    await _seed_manual_chain(session)
+    primary, repair = _manual_calls(include_repair=True)
+    second_primary = replace(primary, attempt=2)
+    if call_shape == "empty":
+        calls = []
+    elif call_shape == "repair_only":
+        calls = [repair]
+    elif call_shape == "double_primary":
+        calls = [primary, second_primary]
+    elif call_shape == "third_call":
+        calls = [primary, repair, second_primary]
+    else:
+        calls = [repair, primary]
+    trusted = _trusted_seed()
+
+    result = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=validate_optimization_output(trusted, _proposal_output()),
+        response=_passing_response(),
+        calls=calls,
+        error_code=None,
+    )
+
+    assert (result.disposition, result.error_code) == (
+        "failed",
+        "MANUAL_REVIEW_FACT_ERROR",
+    )
+    assert await session.scalar(
+        select(ComplianceReview.id).where(ComplianceReview.iteration.is_(None))
+    ) is None
+    assert await session.scalar(
+        select(AgentCall.id).where(
+            AgentCall.workflow_run_id == "manual-workflow-1"
+        )
+    ) is None
 
 
 @pytest.mark.parametrize(

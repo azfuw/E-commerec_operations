@@ -979,28 +979,26 @@ def _call_values(call: ComplianceAgentCallRecord | AgentCall) -> dict[str, objec
 
 def _calls_valid(calls: Sequence[ComplianceAgentCallRecord]) -> bool:
     keys: set[tuple[object, ...]] = set()
-    seen_primary = False
-    for call in calls:
+    expected = (
+        ("call_product_compliance_agent", AgentCallType.PRIMARY),
+        ("repair_product_compliance_schema", AgentCallType.SCHEMA_REPAIR),
+    )
+    if len(calls) > len(expected):
+        return False
+    for call, (node_name, call_type) in zip(calls, expected):
         if not isinstance(call, ComplianceAgentCallRecord):
             return False
-        expected = {
-            "call_product_compliance_agent": AgentCallType.PRIMARY,
-            "repair_product_compliance_schema": AgentCallType.SCHEMA_REPAIR,
-        }.get(call.node_name)
         key = (call.node_name, call.call_type, call.iteration, call.attempt)
         if (
-            expected is None
-            or call.call_type is not expected
+            call.node_name != node_name
+            or call.call_type is not call_type
             or call.iteration != 0
             or call.attempt < 0
             or key in keys
         ):
             return False
         keys.add(key)
-        seen_primary = seen_primary or call.call_type is AgentCallType.PRIMARY
-    return seen_primary or not any(
-        call.call_type is AgentCallType.SCHEMA_REPAIR for call in calls
-    )
+    return True
 
 
 def _calls_exact(
@@ -1254,7 +1252,16 @@ async def _persist_manual_compliance_review(
     )
     valid_response = False
     if response is None:
-        valid_response = error_code in _DEPENDENCY_CODES
+        expected_rag_error = {
+            "zero_hit": "KNOWLEDGE_ZERO_HIT",
+            "low_confidence": "KNOWLEDGE_LOW_CONFIDENCE",
+        }.get(trusted.rag_quality)
+        valid_response = error_code in _DEPENDENCY_CODES and (
+            error_code == expected_rag_error
+            if expected_rag_error is not None
+            else error_code
+            not in {"KNOWLEDGE_ZERO_HIT", "KNOWLEDGE_LOW_CONFIDENCE"}
+        )
         passed = False
         quality = WorkflowQuality.DEGRADED
         stored_error = error_code
@@ -1263,7 +1270,7 @@ async def _persist_manual_compliance_review(
     else:
         try:
             validate_compliance_response(trusted, response)
-            valid_response = error_code is None
+            valid_response = error_code is None and trusted.rag_quality == "normal"
         except (TypeError, ValueError):
             valid_response = False
         passed = bool(
@@ -1287,6 +1294,7 @@ async def _persist_manual_compliance_review(
         or changes is None
         or not valid_response
         or not _calls_valid(calls)
+        or (response is not None and not calls)
         or not await _recheck_canonical_citations(
             session, product, trusted.canonical_rule_citations
         )
