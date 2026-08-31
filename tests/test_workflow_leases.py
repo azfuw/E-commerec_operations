@@ -89,3 +89,59 @@ async def test_owned_analysis_predicate_never_updates_same_owner_optimization_ro
     refreshed = await session.get(WorkflowRun, optimization_id, populate_existing=True)
     assert refreshed is not None
     assert refreshed.current_step is None
+
+
+async def test_manual_renewal_requires_manual_type_current_owner_and_live_lease(session) -> None:
+    from backend.manual_review_runs import renew_manual_review_lease
+
+    analysis_id, optimization_id = await _add_live_typed_runs(session, owner="worker-a")
+    manual = WorkflowRun(
+        id="manual-1",
+        workflow_type=WorkflowType.MANUAL_REVIEW,
+        store_id="store-1",
+        created_by="user-1",
+        status=WorkflowStatus.PROCESSING,
+        quality_status=WorkflowQuality.NORMAL,
+        lease_owner="worker-a",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    session.add(manual)
+    await session.commit()
+    manual_id = manual.id
+
+    assert await renew_manual_review_lease(
+        session,
+        workflow_run_id=manual_id,
+        lease_owner="worker-a",
+        lease_seconds=60,
+    ) is True
+    assert await renew_manual_review_lease(
+        session,
+        workflow_run_id=analysis_id,
+        lease_owner="worker-a",
+        lease_seconds=60,
+    ) is False
+    assert await renew_manual_review_lease(
+        session,
+        workflow_run_id=optimization_id,
+        lease_owner="worker-a",
+        lease_seconds=60,
+    ) is False
+    assert await renew_manual_review_lease(
+        session,
+        workflow_run_id=manual_id,
+        lease_owner="worker-b",
+        lease_seconds=60,
+    ) is False
+    await session.execute(
+        update(WorkflowRun)
+        .where(WorkflowRun.id == manual_id)
+        .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    )
+    await session.commit()
+    assert await renew_manual_review_lease(
+        session,
+        workflow_run_id=manual_id,
+        lease_owner="worker-a",
+        lease_seconds=60,
+    ) is False
