@@ -1,11 +1,18 @@
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 import unicodedata
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
-from backend.common import ComplianceRiskLevel, WorkflowQuality, WorkflowStatus, WorkflowType
+from backend.common import (
+    ApprovalActionType,
+    ComplianceRiskLevel,
+    UserRole,
+    WorkflowQuality,
+    WorkflowStatus,
+    WorkflowType,
+)
 
 
 class LoginRequest(BaseModel):
@@ -245,6 +252,43 @@ class ManualRevisionAccepted(BaseModel):
     revision_id: str
     manual_review_workflow_run_id: str
     status: Literal["accepted"]
+
+
+class ProposalActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision_id: str = Field(min_length=1, max_length=36)
+
+
+class ProposalCommentActionRequest(ProposalActionRequest):
+    comment: str
+
+    @field_validator("comment")
+    @classmethod
+    def validate_comment(cls, value: str) -> str:
+        normalized = value.strip()
+        if not 1 <= len(normalized) <= 500 or any(
+            unicodedata.category(character).startswith("C") for character in normalized
+        ):
+            raise ValueError("invalid approval comment")
+        return normalized
+
+
+class ApprovalActionView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    proposal_id: str
+    proposal_revision_id: str
+    actor_id: str
+    actor_role: UserRole
+    action: ApprovalActionType
+    comment: str | None
+    created_at: datetime
+
+    @field_serializer("created_at", when_used="json")
+    def serialize_created_at(self, value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
 class ValidatedRequiredChange(BaseModel):

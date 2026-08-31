@@ -3,7 +3,8 @@ from time import perf_counter
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Form, Header, HTTPException, Path, Query, Response, UploadFile, status
+from fastapi import APIRouter, Body, Depends, Form, Header, HTTPException, Path, Query, Response, UploadFile, status
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,6 +12,12 @@ from backend.analysis_runs import (
     create_analysis_run,
     get_workflow_run,
     list_analysis_candidates,
+)
+from backend.approvals import (
+    ApprovalDomainError,
+    reject_proposal,
+    request_proposal_changes,
+    submit_proposal,
 )
 from backend.auth import (
     create_access_token,
@@ -58,6 +65,7 @@ from backend.schemas import (
     AnalysisCandidateView,
     AnalysisRunAccepted,
     AnalysisRunRequest,
+    ApprovalActionView,
     ComplianceReviewView,
     KnowledgeCitation,
     KnowledgeEnvelope,
@@ -69,6 +77,8 @@ from backend.schemas import (
     ProductSelectionRequest,
     ProductSelectionView,
     ProductSummary,
+    ProposalActionRequest,
+    ProposalCommentActionRequest,
     ProposalDetailView,
     ProposalRevisionView,
     ProposalView,
@@ -98,6 +108,23 @@ def _envelope(
         quality=quality,
         error=None,
     )
+
+
+def _proposal_comment_request(
+    payload: Annotated[dict[str, object], Body()],
+) -> ProposalCommentActionRequest:
+    try:
+        return ProposalCommentActionRequest.model_validate(payload)
+    except ValidationError as error:
+        if any(item["loc"] == ("comment",) for item in error.errors()):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "APPROVAL_COMMENT_INVALID"},
+            ) from None
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=error.errors(include_url=False),
+        ) from None
 
 
 def _audit(
@@ -394,6 +421,102 @@ async def create_manual_revision_route(
         manual_review_workflow_run_id=result.workflow_run_id,
         status="accepted",
     )
+
+
+@router.post(
+    "/proposals/{id}/submit",
+    response_model=ApprovalActionView,
+    status_code=status.HTTP_201_CREATED,
+)
+async def submit_proposal_route(
+    response: Response,
+    id: Annotated[str, Path(min_length=1, max_length=36)],
+    request: ProposalActionRequest,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ApprovalActionView:
+    try:
+        result = await submit_proposal(
+            session,
+            actor_id=user.id,
+            proposal_id=id,
+            request=request,
+            idempotency_key=idempotency_key,
+            request_id=_request_id(),
+        )
+    except ApprovalDomainError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code},
+        ) from None
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return ApprovalActionView.model_validate(result.action)
+
+
+@router.post(
+    "/approvals/{id}/reject",
+    response_model=ApprovalActionView,
+    status_code=status.HTTP_201_CREATED,
+)
+async def reject_proposal_route(
+    response: Response,
+    id: Annotated[str, Path(min_length=1, max_length=36)],
+    request: ProposalCommentActionRequest = Depends(_proposal_comment_request),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ApprovalActionView:
+    try:
+        result = await reject_proposal(
+            session,
+            actor_id=user.id,
+            proposal_id=id,
+            request=request,
+            idempotency_key=idempotency_key,
+            request_id=_request_id(),
+        )
+    except ApprovalDomainError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code},
+        ) from None
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return ApprovalActionView.model_validate(result.action)
+
+
+@router.post(
+    "/approvals/{id}/request-changes",
+    response_model=ApprovalActionView,
+    status_code=status.HTTP_201_CREATED,
+)
+async def request_proposal_changes_route(
+    response: Response,
+    id: Annotated[str, Path(min_length=1, max_length=36)],
+    request: ProposalCommentActionRequest = Depends(_proposal_comment_request),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ApprovalActionView:
+    try:
+        result = await request_proposal_changes(
+            session,
+            actor_id=user.id,
+            proposal_id=id,
+            request=request,
+            idempotency_key=idempotency_key,
+            request_id=_request_id(),
+        )
+    except ApprovalDomainError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code},
+        ) from None
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return ApprovalActionView.model_validate(result.action)
 
 
 @router.post(
