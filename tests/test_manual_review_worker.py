@@ -1,14 +1,23 @@
+import ast
 import hashlib
+import asyncio
 import json
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+import httpx
 import pytest
+import pytest_asyncio
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import event
+from langgraph.checkpoint.memory import InMemorySaver
 
 import backend.manual_review_runs as manual
+import backend.manual_review_worker as manual_worker
 from backend.audit_events import add_audit_event
 from backend.common import (
     AgentCallType,
@@ -51,6 +60,8 @@ from backend.optimization_validation import (
     DeterministicViolation,
     validate_optimization_output,
 )
+from backend.config import Settings
+from backend.database import Base
 from backend.schemas import (
     CanonicalRuleCitation,
     DescriptionSection,
@@ -2384,3 +2395,966 @@ async def test_terminal_audit_flush_failure_rolls_back_runs_pointer_and_audit(
             AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_COMPLETED
         )
     ) is None
+
+
+@pytest_asyncio.fixture
+async def manual_worker_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine("sqlite+aiosqlite://")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def enable_foreign_keys(dbapi_connection: object, _connection_record: object) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+
+
+def _manual_worker_settings(*, with_key: bool = True) -> Settings:
+    return Settings(
+        _env_file=None,
+        jwt_secret_key="test-only-secret-at-least-32-characters",
+        deepseek_api_key="mock-key" if with_key else None,
+        deepseek_base_url="https://mock.deepseek.invalid",
+        optimization_lease_seconds=60,
+    )
+
+
+class _ManualRecordingSaver(InMemorySaver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.thread_ids: set[str] = set()
+        self.states: list[dict[str, object]] = []
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        self.thread_ids.add(config["configurable"]["thread_id"])
+        self.states.append(dict(checkpoint.get("channel_values", {})))
+        return await super().aput(config, checkpoint, metadata, new_versions)
+
+
+class _ManualLoader:
+    def __init__(self, trusted: TrustedOptimizationInput, error_code: str | None = None) -> None:
+        self.trusted = trusted
+        self.error_code = error_code
+        self.calls = 0
+        self.renewals = 0
+
+    async def __call__(self, _context, before_external) -> TrustedOptimizationInput:
+        self.calls += 1
+        await before_external()
+        self.renewals += 1
+        if self.error_code:
+            raise manual_worker.TrustedInputLoadFailure(self.error_code)
+        return self.trusted
+
+
+async def _seed_manual_worker(factory: async_sessionmaker[AsyncSession]) -> None:
+    async with factory() as session:
+        await _seed_manual_chain(
+            session, status=WorkflowStatus.ACCEPTED, attempt_count=0, lease_owner=None
+        )
+
+
+async def _manual_worker_run(factory: async_sessionmaker[AsyncSession]) -> WorkflowRun:
+    async with factory() as session:
+        run = await session.get(WorkflowRun, "manual-workflow-1", populate_existing=True)
+        assert run is not None
+        return run
+
+
+async def _manual_worker_counts(factory: async_sessionmaker[AsyncSession]) -> tuple[int, int, int]:
+    async with factory() as session:
+        return (
+            int(await session.scalar(select(func.count()).select_from(ProposalRevision)) or 0),
+            int(await session.scalar(select(func.count()).select_from(ComplianceReview)) or 0),
+            int(await session.scalar(select(func.count()).select_from(AgentCall)) or 0),
+        )
+
+
+def _manual_worker_transport(
+    response: ComplianceAgentResponse | None,
+    requests: list[dict[str, object]],
+    *,
+    status: int = 200,
+    schema_invalid_primary: bool = False,
+    schema_invalid_repair: bool = False,
+) -> httpx.MockTransport:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(json.loads(request.content)["messages"][1]["content"])
+        requests.append(payload)
+        invalid = (len(requests) == 1 and schema_invalid_primary) or (
+            len(requests) == 2 and schema_invalid_repair
+        )
+        content = "{}" if invalid else response.model_dump_json() if response else "{}"
+        return httpx.Response(
+            status,
+            json={
+                "choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+            },
+        )
+
+    return httpx.MockTransport(handler)
+
+
+async def test_manual_worker_passes_through_six_safe_nodes_without_optimization_client(
+    manual_worker_factory,
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    saver = _ManualRecordingSaver()
+    requests: list[dict[str, object]] = []
+    loader = _ManualLoader(_trusted_seed())
+
+    processed = await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(),
+        lease_owner="worker-a",
+        checkpointer=saver,
+        trusted_input_loader=loader,
+        transport=_manual_worker_transport(_passing_response(), requests),
+    )
+
+    run = await _manual_worker_run(manual_worker_factory)
+    assert processed == "manual-workflow-1"
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.COMPLETED,
+        WorkflowQuality.NORMAL,
+        None,
+    )
+    assert await _manual_worker_counts(manual_worker_factory) == (2, 2, 1)
+    assert saver.thread_ids == {"manual-workflow-1"}
+    assert loader.renewals == 1
+    module_tree = ast.parse(open(manual_worker.__file__, encoding="utf-8").read())
+    assert not any(
+        alias.name == "ProductOptimizationAgentClient"
+        for node in ast.walk(module_tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    )
+    allowed = {
+        "workflow_run_id", "manual_review_run_id", "proposal_id", "revision_id", "review_id",
+        "review_passed", "review_quality_status", "error_code", "next_node",
+    }
+    async with manual_worker_factory() as session:
+        review_id = await session.scalar(
+            select(ComplianceReview.id).where(ComplianceReview.iteration.is_(None))
+        )
+    fixed_values = {
+        "workflow_run_id": {"manual-workflow-1"},
+        "manual_review_run_id": {"manual-run-1"},
+        "proposal_id": {"proposal-1"},
+        "revision_id": {"revision-2"},
+        "review_id": {None, review_id},
+        "review_passed": {None, True},
+        "review_quality_status": {None, "normal"},
+        "error_code": {None},
+        "next_node": {
+            "load_trusted_input", "run_deterministic_checks", "call_compliance_agent",
+            "persist_manual_review", "finalize_manual_review", "stop",
+        },
+    }
+    for state in saver.states:
+        user_state = {
+            key: value
+            for key, value in state.items()
+            if key != "__start__" and not key.startswith(("branch:", "start:"))
+        }
+        assert set(user_state) <= allowed
+        assert all(value in fixed_values[key] for key, value in user_state.items())
+        checkpoint = json.dumps(state, ensure_ascii=False, default=str)
+        for unsafe in (
+            "原商品标题", "商品文案应有依据。", "mock.deepseek.invalid", "Authorization",
+            "data/uploads", "4" * 64, "candidate_output", "trusted_facts",
+        ):
+            assert unsafe not in checkpoint
+    assert {
+        "load_trusted_input", "run_deterministic_checks", "call_compliance_agent",
+        "persist_manual_review", "finalize_manual_review", "stop",
+    } <= {state.get("next_node") for state in saver.states}
+    assert len(requests) == 1 and requests[0]["iteration"] == 0
+
+
+@pytest.mark.parametrize("semantic", [_passing_response(), _semantic_nonpass_response()])
+async def test_manual_worker_persists_deterministic_or_semantic_nonpass(
+    manual_worker_factory, semantic
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    if semantic.passed:
+        async with manual_worker_factory() as session:
+            await _restricted_manual_output(session)
+    await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=_ManualRecordingSaver(),
+        trusted_input_loader=_ManualLoader(_trusted_seed()), transport=_manual_worker_transport(semantic, []),
+    )
+    run = await _manual_worker_run(manual_worker_factory)
+    assert (run.status, run.quality_status) == (WorkflowStatus.COMPLETED, WorkflowQuality.NORMAL)
+    async with manual_worker_factory() as session:
+        review = await session.scalar(select(ComplianceReview).where(ComplianceReview.iteration.is_(None)))
+        assert review is not None and review.passed is False
+
+
+@pytest.mark.parametrize(
+    ("rag_quality", "error_code"),
+    [("zero_hit", "KNOWLEDGE_ZERO_HIT"), ("low_confidence", "KNOWLEDGE_LOW_CONFIDENCE")],
+)
+async def test_manual_worker_non_normal_rag_skips_deepseek(
+    manual_worker_factory, rag_quality, error_code
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    requests: list[dict[str, object]] = []
+    await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=_ManualRecordingSaver(),
+        trusted_input_loader=_ManualLoader(_trusted_seed().model_copy(update={"rag_quality": rag_quality})),
+        transport=_manual_worker_transport(_passing_response(), requests),
+    )
+    run = await _manual_worker_run(manual_worker_factory)
+    assert not requests
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.COMPLETED, WorkflowQuality.DEGRADED, error_code
+    )
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "KNOWLEDGE_MODEL_UNAVAILABLE", "KNOWLEDGE_DEPENDENCY_TIMEOUT",
+        "KNOWLEDGE_DEPENDENCY_ERROR", "KNOWLEDGE_ZERO_HIT", "KNOWLEDGE_LOW_CONFIDENCE",
+    ],
+)
+async def test_manual_worker_knowledge_loader_failures_are_bounded(
+    manual_worker_factory, error_code
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    assert manual_worker.TrustedInputLoadFailure(error_code).error_code == error_code
+    await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=_ManualRecordingSaver(),
+        trusted_input_loader=_ManualLoader(_trusted_seed(), error_code),
+    )
+    run = await _manual_worker_run(manual_worker_factory)
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.COMPLETED, WorkflowQuality.DEGRADED, error_code
+    )
+    assert await _manual_worker_counts(manual_worker_factory) == (2, 2, 0)
+    async with manual_worker_factory() as session:
+        review = await session.scalar(select(ComplianceReview).where(ComplianceReview.iteration.is_(None)))
+        assert review is not None and review.semantic_review == {
+            "status": "unavailable", "error_code": error_code
+        }
+
+
+async def test_manual_worker_compiles_exactly_six_business_nodes(manual_worker_factory) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    async with manual_worker_factory() as session:
+        graph = manual_worker.build_manual_review_graph(
+            session=session,
+            settings=_manual_worker_settings(),
+            lease_owner="worker-a",
+            checkpointer=_ManualRecordingSaver(),
+            trusted_input_loader=_ManualLoader(_trusted_seed()),
+        )
+    assert set(graph.get_graph().nodes) - {"__start__", "__end__"} == {
+        "load_or_resume", "load_trusted_input", "run_deterministic_checks",
+        "call_compliance_agent", "persist_manual_review", "finalize_manual_review",
+    }
+
+
+async def test_manual_worker_context_database_error_uses_fresh_failure_session(
+    manual_worker_factory, monkeypatch
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    graph_sessions: list[int] = []
+    failure_sessions: list[int] = []
+    real_load = manual_worker.load_owned_manual_review_context
+    real_fail = manual_worker.fail_manual_review_run
+
+    async def failed_load(session, **kwargs):
+        graph_sessions.append(id(session))
+        return manual.OwnedManualReviewContextResult(
+            "failed", None, "MANUAL_REVIEW_DATABASE_ERROR"
+        )
+
+    async def record_fail(session, **kwargs):
+        failure_sessions.append(id(session))
+        monkeypatch.setattr(manual_worker, "load_owned_manual_review_context", real_load)
+        return await real_fail(session, **kwargs)
+
+    monkeypatch.setattr(manual_worker, "load_owned_manual_review_context", failed_load)
+    monkeypatch.setattr(manual_worker, "fail_manual_review_run", record_fail)
+    assert await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=_ManualRecordingSaver(),
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+    ) == "manual-workflow-1"
+    assert graph_sessions and failure_sessions and graph_sessions[0] != failure_sessions[0]
+    run = await _manual_worker_run(manual_worker_factory)
+    assert (run.status, run.error_code) == (WorkflowStatus.FAILED, "MANUAL_REVIEW_DATABASE_ERROR")
+
+
+async def test_manual_worker_propagates_second_fresh_database_failure(
+    manual_worker_factory, monkeypatch
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+
+    async def failed_load(_session, **_kwargs):
+        return manual.OwnedManualReviewContextResult(
+            "failed", None, "MANUAL_REVIEW_DATABASE_ERROR"
+        )
+
+    async def failed_terminal(_session, **_kwargs):
+        raise SQLAlchemyError("fresh failure")
+
+    monkeypatch.setattr(manual_worker, "load_owned_manual_review_context", failed_load)
+    monkeypatch.setattr(manual_worker, "fail_manual_review_run", failed_terminal)
+    with pytest.raises(SQLAlchemyError, match="fresh failure"):
+        await manual_worker.run_once(
+            manual_worker_factory,
+            settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=_ManualRecordingSaver(),
+            trusted_input_loader=_ManualLoader(_trusted_seed()),
+        )
+    run = await _manual_worker_run(manual_worker_factory)
+    assert (run.status, run.lease_owner, run.error_code) == (
+        WorkflowStatus.PROCESSING, "worker-a", None
+    )
+
+
+class _CancelBeforeManualPersistSaver(_ManualRecordingSaver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled = False
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        values = checkpoint.get("channel_values", {})
+        if not self.cancelled and values.get("next_node") == "persist_manual_review":
+            self.cancelled = True
+            raise asyncio.CancelledError()
+        return await super().aput(config, checkpoint, metadata, new_versions)
+
+
+async def _cancel_after_manual_review_persist(
+    factory, *, failed_schema_repair: bool = False
+):
+    await _seed_manual_worker(factory)
+    saver = _CancelBeforeManualPersistSaver()
+    requests: list[dict[str, object]] = []
+    with pytest.raises(asyncio.CancelledError):
+        await manual_worker.run_once(
+            factory,
+            settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=saver,
+            trusted_input_loader=_ManualLoader(_trusted_seed()),
+            transport=_manual_worker_transport(
+                _passing_response(),
+                requests,
+                schema_invalid_primary=failed_schema_repair,
+                schema_invalid_repair=failed_schema_repair,
+            ),
+        )
+    assert len(requests) == (2 if failed_schema_repair else 1)
+    return saver
+
+
+async def _expire_manual_worker(factory) -> None:
+    async with factory() as session:
+        await session.execute(
+            update(WorkflowRun).where(WorkflowRun.id == "manual-workflow-1").values(
+                lease_expires_at=datetime.now(UTC) - timedelta(seconds=1)
+            )
+        )
+        await session.commit()
+
+
+async def _manual_worker_snapshot(factory) -> tuple[object, ...]:
+    async with factory() as session:
+        run = await session.get(WorkflowRun, "manual-workflow-1")
+        original = await session.get(WorkflowRun, "optimization-1")
+        proposal = await session.get(ProductProposal, "proposal-1")
+        assert run is not None and original is not None and proposal is not None
+        return (
+            run.status, run.quality_status, run.current_step, run.error_code,
+            run.lease_owner, run.attempt_count,
+            original.status, original.quality_status, original.current_step,
+            original.error_code, proposal.active_manual_review_run_id,
+            int(await session.scalar(select(func.count()).select_from(ProposalRevision)) or 0),
+            int(await session.scalar(select(func.count()).select_from(ComplianceReview)) or 0),
+            int(await session.scalar(select(func.count()).select_from(AgentCall)) or 0),
+            int(await session.scalar(select(func.count()).select_from(AuditEvent)) or 0),
+        )
+
+
+class _MutateAtNodeSaver(_ManualRecordingSaver):
+    def __init__(self, factory, target_node: str, mutation: str) -> None:
+        super().__init__()
+        self.factory = factory
+        self.target_node = target_node
+        self.mutation = mutation
+        self.mutated = False
+        self.snapshot: tuple[object, ...] | None = None
+
+    async def _mutate(self) -> None:
+        if self.mutated:
+            return
+        async with self.factory() as session:
+            if self.mutation == "owner":
+                statement = update(WorkflowRun).where(
+                    WorkflowRun.id == "manual-workflow-1"
+                ).values(
+                    lease_owner="worker-b",
+                    lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                )
+            elif self.mutation == "version":
+                statement = update(Product).where(Product.id == "product-1").values(
+                    current_version=8
+                )
+            elif self.mutation == "authorization":
+                statement = update(User).where(User.id == "operator-1").values(
+                    status=UserStatus.DISABLED
+                )
+            else:
+                statement = update(KnowledgeDocument).where(
+                    KnowledgeDocument.id == "document-1"
+                ).values(enabled=False)
+            await session.execute(statement.execution_options(synchronize_session=False))
+            await session.commit()
+        self.mutated = True
+        self.snapshot = await _manual_worker_snapshot(self.factory)
+
+    async def aget_tuple(self, *args, **kwargs):
+        if self.target_node == "load_or_resume":
+            await self._mutate()
+        return await super().aget_tuple(*args, **kwargs)
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        if checkpoint.get("channel_values", {}).get("next_node") == self.target_node:
+            await self._mutate()
+        return await super().aput(config, checkpoint, metadata, new_versions)
+
+
+@pytest.mark.parametrize(
+    "target_node",
+    [
+        "load_or_resume", "load_trusted_input", "run_deterministic_checks",
+        "call_compliance_agent", "persist_manual_review", "finalize_manual_review",
+    ],
+)
+async def test_manual_worker_owner_replacement_at_every_node_writes_nothing(
+    manual_worker_factory, target_node
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    saver = _MutateAtNodeSaver(manual_worker_factory, target_node, "owner")
+
+    assert await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=saver,
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=_manual_worker_transport(_passing_response(), []),
+    ) == "manual-workflow-1"
+
+    assert saver.mutated and saver.snapshot is not None
+    assert await _manual_worker_snapshot(manual_worker_factory) == saver.snapshot
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_code"),
+    [
+        ("version", "PRODUCT_VERSION_CONFLICT"),
+        ("authorization", "MANUAL_REVIEW_AUTHORIZATION_CHANGED"),
+        ("citation", "MANUAL_REVIEW_FACT_ERROR"),
+    ],
+)
+async def test_manual_worker_rechecks_mutated_facts_between_nodes_before_http(
+    manual_worker_factory, mutation, error_code
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    saver = _MutateAtNodeSaver(
+        manual_worker_factory, "call_compliance_agent", mutation
+    )
+    requests: list[dict[str, object]] = []
+
+    assert await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=saver,
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=_manual_worker_transport(_passing_response(), requests),
+    ) == "manual-workflow-1"
+
+    assert saver.mutated and not requests
+    assert await _manual_worker_counts(manual_worker_factory) == (2, 1, 0)
+    async with manual_worker_factory() as session:
+        run = await session.get(WorkflowRun, "manual-workflow-1")
+        original = await session.get(WorkflowRun, "optimization-1")
+        proposal = await session.get(ProductProposal, "proposal-1")
+        assert run is not None and original is not None and proposal is not None
+        assert (run.status, run.error_code, original.status, original.error_code) == (
+            WorkflowStatus.FAILED, error_code, WorkflowStatus.FAILED, error_code
+        )
+        assert proposal.active_manual_review_run_id is None
+
+
+async def test_manual_worker_reclaims_cancelled_pre_persist_checkpoint_without_second_http(
+    manual_worker_factory,
+) -> None:
+    saver = await _cancel_after_manual_review_persist(manual_worker_factory)
+    assert await _manual_worker_counts(manual_worker_factory) == (2, 2, 1)
+    await _expire_manual_worker(manual_worker_factory)
+    resumed_requests: list[dict[str, object]] = []
+    assert await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-b", checkpointer=saver,
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=_manual_worker_transport(_passing_response(), resumed_requests),
+    ) == "manual-workflow-1"
+    assert not resumed_requests and saver.thread_ids == {"manual-workflow-1"}
+    run = await _manual_worker_run(manual_worker_factory)
+    assert run.status is WorkflowStatus.COMPLETED
+    assert await _manual_worker_counts(manual_worker_factory) == (2, 2, 1)
+    async with manual_worker_factory() as session:
+        calls = list(
+            await session.scalars(
+                select(AgentCall).where(
+                    AgentCall.workflow_run_id == "manual-workflow-1"
+                )
+            )
+        )
+        completed_audits = int(
+            await session.scalar(
+                select(func.count()).select_from(AuditEvent).where(
+                    AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_COMPLETED
+                )
+            )
+            or 0
+        )
+        failed_audits = int(
+            await session.scalar(
+                select(func.count()).select_from(AuditEvent).where(
+                    AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_FAILED
+                )
+            )
+            or 0
+        )
+    assert [
+        (call.call_type, call.iteration, call.attempt) for call in calls
+    ] == [(AgentCallType.PRIMARY, 0, 1)]
+    assert (completed_audits, failed_audits) == (1, 0)
+
+
+@pytest.mark.parametrize("corruption", ["review", "call"])
+async def test_manual_worker_recovery_rejects_nonexact_review_or_call_without_http(
+    manual_worker_factory, corruption
+) -> None:
+    saver = await _cancel_after_manual_review_persist(manual_worker_factory)
+    async with manual_worker_factory() as session:
+        if corruption == "review":
+            await session.execute(
+                update(ComplianceReview)
+                .where(ComplianceReview.proposal_revision_id == "revision-2")
+                .values(required_changes=[{"unexpected": "value"}])
+            )
+        else:
+            await session.execute(
+                update(AgentCall)
+                .where(AgentCall.workflow_run_id == "manual-workflow-1")
+                .values(attempt=2)
+            )
+        await session.commit()
+    await _expire_manual_worker(manual_worker_factory)
+    requests: list[dict[str, object]] = []
+
+    assert await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-b", checkpointer=saver,
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=_manual_worker_transport(_passing_response(), requests),
+    ) == "manual-workflow-1"
+
+    assert not requests
+    assert await _manual_worker_counts(manual_worker_factory) == (2, 2, 1)
+    async with manual_worker_factory() as session:
+        manual_run = await session.get(WorkflowRun, "manual-workflow-1")
+        original = await session.get(WorkflowRun, "optimization-1")
+        proposal = await session.get(ProductProposal, "proposal-1")
+        failed_audits = int(
+            await session.scalar(
+                select(func.count()).select_from(AuditEvent).where(
+                    AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_FAILED,
+                    AuditEvent.error_code == "MANUAL_REVIEW_REPLAY_CONFLICT",
+                )
+            )
+            or 0
+        )
+        assert manual_run is not None and original is not None and proposal is not None
+        assert (manual_run.status, original.status, proposal.active_manual_review_run_id) == (
+            WorkflowStatus.FAILED, WorkflowStatus.FAILED, None
+        )
+        assert manual_run.error_code == original.error_code == "MANUAL_REVIEW_REPLAY_CONFLICT"
+        assert failed_audits == 1
+
+
+@pytest.mark.parametrize("corruption", ["missing_repair", "status"])
+async def test_manual_worker_recovery_rejects_impossible_stored_call_history(
+    manual_worker_factory, corruption
+) -> None:
+    failed_schema_repair = corruption == "missing_repair"
+    saver = await _cancel_after_manual_review_persist(
+        manual_worker_factory, failed_schema_repair=failed_schema_repair
+    )
+    async with manual_worker_factory() as session:
+        if failed_schema_repair:
+            await session.execute(
+                delete(AgentCall).where(
+                    AgentCall.workflow_run_id == "manual-workflow-1",
+                    AgentCall.call_type == AgentCallType.SCHEMA_REPAIR,
+                )
+            )
+        else:
+            await session.execute(
+                update(AgentCall)
+                .where(AgentCall.workflow_run_id == "manual-workflow-1")
+                .values(status="failed")
+            )
+        await session.commit()
+    before_counts = await _manual_worker_counts(manual_worker_factory)
+    await _expire_manual_worker(manual_worker_factory)
+    requests: list[dict[str, object]] = []
+
+    assert await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-b", checkpointer=saver,
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=_manual_worker_transport(_passing_response(), requests),
+    ) == "manual-workflow-1"
+
+    assert not requests
+    assert await _manual_worker_counts(manual_worker_factory) == before_counts
+    async with manual_worker_factory() as session:
+        manual_run = await session.get(WorkflowRun, "manual-workflow-1")
+        original = await session.get(WorkflowRun, "optimization-1")
+        proposal = await session.get(ProductProposal, "proposal-1")
+        assert manual_run is not None and original is not None and proposal is not None
+        assert (manual_run.status, original.status, proposal.active_manual_review_run_id) == (
+            WorkflowStatus.FAILED, WorkflowStatus.FAILED, None
+        )
+        assert manual_run.error_code == original.error_code == "MANUAL_REVIEW_REPLAY_CONFLICT"
+
+
+class _ManualFailingSaver(InMemorySaver):
+    def __init__(self, method: str) -> None:
+        super().__init__()
+        self.method = method
+
+    async def aget_tuple(self, *args, **kwargs):
+        if self.method == "aget_tuple":
+            raise RuntimeError("checkpoint read failed")
+        return await super().aget_tuple(*args, **kwargs)
+
+    async def aput(self, *args, **kwargs):
+        if self.method == "aput":
+            raise RuntimeError("checkpoint write failed")
+        return await super().aput(*args, **kwargs)
+
+    async def aput_writes(self, *args, **kwargs):
+        if self.method == "aput_writes":
+            raise RuntimeError("checkpoint writes failed")
+        return await super().aput_writes(*args, **kwargs)
+
+
+class _PostReviewBoundarySaver(_ManualRecordingSaver):
+    def __init__(self, factory, method: str, cancel: bool) -> None:
+        super().__init__()
+        self.factory = factory
+        self.method = method
+        self.cancel = cancel
+        self.triggered = False
+
+    async def _interrupt_if_ready(self, method: str) -> None:
+        if self.triggered or method != self.method:
+            return
+        async with self.factory() as session:
+            review_exists = await session.scalar(
+                select(ComplianceReview.id).where(ComplianceReview.iteration.is_(None))
+            )
+        if review_exists is None:
+            return
+        self.triggered = True
+        if self.cancel:
+            raise asyncio.CancelledError()
+        raise RuntimeError(f"post-review {method} failed")
+
+    async def aget_tuple(self, *args, **kwargs):
+        await self._interrupt_if_ready("aget_tuple")
+        return await super().aget_tuple(*args, **kwargs)
+
+    async def aput(self, *args, **kwargs):
+        await self._interrupt_if_ready("aput")
+        return await super().aput(*args, **kwargs)
+
+    async def aput_writes(self, *args, **kwargs):
+        await self._interrupt_if_ready("aput_writes")
+        return await super().aput_writes(*args, **kwargs)
+
+
+@pytest.mark.parametrize("method", ["aget_tuple", "aput", "aput_writes"])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_manual_worker_post_review_checkpoint_boundary_is_recoverable(
+    manual_worker_factory, method, cancel
+) -> None:
+    if method == "aget_tuple":
+        await _cancel_after_manual_review_persist(manual_worker_factory)
+        await _expire_manual_worker(manual_worker_factory)
+        owner = "worker-b"
+    else:
+        await _seed_manual_worker(manual_worker_factory)
+        owner = "worker-a"
+    saver = _PostReviewBoundarySaver(manual_worker_factory, method, cancel)
+    requests: list[dict[str, object]] = []
+
+    invocation = manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner=owner, checkpointer=saver,
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=_manual_worker_transport(_passing_response(), requests),
+    )
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            await invocation
+    else:
+        assert await invocation == "manual-workflow-1"
+
+    assert saver.triggered
+    assert await _manual_worker_counts(manual_worker_factory) == (2, 2, 1)
+    async with manual_worker_factory() as session:
+        run = await session.get(WorkflowRun, "manual-workflow-1")
+        proposal = await session.get(ProductProposal, "proposal-1")
+        assert run is not None and proposal is not None
+        if cancel:
+            assert (run.status, run.lease_owner, run.error_code) == (
+                WorkflowStatus.PROCESSING, owner, None
+            )
+            assert proposal.active_manual_review_run_id == "manual-run-1"
+        else:
+            assert (run.status, run.lease_owner, run.error_code) == (
+                WorkflowStatus.FAILED, None, "MANUAL_REVIEW_CHECKPOINT_ERROR"
+            )
+            assert proposal.active_manual_review_run_id is None
+
+    if cancel:
+        await _expire_manual_worker(manual_worker_factory)
+        resumed_requests: list[dict[str, object]] = []
+        assert await manual_worker.run_once(
+            manual_worker_factory,
+            settings=_manual_worker_settings(), lease_owner="worker-c", checkpointer=saver,
+            trusted_input_loader=_ManualLoader(_trusted_seed()),
+            transport=_manual_worker_transport(_passing_response(), resumed_requests),
+        ) == "manual-workflow-1"
+        assert not resumed_requests
+        assert await _manual_worker_counts(manual_worker_factory) == (2, 2, 1)
+        assert (await _manual_worker_run(manual_worker_factory)).status is WorkflowStatus.COMPLETED
+
+
+@pytest.mark.parametrize("method", ["aget_tuple", "aput", "aput_writes"])
+async def test_manual_worker_checkpoint_failures_use_fresh_guarded_terminal(
+    manual_worker_factory, method
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    assert await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a",
+        checkpointer=_ManualFailingSaver(method), trusted_input_loader=_ManualLoader(_trusted_seed()),
+    ) == "manual-workflow-1"
+    run = await _manual_worker_run(manual_worker_factory)
+    assert (run.status, run.error_code, run.lease_owner) == (
+        WorkflowStatus.FAILED, "MANUAL_REVIEW_CHECKPOINT_ERROR", None
+    )
+    assert await _manual_worker_counts(manual_worker_factory) == (2, 1, 0)
+
+
+@pytest.mark.parametrize(
+    ("case", "error_code", "expected_calls"),
+    [
+        ("key", "DEEPSEEK_KEY_MISSING", 0), ("timeout", "DEEPSEEK_TIMEOUT", 1),
+        ("transport", "DEEPSEEK_TRANSPORT", 1), ("rate", "DEEPSEEK_RATE_LIMIT", 1),
+        ("unauthorized", "DEEPSEEK_UNAUTHORIZED", 1), ("forbidden", "DEEPSEEK_FORBIDDEN", 1),
+        ("http", "DEEPSEEK_HTTP_ERROR", 1), ("server", "DEEPSEEK_SERVER_ERROR", 1),
+    ],
+)
+async def test_manual_worker_maps_every_primary_failure_to_one_bounded_call(
+    manual_worker_factory, case, error_code, expected_calls
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    requests = 0
+
+    async def failing_transport(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if case == "timeout":
+            raise httpx.ReadTimeout("timeout", request=request)
+        if case == "transport":
+            raise httpx.ConnectError("transport", request=request)
+        status = {"rate": 429, "unauthorized": 401, "forbidden": 403, "http": 418, "server": 500}[case]
+        return httpx.Response(status)
+
+    await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(with_key=case != "key"), lease_owner="worker-a",
+        checkpointer=_ManualRecordingSaver(), trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=httpx.MockTransport(failing_transport) if case != "key" else None,
+    )
+    run = await _manual_worker_run(manual_worker_factory)
+    assert (run.status, run.error_code) == (WorkflowStatus.COMPLETED, error_code)
+    assert requests == expected_calls
+    async with manual_worker_factory() as session:
+        calls = list(await session.scalars(select(AgentCall).where(AgentCall.workflow_run_id == "manual-workflow-1")))
+        assert len(calls) == expected_calls
+        if calls:
+            assert (calls[0].node_name, calls[0].call_type, calls[0].iteration, calls[0].attempt) == (
+                "call_product_compliance_agent", AgentCallType.PRIMARY, 0, 1
+            )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(401, "DEEPSEEK_UNAUTHORIZED"), (403, "DEEPSEEK_FORBIDDEN"), (418, "DEEPSEEK_HTTP_ERROR"), (500, "DEEPSEEK_SERVER_ERROR")],
+)
+async def test_manual_worker_primary_provider_failures_create_one_safe_call(
+    manual_worker_factory, status, expected
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    requests: list[dict[str, object]] = []
+    await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=_ManualRecordingSaver(),
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=_manual_worker_transport(_passing_response(), requests, status=status),
+    )
+    run = await _manual_worker_run(manual_worker_factory)
+    assert len(requests) == 1
+    assert (run.status, run.error_code) == (WorkflowStatus.COMPLETED, expected)
+    assert (await _manual_worker_counts(manual_worker_factory))[2] == 1
+
+
+@pytest.mark.parametrize("repair_valid", [True, False])
+async def test_manual_worker_schema_repair_is_the_only_second_request(
+    manual_worker_factory, repair_valid
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    requests: list[dict[str, object]] = []
+    await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a", checkpointer=_ManualRecordingSaver(),
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=_manual_worker_transport(
+            _passing_response(), requests, schema_invalid_primary=True, schema_invalid_repair=not repair_valid
+        ),
+    )
+    run = await _manual_worker_run(manual_worker_factory)
+    assert len(requests) == 2
+    assert run.error_code == (None if repair_valid else "DEEPSEEK_SCHEMA_INVALID")
+    assert (await _manual_worker_counts(manual_worker_factory))[2] == 2
+
+
+async def test_manual_worker_renews_before_rag_primary_and_single_repair_attempt(
+    manual_worker_factory, monkeypatch
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+    real_renew = manual_worker.renew_manual_review_lease
+    renewals: list[int] = []
+    requests: list[dict[str, object]] = []
+
+    async def recording_renew(session, **kwargs):
+        renewals.append(len(renewals) + 1)
+        return await real_renew(session, **kwargs)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(json.loads(request.content)["messages"][1]["content"])
+        requests.append(payload)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "{}"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+        raise httpx.ReadTimeout("repair timeout", request=request)
+
+    monkeypatch.setattr(manual_worker, "renew_manual_review_lease", recording_renew)
+    await manual_worker.run_once(
+        manual_worker_factory,
+        settings=_manual_worker_settings(), lease_owner="worker-a",
+        checkpointer=_ManualRecordingSaver(),
+        trusted_input_loader=_ManualLoader(_trusted_seed()),
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert len(requests) == 2
+    assert renewals == [1, 2, 3]
+    async with manual_worker_factory() as session:
+        calls = list(
+            await session.scalars(
+                select(AgentCall)
+                .where(AgentCall.workflow_run_id == "manual-workflow-1")
+            )
+        )
+    calls.sort(key=lambda call: 0 if call.call_type is AgentCallType.PRIMARY else 1)
+    assert [
+        (call.node_name, call.call_type, call.iteration, call.attempt, call.error_code)
+        for call in calls
+    ] == [
+        (
+            "call_product_compliance_agent", AgentCallType.PRIMARY, 0, 1,
+            "DEEPSEEK_SCHEMA_INVALID",
+        ),
+        (
+            "repair_product_compliance_schema", AgentCallType.SCHEMA_REPAIR, 0, 1,
+            "DEEPSEEK_TIMEOUT",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("boundary", ["loader", "transport", "aget_tuple", "aput", "aput_writes"])
+async def test_manual_worker_propagates_cancellation_without_terminal_write(
+    manual_worker_factory, boundary
+) -> None:
+    await _seed_manual_worker(manual_worker_factory)
+
+    async def cancelled_loader(_context, before_external):
+        await before_external()
+        raise asyncio.CancelledError()
+
+    async def cancelled_transport(_request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError()
+
+    class CancelSaver(_ManualRecordingSaver):
+        async def aget_tuple(self, *args, **kwargs):
+            if boundary == "aget_tuple":
+                raise asyncio.CancelledError()
+            return await super().aget_tuple(*args, **kwargs)
+
+        async def aput(self, *args, **kwargs):
+            if boundary == "aput":
+                raise asyncio.CancelledError()
+            return await super().aput(*args, **kwargs)
+
+        async def aput_writes(self, *args, **kwargs):
+            if boundary == "aput_writes":
+                raise asyncio.CancelledError()
+            return await super().aput_writes(*args, **kwargs)
+
+    with pytest.raises(asyncio.CancelledError):
+        await manual_worker.run_once(
+            manual_worker_factory,
+            settings=_manual_worker_settings(), lease_owner="worker-a",
+            checkpointer=CancelSaver() if boundary in {"aget_tuple", "aput", "aput_writes"} else _ManualRecordingSaver(),
+            trusted_input_loader=cancelled_loader if boundary == "loader" else _ManualLoader(_trusted_seed()),
+            transport=httpx.MockTransport(cancelled_transport) if boundary == "transport" else None,
+        )
+    run = await _manual_worker_run(manual_worker_factory)
+    assert (run.status, run.lease_owner, run.error_code) == (WorkflowStatus.PROCESSING, "worker-a", None)
+    assert await _manual_worker_counts(manual_worker_factory) == (2, 1, 0)
