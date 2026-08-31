@@ -1,11 +1,17 @@
 import ast
 import hashlib
 import asyncio
+import importlib
 import json
+import os
+import runpy
+import sys
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from functools import partial
+from pathlib import Path
 
 import httpx
 import pytest
@@ -3358,3 +3364,141 @@ async def test_manual_worker_propagates_cancellation_without_terminal_write(
     run = await _manual_worker_run(manual_worker_factory)
     assert (run.status, run.lease_owner, run.error_code) == (WorkflowStatus.PROCESSING, "worker-a", None)
     assert await _manual_worker_counts(manual_worker_factory) == (2, 1, 0)
+
+
+def test_manual_review_worker_cli_import_is_side_effect_free() -> None:
+    module = importlib.import_module("scripts.run_manual_review_worker")
+    assert callable(module.main)
+    assert {
+        "Settings", "AsyncPostgresSaver", "async_session_factory",
+        "load_optimization_trusted_input", "run_once", "ProductOptimizationAgentClient",
+        "LocalKnowledgeModels", "MilvusKnowledgeIndex",
+    }.isdisjoint(module.__dict__)
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    top_level_imports = {
+        alias.name.split(".")[0]
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module.split(".")[0]
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+    assert top_level_imports <= {"argparse", "asyncio", "functools", "os", "socket"}
+
+
+async def _manual_cli_fakes(monkeypatch, outcomes):
+    module = importlib.import_module("scripts.run_manual_review_worker")
+    from backend import config, database, manual_review_worker, optimization_trusted_input
+    from langgraph.checkpoint.postgres import aio as checkpoint_aio
+
+    settings = Settings(
+        _env_file=None,
+        jwt_secret_key="test-only-secret-at-least-32-characters",
+        langgraph_database_url="postgresql://test.invalid/manual-review",
+    )
+    factory = object()
+    calls: list[tuple[object, dict[str, object]]] = []
+    remaining = iter(outcomes)
+
+    class FakeSaver:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def setup(self) -> None:
+            calls.append(("setup", {}))
+
+    saver = FakeSaver()
+
+    class FakeAsyncPostgresSaver:
+        @classmethod
+        def from_conn_string(cls, value):
+            calls.append(("connection", {"value": value}))
+            return saver
+
+    async def fake_run_once(session_factory, **kwargs):
+        calls.append((session_factory, kwargs))
+        return next(remaining)
+
+    monkeypatch.setattr(config, "Settings", lambda: settings)
+    monkeypatch.setattr(database, "async_session_factory", factory)
+    monkeypatch.setattr(manual_review_worker, "run_once", fake_run_once)
+    monkeypatch.setattr(checkpoint_aio, "AsyncPostgresSaver", FakeAsyncPostgresSaver)
+    monkeypatch.setattr(module.socket, "gethostname", lambda: "worker-host")
+    monkeypatch.setattr(module.os, "getpid", lambda: 4321)
+    return module, settings, factory, saver, calls, optimization_trusted_input
+
+
+async def test_manual_review_worker_cli_once_binds_production_dependencies_once(
+    monkeypatch,
+) -> None:
+    module, settings, factory, saver, calls, trusted_input = await _manual_cli_fakes(
+        monkeypatch, ["manual-workflow-1"]
+    )
+
+    await module.main(True)
+
+    assert calls[:2] == [
+        ("connection", {"value": settings.langgraph_database_url}),
+        ("setup", {}),
+    ]
+    run_calls = [call for call in calls if call[0] is factory]
+    assert len(run_calls) == 1
+    kwargs = run_calls[0][1]
+    loader = kwargs["trusted_input_loader"]
+    assert isinstance(loader, partial)
+    assert loader.func is trusted_input.load_optimization_trusted_input
+    assert loader.keywords == {"session_factory": factory, "settings": settings}
+    assert kwargs == {
+        "settings": settings,
+        "lease_owner": "worker-host:4321",
+        "checkpointer": saver,
+        "trusted_input_loader": loader,
+    }
+
+
+async def test_manual_review_worker_cli_loop_sleeps_only_when_no_row(monkeypatch) -> None:
+    module, _, factory, _, calls, _ = await _manual_cli_fakes(
+        monkeypatch, ["manual-workflow-1", None]
+    )
+    sleeps: list[int] = []
+
+    class LoopStopped(Exception):
+        pass
+
+    async def stop_after_sleep(seconds: int) -> None:
+        sleeps.append(seconds)
+        raise LoopStopped
+
+    monkeypatch.setattr(module.asyncio, "sleep", stop_after_sleep)
+    with pytest.raises(LoopStopped):
+        await module.main(False)
+
+    assert len([call for call in calls if call[0] is factory]) == 2
+    assert sleeps == [1]
+
+
+def test_manual_review_worker_cli_selects_windows_event_loop_policy(monkeypatch) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "run_manual_review_worker.py"
+    policy = object()
+    selected: list[object] = []
+    coroutines: list[object] = []
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(asyncio, "WindowsSelectorEventLoopPolicy", lambda: policy)
+    monkeypatch.setattr(asyncio, "set_event_loop_policy", selected.append)
+
+    def fake_run(coroutine) -> None:
+        coroutines.append(coroutine)
+        coroutine.close()
+
+    monkeypatch.setattr(asyncio, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", [str(script), "--once"])
+    runpy.run_path(str(script), run_name="__main__")
+
+    assert selected == [policy]
+    assert len(coroutines) == 1
