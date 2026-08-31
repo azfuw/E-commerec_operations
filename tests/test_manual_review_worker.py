@@ -66,6 +66,20 @@ def _citation() -> CanonicalRuleCitation:
     )
 
 
+def _second_citation() -> CanonicalRuleCitation:
+    return CanonicalRuleCitation(
+        document_id="document-2",
+        version_id="version-2",
+        chunk_id="chunk-2",
+        document_name="家居规则",
+        version_number=1,
+        category="家居",
+        canonical_text="商品标题不得夸大。",
+        active=True,
+        applicable=True,
+    )
+
+
 def _proposal_output() -> OptimizationProposalOutput:
     fact_title = EvidenceRef(kind="fact", value="product.title")
     fact_description = EvidenceRef(kind="fact", value="product.description")
@@ -770,6 +784,242 @@ async def test_owned_context_is_fresh_typed_and_trusted_loader_compatible(
     )
     assert trusted.product_id == "product-1"
     assert trusted.skus[0].price == Decimal("100.00")
+
+
+async def test_owned_context_accepts_output_citation_subset_of_current_canonical_facts(
+    session,
+) -> None:
+    await _seed_manual_chain(session)
+    second = _second_citation()
+    document = KnowledgeDocument(
+        id=second.document_id,
+        name=second.document_name,
+        category=second.category,
+        created_by="operator-1",
+    )
+    session.add(document)
+    await session.flush()
+    version = KnowledgeDocumentVersion(
+        id=second.version_id,
+        document_id=document.id,
+        version_number=second.version_number,
+        sha256="2" * 64,
+        original_filename="home-rule.txt",
+        mime_type="text/plain",
+        storage_path="test/home-rule.txt",
+        status=KnowledgeVersionStatus.ACTIVE,
+    )
+    session.add(version)
+    await session.flush()
+    session.add(
+        KnowledgeChunk(
+            id=second.chunk_id,
+            version_id=version.id,
+            chunk_index=0,
+            chunk_hash="3" * 64,
+            canonical_text=second.canonical_text,
+            chunk_metadata={},
+            token_count=8,
+        )
+    )
+    await session.flush()
+    document.current_version_id = version.id
+    citations = [_citation(), second]
+    trusted = _trusted_seed().model_copy(
+        update={"canonical_rule_citations": citations}
+    )
+    trusted_hash = hashlib.sha256(
+        json.dumps(
+            trusted.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    canonical = [citation.model_dump(mode="json") for citation in citations]
+    parent = await session.get(ProposalRevision, "revision-1")
+    revision = await session.get(ProposalRevision, "revision-2")
+    assert parent is not None and revision is not None
+    parent.citations = canonical
+    revision.citations = canonical
+    revision.trusted_fact_hash = trusted_hash
+    await session.commit()
+
+    result = await manual.load_owned_manual_review_context(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+    )
+
+    assert (result.disposition, result.error_code) == ("ready", None)
+    assert result.context is not None
+    assert result.context.canonical_citations == tuple(citations)
+    assert [item.chunk_id for item in result.context.proposal_output.citations] == [
+        "chunk-1"
+    ]
+
+
+async def test_malformed_product_json_fails_both_runs_and_clears_active_pointer(
+    session,
+) -> None:
+    await _seed_manual_chain(session)
+    await session.execute(
+        update(Product)
+        .where(Product.id == "product-1")
+        .values(selling_points=None)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+
+    result = await manual.load_owned_manual_review_context(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+    )
+
+    assert (result.disposition, result.context, result.error_code) == (
+        "failed",
+        None,
+        "MANUAL_REVIEW_FACT_ERROR",
+    )
+    manual_workflow = await session.get(
+        WorkflowRun, "manual-workflow-1", populate_existing=True
+    )
+    original = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    proposal = await session.get(ProductProposal, "proposal-1", populate_existing=True)
+    assert manual_workflow is not None and original is not None and proposal is not None
+    assert (manual_workflow.status, manual_workflow.error_code) == (
+        WorkflowStatus.FAILED,
+        "MANUAL_REVIEW_FACT_ERROR",
+    )
+    assert (original.status, original.current_step, original.error_code) == (
+        WorkflowStatus.FAILED,
+        "manual_review_failed",
+        "MANUAL_REVIEW_FACT_ERROR",
+    )
+    assert proposal.active_manual_review_run_id is None
+    audits = list(
+        await session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_FAILED
+            )
+        )
+    )
+    assert len(audits) == 1
+    assert audits[0].error_code == "MANUAL_REVIEW_FACT_ERROR"
+
+
+async def test_owned_context_locks_authorization_before_proposal_chain(
+    session, monkeypatch
+) -> None:
+    await _seed_manual_chain(session)
+    observed: list[tuple[str, bool]] = []
+    real_scalar = session.scalar
+
+    async def trace_scalar(statement, *args, **kwargs):
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is not None:
+            observed.append(
+                (entity.__name__, getattr(statement, "_for_update_arg", None) is not None)
+            )
+        return await real_scalar(statement, *args, **kwargs)
+
+    monkeypatch.setattr(session, "scalar", trace_scalar)
+
+    result = await manual.load_owned_manual_review_context(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+    )
+
+    assert result.disposition == "ready"
+    assert observed[:7] == [
+        ("WorkflowRun", True),
+        ("ManualReviewRun", False),
+        ("ProductProposal", False),
+        ("User", True),
+        ("Store", True),
+        ("UserStoreScope", True),
+        ("ProductProposal", True),
+    ]
+
+
+@pytest.mark.parametrize("broken_original", ["store", "type", "input"])
+async def test_bad_original_ownership_clears_pointer_without_mutating_original(
+    session, broken_original: str
+) -> None:
+    await _seed_manual_chain(session)
+    values: dict[str, object]
+    if broken_original == "store":
+        values = {"store_id": "store-2"}
+    elif broken_original == "type":
+        values = {
+            "workflow_type": WorkflowType.ANALYSIS,
+            "status": WorkflowStatus.COMPLETED,
+            "start_date": date(2026, 8, 1),
+            "end_date": date(2026, 8, 2),
+        }
+    else:
+        values = {"input": {"proposal_id": "other-proposal"}}
+    await session.execute(
+        update(WorkflowRun)
+        .where(WorkflowRun.id == "optimization-1")
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    original = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    assert original is not None
+    original_before = (
+        original.workflow_type,
+        original.store_id,
+        original.status,
+        original.quality_status,
+        original.current_step,
+        original.error_code,
+        original.input,
+    )
+
+    result = await manual.load_owned_manual_review_context(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+    )
+
+    assert (result.disposition, result.error_code) == (
+        "failed",
+        "MANUAL_REVIEW_CONTEXT_INCONSISTENT",
+    )
+    manual_workflow = await session.get(
+        WorkflowRun, "manual-workflow-1", populate_existing=True
+    )
+    original = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    proposal = await session.get(ProductProposal, "proposal-1", populate_existing=True)
+    assert manual_workflow is not None and original is not None and proposal is not None
+    assert (manual_workflow.status, manual_workflow.error_code) == (
+        WorkflowStatus.FAILED,
+        "MANUAL_REVIEW_CONTEXT_INCONSISTENT",
+    )
+    assert proposal.active_manual_review_run_id is None
+    assert (
+        original.workflow_type,
+        original.store_id,
+        original.status,
+        original.quality_status,
+        original.current_step,
+        original.error_code,
+        original.input,
+    ) == original_before
+    audits = list(
+        await session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_FAILED
+            )
+        )
+    )
+    assert len(audits) == 1
+    assert audits[0].error_code == "MANUAL_REVIEW_CONTEXT_INCONSISTENT"
 
 
 @pytest.mark.parametrize(

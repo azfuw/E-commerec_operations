@@ -298,21 +298,30 @@ async def _fail_context(
     exact_active_chain = (
         manual is not None
         and proposal is not None
-        and original is not None
         and manual.workflow_run_id == run.id
         and manual.proposal_id == proposal.id
-        and proposal.optimization_run_id == original.id
         and proposal.active_manual_review_run_id == manual.id
-        and original.workflow_type is WorkflowType.OPTIMIZATION
-        and original.store_id == proposal.store_id == run.store_id
+        and proposal.store_id == run.store_id
     )
-    if exact_active_chain:
+    exact_original_chain = (
+        exact_active_chain
+        and original is not None
+        and proposal.optimization_run_id == original.id
+        and original.workflow_type is WorkflowType.OPTIMIZATION
+        and original.store_id == proposal.store_id
+        and isinstance(original.input, dict)
+        and original.input.get("proposal_id") == proposal.id
+        and original.input.get("product_id") == proposal.product_id
+        and original.input.get("store_id") == proposal.store_id
+    )
+    if exact_original_chain:
         original.status = WorkflowStatus.FAILED
         original.quality_status = WorkflowQuality.DEGRADED
         original.lease_owner = None
         original.lease_expires_at = None
         original.current_step = "manual_review_failed"
         original.error_code = error_code
+    if exact_active_chain:
         proposal.active_manual_review_run_id = None
     add_audit_event(
         session,
@@ -353,21 +362,61 @@ async def load_owned_manual_review_context(
         if run is None:
             await session.rollback()
             return OwnedManualReviewContextResult("lease_lost", None, None)
-        manual = await session.scalar(
+        manual_hint = await session.scalar(
             select(ManualReviewRun)
             .where(ManualReviewRun.workflow_run_id == run.id)
             .execution_options(populate_existing=True)
-            .with_for_update()
         )
-        if manual is None:
+        if manual_hint is None:
             return await _fail_context(
                 session,
                 run=run,
                 error_code="MANUAL_REVIEW_CONTEXT_NOT_FOUND",
             )
+        manual_hint_values = (
+            manual_hint.id,
+            manual_hint.workflow_run_id,
+            manual_hint.proposal_id,
+            manual_hint.proposal_revision_id,
+            manual_hint.submitted_by,
+        )
+        proposal_hint = await session.scalar(
+            select(ProductProposal)
+            .where(ProductProposal.id == manual_hint.proposal_id)
+            .execution_options(populate_existing=True)
+        )
+        if proposal_hint is None:
+            return await _fail_context(
+                session,
+                run=run,
+                manual=manual_hint,
+                error_code="MANUAL_REVIEW_CONTEXT_NOT_FOUND",
+            )
+        proposal_hint_values = (proposal_hint.id, proposal_hint.store_id)
+        actor = await session.scalar(
+            select(User)
+            .where(User.id == manual_hint_values[4])
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        store = await session.scalar(
+            select(Store)
+            .where(Store.id == proposal_hint_values[1])
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        scope = await session.scalar(
+            select(UserStoreScope)
+            .where(
+                UserStoreScope.user_id == manual_hint_values[4],
+                UserStoreScope.store_id == proposal_hint_values[1],
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
         proposal = await session.scalar(
             select(ProductProposal)
-            .where(ProductProposal.id == manual.proposal_id)
+            .where(ProductProposal.id == proposal_hint_values[0])
             .execution_options(populate_existing=True)
             .with_for_update()
         )
@@ -375,7 +424,7 @@ async def load_owned_manual_review_context(
             return await _fail_context(
                 session,
                 run=run,
-                manual=manual,
+                manual=manual_hint,
                 error_code="MANUAL_REVIEW_CONTEXT_NOT_FOUND",
             )
         original = await session.scalar(
@@ -384,6 +433,26 @@ async def load_owned_manual_review_context(
             .execution_options(populate_existing=True)
             .with_for_update()
         )
+        product = await session.scalar(
+            select(Product)
+            .where(Product.id == proposal.product_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        manual = await session.scalar(
+            select(ManualReviewRun)
+            .where(ManualReviewRun.id == manual_hint_values[0])
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if manual is None:
+            return await _fail_context(
+                session,
+                run=run,
+                proposal=proposal,
+                original=original,
+                error_code="MANUAL_REVIEW_CONTEXT_NOT_FOUND",
+            )
         revision = await session.scalar(
             select(ProposalRevision)
             .where(ProposalRevision.id == manual.proposal_revision_id)
@@ -400,12 +469,6 @@ async def load_owned_manual_review_context(
             if revision is not None and revision.parent_revision_id is not None
             else None
         )
-        product = await session.scalar(
-            select(Product)
-            .where(Product.id == proposal.product_id)
-            .execution_options(populate_existing=True)
-            .with_for_update()
-        )
         analysis = await session.scalar(
             select(WorkflowRun)
             .where(WorkflowRun.id == proposal.analysis_run_id)
@@ -415,27 +478,6 @@ async def load_owned_manual_review_context(
         candidate = await session.scalar(
             select(AnalysisCandidate)
             .where(AnalysisCandidate.id == proposal.analysis_candidate_id)
-            .execution_options(populate_existing=True)
-            .with_for_update()
-        )
-        store = await session.scalar(
-            select(Store)
-            .where(Store.id == proposal.store_id)
-            .execution_options(populate_existing=True)
-            .with_for_update()
-        )
-        actor = await session.scalar(
-            select(User)
-            .where(User.id == manual.submitted_by)
-            .execution_options(populate_existing=True)
-            .with_for_update()
-        )
-        scope = await session.scalar(
-            select(UserStoreScope)
-            .where(
-                UserStoreScope.user_id == manual.submitted_by,
-                UserStoreScope.store_id == proposal.store_id,
-            )
             .execution_options(populate_existing=True)
             .with_for_update()
         )
@@ -466,7 +508,16 @@ async def load_owned_manual_review_context(
             "store_id": store.id,
         }
         if (
-            manual.proposal_revision_id != revision.id
+            (
+                manual.id,
+                manual.workflow_run_id,
+                manual.proposal_id,
+                manual.proposal_revision_id,
+                manual.submitted_by,
+            )
+            != manual_hint_values
+            or (proposal.id, proposal.store_id) != proposal_hint_values
+            or manual.proposal_revision_id != revision.id
             or proposal.current_revision_id != revision.id
             or proposal.active_manual_review_run_id != manual.id
             or run.created_by != manual.submitted_by
@@ -591,7 +642,6 @@ async def load_owned_manual_review_context(
         if (
             len(citation_ids) != len(set(citation_ids))
             or any(not citation.active or not citation.applicable for citation in citations)
-            or tuple(item.chunk_id for item in output.citations) != citation_ids
             or revision.citations != parent.citations
             or output.price_suggestions != parent_output.price_suggestions
             or output.sku_suggestions != parent_output.sku_suggestions
@@ -615,23 +665,33 @@ async def load_owned_manual_review_context(
                 original=original,
                 error_code="MANUAL_REVIEW_CONTEXT_INCONSISTENT",
             )
-        trusted = TrustedOptimizationInput(
-            store_id=proposal.store_id,
-            product_id=product.id,
-            base_product_version=product.current_version,
-            title=product.title,
-            category=product.category,
-            brand=product.brand,
-            selling_points=list(product.selling_points),
-            description=product.description,
-            search_keywords=list(product.search_keywords),
-            attributes=dict(product.attributes),
-            skus=list(typed_skus),
-            candidate_metrics=metrics,
-            candidate_evidence=list(candidate.evidence),
-            rag_quality="normal",
-            canonical_rule_citations=list(citations),
-        )
+        try:
+            trusted = TrustedOptimizationInput(
+                store_id=proposal.store_id,
+                product_id=product.id,
+                base_product_version=product.current_version,
+                title=product.title,
+                category=product.category,
+                brand=product.brand,
+                selling_points=list(product.selling_points),
+                description=product.description,
+                search_keywords=list(product.search_keywords),
+                attributes=dict(product.attributes),
+                skus=list(typed_skus),
+                candidate_metrics=metrics,
+                candidate_evidence=list(candidate.evidence),
+                rag_quality="normal",
+                canonical_rule_citations=list(citations),
+            )
+        except (TypeError, ValueError, ValidationError):
+            return await _fail_context(
+                session,
+                run=run,
+                manual=manual,
+                proposal=proposal,
+                original=original,
+                error_code="MANUAL_REVIEW_FACT_ERROR",
+            )
         if revision.trusted_fact_hash != _sha256(trusted):
             return await _fail_context(
                 session,
