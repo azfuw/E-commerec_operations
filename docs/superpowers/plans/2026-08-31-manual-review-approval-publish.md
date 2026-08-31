@@ -13,14 +13,15 @@
 ## Global Constraints
 
 - Execute only in `C:\Users\15482\.codex\worktrees\fab9\E-commerce_operations` with `D:\E-commerce_operations_env\python.exe`.
-- Start from commit `9fd526103cf52147ed219a64e4a65acf12142319` on `codex/manual-review-approval-publish`. Do not modify `D:\E-commerce_operations`, merge, push, or remove either worktree.
+- Begin implementation from the current `codex/manual-review-approval-publish` branch. Before Task 1, verify its history contains the approved specification commit `9fd526103cf52147ed219a64e4a65acf12142319` and the latest committed version of this plan; never reset or check out a state that discards the plan. Do not modify `D:\E-commerce_operations`, merge, push, or remove either worktree.
 - Use the existing FastAPI app, SQLAlchemy session factory, JWT/RBAC dependencies, `workflow_leases` predicates, `load_optimization_trusted_input`, `validate_optimization_output`, `ProductComplianceAgentClient`, and LangGraph saver. Add no dependency, service, queue, provider factory, shared Worker base class, validator duplicate, or Compose service.
 - The API process never reads or calls DeepSeek. Ordinary tests use `httpx.MockTransport`; this phase adds no real DeepSeek smoke and never runs the existing smoke with its opt-in enabled.
 - Preserve automatic optimization iteration `0..2`. Agent revisions retain integer `iteration`; manual revisions and their reviews use `iteration=NULL`. `revision_number`, not `iteration`, is the proposal-wide display and parent-chain sequence.
 - Manual input may replace only title, selling points, structured description, keywords, and attribute completions. Citations, price suggestions, and SKU suggestions are inherited and revalidated server-side. Publishing never changes price, SKU code/spec, current stock, inventory snapshots, orders, or traffic.
-- Every POST requires a trimmed `Idempotency-Key` of `1..128` characters. Store only SHA-256 hashes. Exact key/request replay returns the existing result; the same key with a different canonical request returns `409/IDEMPOTENCY_REPLAY_CONFLICT`.
+- Every new POST write endpoint introduced by this phase requires a trimmed `Idempotency-Key` of `1..128` characters. Store only SHA-256 hashes. This requirement does not alter unrelated existing POST endpoints.
+- All new write services use one replay order: validate the key; fresh-load and validate the active actor, enabled Store, exact `UserStoreScope`, target resource visibility, and ownership chain; canonicalize the request and query the immutable result by action/actor/resource/key hash; return it only when the request hash and the first successful write's immutable terminal chain are exact. A different request hash returns `409/IDEMPOTENCY_REPLAY_CONFLICT`. Only when no prior result exists may the service apply first-write state, pointer, version, active-run, review, and eligibility gates. Replay never reruns those pre-write gates: a manual-revision replay may return after current revision/pointer advancement with an active run, submit may replay in `pending_approval` or after a later legal action, reject may replay in `rejected`, request-changes may replay in `pending_manual` after `submitted_revision_id` is cleared, and approve may replay in `completed` after Product version `base+1`.
 - Every security/state/fact query uses fresh database state (`populate_existing=True`), exact actor/store scope, resource ownership, and row locks where the transaction mutates state. No success/replay decision may rely on a stale identity-map object.
-- Immutable rows use insert-only behavior. On a unique-key `IntegrityError`, rollback first, open a fresh transaction, repeat the complete authorization/ownership/version/state guard, then allow only byte-equivalent canonical replay. A still-current owner with a missing or non-exact race result receives the original database error or the specified stable replay conflict; never use upsert/update.
+- Immutable rows use insert-only behavior. On a unique-key `IntegrityError`, rollback first, open a fresh transaction, repeat key validation plus the complete fresh actor/store/scope/resource-ownership guard, then perform the same prior-result lookup and terminal-chain replay contract above. Only a missing prior result re-enters first-write state/version guards. A still-current Worker owner with a missing or non-exact immutable race result receives the original database error or the specified stable replay conflict; never use upsert/update.
 - Checkpoints, logs, responses, business tables, and audit details must not contain Keys, Authorization/Cookie values, full Prompts, raw provider responses, chain-of-thought, exception text, filesystem/model paths, vectors, original idempotency keys, or request/trusted-fact hashes.
 - Every task ends with the exact file whitelist Git gate shown in that task. `git diff --cached --name-only` must match it exactly and `git diff --cached --check` must pass before the task commit.
 
@@ -89,7 +90,7 @@ Constraint and index names are fixed: `uq_proposal_revisions_proposal_revision_n
 
 Stable API codes are exactly `IDEMPOTENCY_KEY_INVALID`, `PROPOSAL_ACTION_FORBIDDEN`, `PROPOSAL_NOT_FOUND`, `IDEMPOTENCY_REPLAY_CONFLICT`, `MANUAL_REVIEW_ACTIVE`, `PROPOSAL_EDIT_FORBIDDEN`, `PROPOSAL_NOT_SUBMITTABLE`, `APPROVAL_STATE_CONFLICT`, `APPROVAL_ACTION_CONFLICT`, `PRODUCT_VERSION_CONFLICT`, `PUBLISH_REPLAY_CONFLICT`, `MANUAL_REVISION_INVALID`, `TRUSTED_EVIDENCE_INVALID`, `APPROVAL_COMMENT_INVALID`, and `PROPOSAL_DATA_INCONSISTENT`, with the HTTP statuses fixed by the approved spec.
 
-Manual Worker fact failures are exactly `MANUAL_REVIEW_CONTEXT_NOT_FOUND`, `MANUAL_REVIEW_CONTEXT_INCONSISTENT`, `MANUAL_REVIEW_AUTHORIZATION_CHANGED`, `PRODUCT_VERSION_CONFLICT`, `MANUAL_REVIEW_FACT_ERROR`, `MANUAL_REVIEW_DATABASE_ERROR`, `MANUAL_REVIEW_CHECKPOINT_ERROR`, and `MANUAL_REVIEW_REPLAY_CONFLICT`. Dependency degradation reuses only the existing DeepSeek/knowledge/compliance safe code closed set named in the spec; arbitrary exceptions never become stored or returned codes.
+Manual Worker fact failures are exactly `MANUAL_REVIEW_CONTEXT_NOT_FOUND`, `MANUAL_REVIEW_CONTEXT_INCONSISTENT`, `MANUAL_REVIEW_AUTHORIZATION_CHANGED`, `PRODUCT_VERSION_CONFLICT`, `MANUAL_REVIEW_FACT_ERROR`, `MANUAL_REVIEW_DATABASE_ERROR`, `MANUAL_REVIEW_CHECKPOINT_ERROR`, and `MANUAL_REVIEW_REPLAY_CONFLICT`. `LEASE_ATTEMPTS_EXHAUSTED` remains the repository's shared safe lease-operations code and is not added to that manual fact-failure closed set. Dependency degradation reuses only the existing DeepSeek/knowledge/compliance safe code closed set named in the spec; arbitrary exceptions never become stored or returned codes.
 
 ---
 
@@ -205,8 +206,8 @@ Expected cached names are exactly the eight paths above.
 # backend/schemas.py
 class ManualRevisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    parent_revision_id: str
-    base_product_version: int
+    parent_revision_id: str = Field(min_length=1, max_length=36)
+    base_product_version: int = Field(ge=1)
     title: str
     selling_points: list[str]
     description: list[DescriptionSection]
@@ -221,7 +222,7 @@ class ManualRevisionAccepted(BaseModel):
     status: Literal["accepted"]
 ```
 
-`ManualRevisionRequest` enforces the approved business caps: title `1..60` with Chinese text; selling points `1..5` of `1..80`; description `1..10` with heading `1..40` and body `1..1000`; keywords `1..20` of `1..32`; attribute completions `0..20`; changes `0..4`, with their field closed set unchanged. It reuses the existing nested types and adds one request-level validator for the narrower heading/body limits. It has no client fields for citations, price suggestions, or SKU suggestions.
+`ManualRevisionRequest` enforces `base_product_version >= 1`, every resource ID as a non-empty string of at most 36 characters, and the approved business caps: title `1..60` with Chinese text; selling points `1..5` of `1..80`; description `1..10` with heading `1..40` and body `1..1000`; keywords `1..20` of `1..32`; attribute completions `0..20`; changes `0..4`, with their field closed set unchanged. It reuses the existing nested types and adds one request-level validator for the narrower heading/body limits. It has no client fields for citations, price suggestions, or SKU suggestions.
 
 ```python
 # backend/manual_reviews.py
@@ -239,7 +240,7 @@ def compose_manual_output(
 
 - [ ] **Step 1: Write failing strict-boundary tests**
 
-Test valid minimum/maximum requests, every length bound, required Chinese title, duplicate targets delegated to the existing validator, and `extra="forbid"`. Prove client `citations`, `price_suggestions`, and `sku_suggestions` produce 422-level Pydantic errors. Assert `compose_manual_output` takes only the five editable groups from the request and copies the parent's output citations, price suggestions, and SKU suggestions byte-equivalently.
+Test valid minimum/maximum requests, `base_product_version` values `0` and `1`, empty and 37-character resource IDs, every content length bound, required Chinese title, duplicate targets delegated to the existing validator, and `extra="forbid"`. Prove client `citations`, `price_suggestions`, and `sku_suggestions` produce 422-level Pydantic errors. Assert `compose_manual_output` takes only the five editable groups from the request and copies the parent's output citations, price suggestions, and SKU suggestions byte-equivalently.
 
 Build a trusted input with current SKU/citation facts and prove the composed `OptimizationProposalOutput` passes Pydantic plus the existing deterministic allowlist when facts match. Parameterize unknown fact paths, forged current values, duplicate targets, missing evidence, unknown citations, unknown SKU, stale price/code/spec, and untrusted new attributes as trust-boundary failures. Keep business-review violations such as restricted copy as deterministic results for the Worker rather than claiming API approval.
 
@@ -340,7 +341,7 @@ async def create_manual_revision(
 
 - [ ] **Step 1: Extend tests with route-level RED cases**
 
-Using the existing JWT/client/session fixtures, test operator, supervisor, and admin success with exact scope; disabled user/store, missing scope, cross-store, wrong resource chain, and unsupported role behavior; admin must not bypass scope. Test missing/blank/129-character key, exact replay (`202` then `200`), same-key/different-body conflict, different active request conflict, and a controlled unique-key race.
+Using the existing JWT/client/session fixtures, test operator, supervisor, and admin success with exact scope; disabled user/store, missing scope, cross-store, wrong resource chain, and unsupported role behavior; admin must not bypass scope. Test empty/37-character path and body resource IDs, `base_product_version=0`, missing/blank/129-character key, exact replay (`202` then `200`), same-key/different-body conflict, different active request conflict, and a controlled unique-key race. After the first success, advance the current revision and leave a different active manual run; the exact original key/request must still return its immutable original revision/workflow result without pointer or state mutation.
 
 For success, assert one new manual revision (`origin=manual`, `iteration=NULL`, next consecutive number, exact parent/creator and SHA-256 of canonical fresh trusted input), one `WorkflowRun(type=manual_review,status=accepted)`, one `ManualReviewRun`, one safe audit event, current/active pointers, and original optimization run `pending_manual/normal/manual_review_pending`. Assert all six mutations commit together. Inject a flush/commit error at each boundary and prove zero partial revision/workflow/manual-run/pointer/audit writes.
 
@@ -357,11 +358,11 @@ Expected: schema/composition tests remain green; route/service tests fail becaus
 
 - [ ] **Step 3: Implement the locked creation path**
 
-Add `POST /proposals/{id}/manual-revision` (bind `id` to the service's `proposal_id`). Validate the key before resource lookup, then in stable lock order refresh actor, Store, exact `UserStoreScope`, proposal, original optimization run, Product, current SKUs, parent revision/review, and canonical citations. Allow only `draft_ready|pending_manual`, reject any active manual pointer, require the request parent/current revision and base version to match, and verify ownership chains.
+Add `POST /proposals/{id}/manual-revision` with `id: Annotated[str, Path(min_length=1, max_length=36)]` bound to the service's `proposal_id`. Follow the global replay order: validate the key; in stable lock order refresh actor, Store, exact `UserStoreScope`, proposal and ownership chain; compute hashes and look up the existing `ManualReviewRun` plus immutable revision/workflow/audit chain. Exact replay returns that original result even when current revision/pointers have advanced or another active run exists. A hash mismatch returns `IDEMPOTENCY_REPLAY_CONFLICT`. Only when no prior result exists may the service lock/refetch the original optimization run, Product, current SKUs, parent revision/review and canonical citations, require `draft_ready|pending_manual`, reject an active manual pointer, and require request parent/current revision plus `base_product_version >= 1` to match current facts.
 
 Parse the immutable parent output, call `compose_manual_output`, inherit canonical citations from the revision, rebuild `TrustedOptimizationInput` from current database facts, and run `validate_optimization_output`. Reject trust-boundary codes as `422/TRUSTED_EVIDENCE_INVALID`; use `422/MANUAL_REVISION_INVALID` for request/output structure. Do not reject reviewable copy violations that the Worker must record.
 
-Canonicalize action, actor, proposal, parent revision, base version, and request body for `request_hash`; hash the original key separately. Insert the six success facts in one transaction. An `IntegrityError` rollback must fresh-reguard the actor/scope/state/version and return only an exact existing `ManualReviewRun`/revision/workflow/audit chain; same key with non-exact hash returns `IDEMPOTENCY_REPLAY_CONFLICT`, and a different active run returns `MANUAL_REVIEW_ACTIVE`.
+Canonicalize action, actor, proposal, parent revision, base version, and request body for `request_hash`; hash the original key separately. Insert the six success facts in one transaction. An `IntegrityError` rollback repeats the global replay order in a fresh transaction: fresh actor/store/scope/resource ownership first, then exact key/request hash and immutable result-chain comparison, without current-pointer/active-run/first-write state gates. Same key with non-exact hash returns `IDEMPOTENCY_REPLAY_CONFLICT`; only a request with no existing result reaches `MANUAL_REVIEW_ACTIVE` or the other first-write guards.
 
 - [ ] **Step 4: Run GREEN and safe-response checks**
 
@@ -459,7 +460,7 @@ async def load_owned_manual_review_context(
 
 - [ ] **Step 1: Write failing lease/context tests**
 
-Test `FOR UPDATE SKIP LOCKED` query shape through the established SQLite-compatible claim behavior: only `manual_review` accepted/expired-processing rows are eligible; analysis and optimization rows with identical status/owner are untouched. Claim increments attempts once, sets server-time lease/current step, writes `manual_review_claimed` audit, and exhausts only an expired attempt-three manual row to failed. Renew and simple updates require type, processing status, owner, and unexpired lease.
+Test `FOR UPDATE SKIP LOCKED` query shape through the established SQLite-compatible claim behavior: only `manual_review` accepted/expired-processing rows are eligible; analysis and optimization rows with identical status/owner are untouched. Claim increments attempts once, sets server-time lease/current step, and writes `manual_review_claimed` audit. For an expired manual-review workflow already at attempt `3`, assert one locked transaction refreshes and locks its `ManualReviewRun`, proposal, original optimization run, and active pointer; sets the manual workflow to `status=failed`, `quality_status=degraded`, `current_step=failed`, `error_code=LEASE_ATTEMPTS_EXHAUSTED` and clears its lease; sets the original optimization run to `status=failed`, `quality_status=degraded`, `current_step=manual_review_failed`, `error_code=LEASE_ATTEMPTS_EXHAUSTED`; clears `active_manual_review_run_id`; and inserts exactly one safe `manual_review_failed` audit carrying that code. Assert zero changes to an otherwise identical analysis/optimization row and no dangling proposal pointer after success or rollback fault injection. Renew and simple updates require type, processing status, owner, and unexpired lease.
 
 Context tests fresh-load active actor and current role, exact scope, enabled Store, manual run/proposal/revision/original run/Product/candidate/SKU ownership, active pointer, `origin=manual`, `iteration=NULL`, parent/number chain, base product version, immutable output, and current canonical citations. Parameterize every broken link and same-session stale cache. Actor/scope/version/fact changes return the exact stable fact code; owner loss returns `lease_lost` and writes nothing.
 
@@ -474,7 +475,7 @@ Expected: new tests fail because the manual claim/context module is absent while
 
 - [ ] **Step 3: Implement the minimal manual-only persistence boundary**
 
-Build claim and renewal from `workflow_lease_expiry`, `owned_workflow_lease`, and `commit_owned_workflow_update`, always passing `WorkflowType.MANUAL_REVIEW`. Do not change `backend/workflow_leases.py` and do not add a generic claim service.
+Build claim and renewal from `workflow_lease_expiry`, `owned_workflow_lease`, and `commit_owned_workflow_update`, always passing `WorkflowType.MANUAL_REVIEW`. Before claiming an eligible row, select each expired attempt-three manual workflow and its manual/proposal/original-run chain with row locks in stable order, validate that the proposal active pointer names that run, then apply the complete two-run failure, pointer clear, lease clear, and one audit insertion in the same transaction. Use the shared safe operations code `LEASE_ATTEMPTS_EXHAUSTED`; do not add it to the manual fact-error closed set. Any lock, chain, audit, or commit error rolls back the whole exhaustion transition. Do not change `backend/workflow_leases.py` and do not add a generic claim service.
 
 The context loader uses locked, `populate_existing=True` queries and returns an immutable dataclass. It must expose the same product/candidate field names consumed by `load_optimization_trusted_input`; pass this structurally compatible context directly later rather than create a second RAG adapter. It never calls RAG or an Agent.
 
@@ -487,7 +488,7 @@ D:\E-commerce_operations_env\python.exe -m compileall backend tests
 git diff --check
 ```
 
-Expected: manual claims are type-isolated and existing analysis/optimization lease behavior is unchanged.
+Expected: manual claims and atomic exhaustion are type-isolated, no exhausted chain leaves an active pointer, and existing analysis/optimization lease behavior is unchanged.
 
 - [ ] **Step 5: Commit the lease/context slice**
 
@@ -788,7 +789,7 @@ Expected cached names are exactly the two paths above.
 # backend/schemas.py
 class ProposalActionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    revision_id: str
+    revision_id: str = Field(min_length=1, max_length=36)
 
 
 class ProposalCommentActionRequest(ProposalActionRequest):
@@ -806,7 +807,7 @@ class ApprovalActionView(BaseModel):
     created_at: datetime
 ```
 
-`comment` is trimmed `1..500` and rejects every Unicode control character. No response exposes idempotency/request hashes.
+Every action request resource ID is non-empty and at most 36 characters. `comment` is trimmed `1..500` and rejects every Unicode control character. No response exposes idempotency/request hashes.
 
 ```python
 # backend/approvals.py
@@ -855,13 +856,13 @@ async def request_proposal_changes(
 
 - [ ] **Step 1: Write failing action/RBAC/idempotency tests**
 
-Test operator/supervisor/admin submit with exact scope; only supervisor/admin reject/request changes; both approval roles may act on their own submitted revision. Admin still requires exact scope. A scoped operator's rejected approval attempt appends one `authorization_denied/denied` audit with empty safe details and no action/state mutation; invisible/cross-scope resources remain 404 without exposing identifiers. Disabled actor/store, cross-store, missing scope, stale revision, inconsistent chains, non-pending state, and changed Product/citation facts use stable safe codes.
+Test operator/supervisor/admin submit with exact scope; only supervisor/admin reject/request changes; both approval roles may act on their own submitted revision. Admin still requires exact scope. Test empty/37-character revision IDs and 37-character proposal path IDs as request-boundary failures. A scoped operator's rejected approval attempt appends one `authorization_denied/denied` audit with empty safe details and no action/state mutation; invisible/cross-scope resources remain 404 without exposing identifiers. Disabled actor/store, cross-store, missing scope, stale revision, inconsistent chains, non-pending state, and changed Product/citation facts use stable safe codes.
 
-Submit must require `draft_ready`, current request revision, no active manual run, `normal+passed+error_code NULL` review, current Product base version, and current citations. It writes one append-only submit action/audit, sets `submitted_revision_id`, and changes the original optimization run to `pending_approval/normal` atomically.
+A first-write submit requires `draft_ready`, current request revision, no active manual run, `normal+passed+error_code NULL` review, current Product base version, and current citations. It writes one append-only submit action/audit, sets `submitted_revision_id`, and changes the original optimization run to `pending_approval/normal` atomically.
 
-Reject/request changes require `pending_approval` and exact submitted revision. Reject writes action/audit and terminal `rejected` without changing Product or clearing immutable history. Request changes writes action/audit, changes the original run to `pending_manual/normal/approval_changes_requested`, and clears `submitted_revision_id`; Product remains unchanged. `pending_approval` remains uneditable by the manual-revision route.
+Reject/request changes require `pending_approval` and exact submitted revision only for a first write. Reject writes action/audit and terminal `rejected`, keeps `submitted_revision_id` pointing to the rejected revision, and leaves Product plus immutable history unchanged. Request changes writes action/audit, changes the original run to `pending_manual/normal/approval_changes_requested`, and alone clears `submitted_revision_id`; Product remains unchanged. `pending_approval` remains uneditable by the manual-revision route.
 
-For all three endpoints, test missing/invalid key, exact replay, same-key/different request, concurrent unique-key race, conflicting action race, commit failure rollback, and response/log hash absence. Assert rejected/requested comments remain only on the action row and never enter audit details.
+For all three endpoints, test missing/invalid key, exact replay, same-key/different request, concurrent unique-key race, conflicting action race, commit failure rollback, and response/log hash absence. Submit exact replay must return the original action while the run is `pending_approval`; reject replay must return it from `rejected` with `submitted_revision_id` preserved; request-changes replay must return it from `pending_manual` after that pointer is cleared. Each replay executes fresh actor/store/scope/ownership checks but not the first-write state/pointer gate and performs zero new action/audit/status writes. Assert rejected/requested comments remain only on the action row and never enter audit details.
 
 - [ ] **Step 2: Run RED**
 
@@ -874,9 +875,9 @@ Expected: manual creation tests stay green; action tests fail because schemas, s
 
 - [ ] **Step 3: Implement the three locked actions**
 
-Add `POST /proposals/{id}/submit`, `POST /approvals/{id}/reject`, and `POST /approvals/{id}/request-changes`. Hash a canonical request containing action, actor, proposal, revision, normalized body, and base version. Lock/refetch actor, Store, scope, proposal, original run, current/submitted revision and review, and Product in one stable order. Recheck citations and SKUs where the action depends on trust. Persist a known-resource role denial in its own safe audit transaction before returning 403; no proposal/action/Product state is changed.
+Add `POST /proposals/{id}/submit`, `POST /approvals/{id}/reject`, and `POST /approvals/{id}/request-changes`, with every `id` path value constrained to `1..36`. Hash a canonical request containing action, actor, proposal, revision, normalized body, and base version. Apply the global order: key validation; fresh actor, Store, exact scope, proposal and resource ownership; existing action lookup by proposal/actor/action/key; exact request/immutable action comparison and action-specific successful terminal-chain validation; only then, when no action exists, lock/refetch original run, current/submitted revision and review, Product and current facts and apply the first-write state gates. Persist a known-resource role denial in its own safe audit transaction before returning 403; no proposal/action/Product state is changed.
 
-Keep exact replay behind the same live authorization and ownership checks. After an insert race, rollback and repeat the whole guard before reading an exact existing `ApprovalAction`. A conflicting action winner returns `409/APPROVAL_ACTION_CONFLICT` with no second action/audit/status write.
+For exact replay, accept the immutable first-success chain in its legal post-state: submit at `pending_approval` or after a later action, reject at `rejected` with the rejected pointer retained, and request changes at `pending_manual` with the pointer cleared. Do not require the pre-write `draft_ready`/`pending_approval` states. After an insert race, rollback and repeat the same replay order in a fresh transaction. A different request hash returns `IDEMPOTENCY_REPLAY_CONFLICT`; a conflicting action winner returns `409/APPROVAL_ACTION_CONFLICT` with no second action/audit/status write.
 
 - [ ] **Step 4: Run GREEN and route regression**
 
@@ -963,7 +964,7 @@ Test supervisor and admin approval including self-approval; operator 403; all ro
 - exactly one approve action, publish record, `proposal_approved` audit, and `simulated_publish_completed` audit exist;
 - original run is `completed/normal/simulated_published` with no error.
 
-Test exact same-key replay, same-key/different request, completed proposal replay under a new key, concurrent approve/approve, approve versus reject/request changes, stale Product version, stale submitted/current pointer, non-passed/degraded review, changed citation/SKU facts, publish unique races, and existing non-exact publish corruption. Inject failures after Product mutation, action flush, publish flush, each audit insert, and final run update; every fault must rollback Product/version/action/publish/audit/status together.
+Test exact same-key replay from the successful `completed/simulated_published` terminal chain with Product already at `base+1`; it must return the original action/publish record after fresh actor/store/scope/resource checks and must not apply the pre-approve `pending_approval` or base-version equality gates. Also test same-key/different request, completed proposal replay under a new key, concurrent approve/approve, approve versus reject/request changes, stale Product version before any publish exists, stale submitted/current pointer, non-passed/degraded review, changed citation/SKU facts, publish unique races, and existing non-exact publish corruption. Inject failures after Product mutation, action flush, publish flush, each audit insert, and final run update; every fault must rollback Product/version/action/publish/audit/status together.
 
 - [ ] **Step 2: Run RED**
 
@@ -976,11 +977,11 @@ Expected: selected tests fail because approve publication is not implemented; su
 
 - [ ] **Step 3: Implement the one locked transaction**
 
-Add `POST /approvals/{proposal_id}/approve`. Lock in stable order: actor, Store/scope, proposal, original run, submitted/current revision, unique review, Product, then current SKUs. Require `pending_approval`, exact revision pointers, no active manual run, `normal+passed+no error`, current base version, and fresh citations/SKU facts.
+Add `POST /approvals/{proposal_id}/approve` with `proposal_id: Annotated[str, Path(min_length=1, max_length=36)]`. Validate the key, then fresh-load actor, Store, exact scope, proposal, and resource ownership. Compute hashes and query the existing approve action/publish record for this key before first-write state checks. An exact result must validate the immutable revision/action/publish/snapshot chain, `completed/simulated_published`, and Product at the recorded `base+1`, then return it without mutation. If this key has no action, query the unique publish record for the same proposal/requested revision; an exact completed chain returns that record under a new key without adding an action. Only when neither prior result exists does the service lock in stable order the original run, submitted/current revision, unique review, Product, and current SKUs and require `pending_approval`, exact revision pointers, no active manual run, `normal+passed+no error`, current base version, and fresh citations/SKU facts.
 
 Create the allowlisted before snapshot, render description deterministically, update only the five Listing groups, merge trusted attributes, increment version once, and create the after snapshot. Insert approve action, unique publish record with a server-derived domain/proposal/revision SHA-256 idempotency hash, and the two safe audits; update the original run last; commit once.
 
-Replay first repeats authorization and exact immutable chain validation. A completed proposal with the same published revision returns the one existing publish record without inserting a new action/audit or incrementing Product. Any non-exact immutable row returns `PUBLISH_REPLAY_CONFLICT`; a conflicting action winner returns `APPROVAL_ACTION_CONFLICT`; stale Product returns `PRODUCT_VERSION_CONFLICT`.
+Same-key replay and post-`IntegrityError` recovery repeat the global fresh authorization/ownership-first lookup order, never the first-write `pending_approval`/base-version gate. A completed proposal with the same published revision returns the one existing publish record without inserting a new action/audit or incrementing Product. A different request hash returns `IDEMPOTENCY_REPLAY_CONFLICT`; any non-exact immutable publish chain returns `PUBLISH_REPLAY_CONFLICT`; a conflicting action winner returns `APPROVAL_ACTION_CONFLICT`; a stale Product before any prior publish exists returns `PRODUCT_VERSION_CONFLICT`.
 
 - [ ] **Step 4: Run GREEN and immutable-fact regression**
 
@@ -1038,6 +1039,7 @@ class ApprovalListView(BaseModel):
     items: list[ApprovalListItem]
     page: int
     page_size: int
+    total: int
 
 class AuditEventView(BaseModel):
     id: str
@@ -1060,6 +1062,7 @@ class AuditEventListView(BaseModel):
     items: list[AuditEventView]
     page: int
     page_size: int
+    total: int
 
 class ManualReviewSummary(BaseModel):
     manual_review_run_id: str
@@ -1099,13 +1102,13 @@ async def list_audit_events(
     page_size: int,
     store_id: str | None,
     proposal_id: str | None,
-    event_type: AuditEventType | None,
+    action: ApprovalActionType | None,
 ) -> tuple[list[AuditEvent], int]
 ```
 
 - [ ] **Step 1: Write failing read/RBAC/security tests**
 
-Test `GET /approvals` for supervisor/admin only, exact scope intersection, pending-only rows, `page>=1`, `page_size=1..100`, and stable `created_at,id` ordering. Test `GET /audit-events` with bounded pagination and optional store/proposal/event filter; no event outside any caller scope may appear. Operator receives 403 for both lists.
+Test `GET /approvals` for supervisor/admin only, exact scope intersection, pending-only rows, `page>=1`, `page_size=1..100`, stable `created_at,id` ordering, and `total` equal to the scoped unpaginated match count. Test `GET /audit-events` with bounded pagination and optional `store_id`, `proposal_id`, and `action: ApprovalActionType` filters; the action filter joins `AuditEvent.approval_action_id` to `ApprovalAction.id` and filters `ApprovalAction.action`, rather than filtering `AuditEvent.event_type`. Its `total` is also the scoped unpaginated count after all filters. Empty/37-character resource filters fail validation, and no event outside any caller scope may appear. Operator receives 403 for both lists.
 
 Extend `GET /proposals/{id}` tests for agent/manual revision metadata, active manual run safe state, submitted revision, latest action, and publish record. Every read refreshes active actor/store/scope and verifies all cross-table ownership links. Parameterize inconsistent pointers/FKs and stale identity map.
 
@@ -1122,9 +1125,9 @@ Expected: existing proposal tests pass where unchanged; new endpoints/fields and
 
 - [ ] **Step 3: Implement scoped bounded reads**
 
-Add `GET /approvals` and `GET /audit-events`; extend only the existing proposal aggregate read. Use database joins and exact scopes rather than post-filtering unauthorized rows. Return stable typed fields, not raw ORM `__dict__`, workflow input/output, revision JSON containers beyond the established safe proposal output, or hashes.
+Add `GET /approvals` and `GET /audit-events`; extend only the existing proposal aggregate read. Constrain optional `store_id`/`proposal_id` query resource IDs to `1..36`, parse optional `action` as `ApprovalActionType`, and implement it through the approval-action relationship. Use database joins and exact scopes rather than post-filtering unauthorized rows. Consume both values returned by each service tuple: map rows to `items` and the integer to response `total`. Return stable typed fields, not raw ORM `__dict__`, workflow input/output, revision JSON containers beyond the established safe proposal output, or hashes.
 
-Keep listing logic in `approvals.py`/`audit_events.py`; routes only validate query bounds, call services, map results, and translate `ApprovalDomainError`/`ProposalDomainError`.
+Keep listing logic in `approvals.py`/`audit_events.py`; routes validate query/resource bounds and action enum, call services, map items plus total, and translate `ApprovalDomainError`/`ProposalDomainError`.
 
 - [ ] **Step 4: Run GREEN**
 
@@ -1167,9 +1170,9 @@ Expected cached names are exactly the seven paths above.
 
 Record exact IDs for users, `(user_id,store_id)` scopes, stores, products, SKUs, inventory rows, analysis/optimization/manual workflows, candidates, proposals, revisions, reviews, calls, documents/versions/chunks, actions, publishes, audits, and checkpoint thread IDs. Before every claim, query for eligible manual-review rows excluding the recorded workflow IDs; skip rather than claim an external row. Cleanup only recorded checkpoint `thread_id` values and delete ORM rows in reverse FK order; never use a broad prefix delete.
 
-The body must prove real `FOR UPDATE SKIP LOCKED` claim exclusion, attempt cap, expired reclaim, same thread resume after review commit/checkpoint write cancellation, exact immutable review/call/audit replay, non-exact race behavior, checkpoint get/put failure with owner replacement, old-owner zero writes at context/review/final/fail boundaries, and only manual workflow claimability.
+The body must prove real `FOR UPDATE SKIP LOCKED` claim exclusion, attempt cap, expired reclaim, same thread resume after review commit/checkpoint write cancellation, exact immutable review/call/audit replay, non-exact race behavior, checkpoint get/put failure with owner replacement, old-owner zero writes at context/review/final/fail boundaries, and only manual workflow claimability. For an owned expired attempt-three manual workflow, assert the single locked exhaustion transaction sets both manual and original optimization workflows to failed/degraded with shared `LEASE_ATTEMPTS_EXHAUSTED`, clears the exact active pointer and lease, and inserts one `manual_review_failed` audit; inject a database failure and assert the complete chain remains unchanged, while owned analysis/optimization control rows are untouched.
 
-Add real transaction races for one active manual run per proposal, exact/same-key-different-body manual revision creation, submit, concurrent approve/approve, approve versus reject/request changes, Product version conflict, and fault-injected approve rollback. Assert one version increment/publish and invariant price/SKU/stock/inventory facts.
+Add real transaction races for one active manual run per proposal, exact/same-key-different-body manual revision creation, submit, concurrent approve/approve, approve versus reject/request changes, Product version conflict, and fault-injected approve rollback. Explicitly replay manual creation after pointer advancement/another active run, submit from `pending_approval`, reject from `rejected` with submitted pointer retained, request changes from `pending_manual` with it cleared, and approve from `completed` with Product at `base+1`; each must fresh-reguard actor/store/scope/ownership, return its original immutable result, and write nothing. Assert one version increment/publish and invariant price/SKU/stock/inventory facts.
 
 For the migration proof, use a transaction-scoped unique PostgreSQL schema and the migration's narrow backfill/guard helpers: seed the relevant `0004` row shape, assert number/origin/creator/parent backfill, assert malformed history aborts, and assert downgrade refusal once each stage-five fact class is present. Drop only that recorded schema in `finally`; do not alter the project schema's migration version during pytest.
 
@@ -1243,7 +1246,7 @@ Expected: pytest exits non-zero only because `tests/test_manual_review_flow.py` 
 2. Start from `draft_ready`, submit, request changes, assert no Product change, create a second manual revision with a new workflow/thread ID, pass review, resubmit, approve, and assert the first workflow/history remains immutable.
 3. Submit then reject, assert terminal `rejected`, no Product/version change, no publish record, immutable suggestions retained, and one safe rejection action/audit.
 
-Each POST also exercises exact idempotent replay and same-key/different-request conflict. Each flow proves the manual Worker makes zero optimization Agent calls, compliance PRIMARY once, SCHEMA_REPAIR only in the dedicated schema-invalid subcase, and no response/checkpoint/audit leakage.
+Each new stage-five POST write endpoint also exercises exact idempotent replay and same-key/different-request conflict, including the approved post-success states rather than pre-write state gates. Each flow proves the manual Worker makes zero optimization Agent calls, compliance PRIMARY once, SCHEMA_REPAIR only in the dedicated schema-invalid subcase, and no response/checkpoint/audit leakage.
 
 - [ ] **Step 3: Run the integrated public flow GREEN**
 
@@ -1296,7 +1299,7 @@ Expected cached names contain only `tests/test_manual_review_flow.py`.
 - [ ] The independent Worker claims only `manual_review`, uses six nodes and one thread per workflow, calls no optimization Agent, and safely resumes after lease/checkpoint cancellation.
 - [ ] Deterministic and semantic tracks both pass before `draft_ready`; valid non-pass/degrade stays `pending_manual`; fatal facts fail atomically.
 - [ ] Operator can edit/submit but cannot approve; supervisor/admin can edit, submit, and self-approve/reject/request changes with exact store scope.
-- [ ] Every POST has exact replay and same-key/different-request protection; no key/hash appears in a response, log, checkpoint, or audit detail.
+- [ ] Every new POST write endpoint in this phase has exact replay and same-key/different-request protection; no key/hash appears in a response, log, checkpoint, or audit detail.
 - [ ] Approval publishes once in one transaction, Product version increments once, and price/SKU/stock/inventory remain unchanged.
 - [ ] Reject is terminal without Product mutation; request changes returns to a fresh independent manual-review flow.
 - [ ] Approval, publish, and audit rows are append-only; audit details use the exact safe allowlist.
