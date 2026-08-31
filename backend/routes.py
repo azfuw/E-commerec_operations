@@ -3,7 +3,7 @@ from time import perf_counter
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Path, Query, Response, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +36,10 @@ from backend.knowledge_search import (
     get_knowledge_search_loader,
     search_active_knowledge,
 )
+from backend.manual_reviews import (
+    ManualReviewDomainError,
+    create_manual_revision,
+)
 from backend.models import (
     KnowledgeDocument,
     KnowledgeDocumentVersion,
@@ -59,6 +63,8 @@ from backend.schemas import (
     KnowledgeEnvelope,
     KnowledgeSearchRequest,
     LoginRequest,
+    ManualRevisionAccepted,
+    ManualRevisionRequest,
     OptimizationWorkflowSummary,
     ProductSelectionRequest,
     ProductSelectionView,
@@ -351,6 +357,42 @@ async def read_proposal_route(
             citations=review.citations,
             error_code=review.error_code,
         ),
+    )
+
+
+@router.post(
+    "/proposals/{id}/manual-revision",
+    response_model=ManualRevisionAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_manual_revision_route(
+    response: Response,
+    id: Annotated[str, Path(min_length=1, max_length=36)],
+    request: ManualRevisionRequest,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ManualRevisionAccepted:
+    try:
+        result = await create_manual_revision(
+            session,
+            actor_id=user.id,
+            proposal_id=id,
+            request=request,
+            idempotency_key=idempotency_key,
+            request_id=_request_id(),
+        )
+    except ManualReviewDomainError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code},
+        ) from None
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return ManualRevisionAccepted(
+        revision_id=result.revision_id,
+        manual_review_workflow_run_id=result.workflow_run_id,
+        status="accepted",
     )
 
 
