@@ -213,6 +213,40 @@ class OptimizationProposalOutput(BaseModel):
     sku_suggestions: list[SkuSuggestion] = Field(max_length=50)
 
 
+class ManualRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    parent_revision_id: str = Field(min_length=1, max_length=36)
+    base_product_version: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=60)
+    selling_points: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(
+        min_length=1, max_length=5
+    )
+    description: list[DescriptionSection] = Field(min_length=1, max_length=10)
+    keywords: list[Annotated[str, Field(min_length=1, max_length=32)]] = Field(
+        min_length=1, max_length=20
+    )
+    attribute_completions: list[AttributeCompletion] = Field(max_length=20)
+    changes: list[OptimizationChange] = Field(max_length=4)
+
+    @model_validator(mode="after")
+    def validate_manual_content(self) -> "ManualRevisionRequest":
+        if not any("\u4e00" <= character <= "\u9fff" for character in self.title):
+            raise ValueError("title must contain Chinese text")
+        if any(
+            not 1 <= len(section.heading) <= 40 or not 1 <= len(section.body) <= 1000
+            for section in self.description
+        ):
+            raise ValueError("description section exceeds manual revision limits")
+        return self
+
+
+class ManualRevisionAccepted(BaseModel):
+    revision_id: str
+    manual_review_workflow_run_id: str
+    status: Literal["accepted"]
+
+
 class ValidatedRequiredChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
