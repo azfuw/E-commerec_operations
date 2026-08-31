@@ -5,11 +5,12 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 import backend.manual_review_runs as manual
 from backend.audit_events import add_audit_event
 from backend.common import (
+    AgentCallType,
     AuditEventType,
     AuditOutcome,
     ComplianceRiskLevel,
@@ -21,7 +22,13 @@ from backend.common import (
     WorkflowStatus,
     WorkflowType,
 )
+from backend.compliance_agent import (
+    ComplianceAgentCallRecord,
+    ComplianceAgentResponse,
+    ComplianceSemanticViolation,
+)
 from backend.models import (
+    AgentCall,
     AnalysisCandidate,
     AuditEvent,
     ComplianceReview,
@@ -38,6 +45,11 @@ from backend.models import (
     UserStoreScope,
     WorkflowRun,
 )
+from backend.optimization_validation import (
+    DeterministicComplianceResult,
+    DeterministicViolation,
+    validate_optimization_output,
+)
 from backend.schemas import (
     CanonicalRuleCitation,
     DescriptionSection,
@@ -49,6 +61,7 @@ from backend.schemas import (
     ProductMetrics,
     SkuSuggestion,
     TrustedOptimizationInput,
+    ValidatedRequiredChange,
 )
 
 
@@ -183,6 +196,115 @@ def _trusted_hash() -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _manual_calls(
+    *, include_repair: bool = False, error_code: str | None = None
+) -> list[ComplianceAgentCallRecord]:
+    calls = [
+        ComplianceAgentCallRecord(
+            node_name="call_product_compliance_agent",
+            call_type=AgentCallType.PRIMARY,
+            iteration=0,
+            attempt=1,
+            model="deepseek-v4-flash",
+            prompt_version="product-compliance-v1",
+            status="success" if error_code is None else "failed",
+            input_hash="4" * 64,
+            prompt_tokens=3,
+            completion_tokens=5,
+            total_tokens=8,
+            duration_ms=10,
+            estimated_cost=Decimal("0.000001"),
+            error_code=error_code,
+        )
+    ]
+    if include_repair:
+        calls.append(
+            ComplianceAgentCallRecord(
+                node_name="repair_product_compliance_schema",
+                call_type=AgentCallType.SCHEMA_REPAIR,
+                iteration=0,
+                attempt=1,
+                model="deepseek-v4-flash",
+                prompt_version="product-compliance-v1",
+                status="success",
+                input_hash="5" * 64,
+                prompt_tokens=4,
+                completion_tokens=6,
+                total_tokens=10,
+                duration_ms=12,
+                estimated_cost=Decimal("0.000002"),
+                error_code=None,
+            )
+        )
+    return calls
+
+
+def _passing_response() -> ComplianceAgentResponse:
+    return ComplianceAgentResponse(
+        passed=True,
+        risk_level=ComplianceRiskLevel.LOW,
+        violations=[],
+        required_changes=[],
+        citations=[OutputCitation(chunk_id="chunk-1")],
+        confidence=Decimal("0.9"),
+        degraded=False,
+    )
+
+
+def _semantic_nonpass_response() -> ComplianceAgentResponse:
+    change = ValidatedRequiredChange(
+        source_track="semantic",
+        source_violation_code="EXAGGERATION",
+        field="title",
+        instruction="删除夸大用语",
+        citation_chunk_ids=["chunk-1"],
+    )
+    return ComplianceAgentResponse(
+        passed=False,
+        risk_level=ComplianceRiskLevel.MEDIUM,
+        violations=[
+            ComplianceSemanticViolation(
+                code="EXAGGERATION",
+                field="title",
+                message_zh="标题存在夸大表达",
+                citation_chunk_ids=["chunk-1"],
+            )
+        ],
+        required_changes=[change],
+        citations=[OutputCitation(chunk_id="chunk-1")],
+        confidence=Decimal("0.8"),
+        degraded=False,
+    )
+
+
+async def _restricted_manual_output(
+    session,
+) -> tuple[TrustedOptimizationInput, DeterministicComplianceResult]:
+    output = _proposal_output()
+    title = "人工修订标题保证"
+    output = output.model_copy(
+        update={
+            "title": title,
+            "changes": [
+                change.model_copy(update={"suggested_value": title})
+                if change.field == "title"
+                else change
+                for change in output.changes
+            ],
+        }
+    )
+    revision = await session.get(ProposalRevision, "revision-2")
+    assert revision is not None
+    revision.proposal_output = output.model_dump(mode="json")
+    await session.commit()
+    trusted = _trusted_seed()
+    deterministic = validate_optimization_output(trusted, output)
+    assert [(item.code, item.field) for item in deterministic.violations] == [
+        ("RESTRICTED_PHRASE", "title")
+    ]
+    return trusted, deterministic
 
 
 async def _seed_manual_chain(
@@ -1212,3 +1334,904 @@ async def test_context_database_error_is_stable_and_rolls_back(session, monkeypa
         None,
         "MANUAL_REVIEW_DATABASE_ERROR",
     )
+
+
+async def test_manual_review_pass_is_insert_only_and_exactly_replays_one_safe_call(
+    session,
+) -> None:
+    await _seed_manual_chain(session)
+    trusted = _trusted_seed()
+    deterministic = validate_optimization_output(trusted, _proposal_output())
+    response = _passing_response()
+    calls = _manual_calls()
+
+    created = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=response,
+        calls=calls,
+        error_code=None,
+    )
+    replayed = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=response,
+        calls=calls,
+        error_code=None,
+    )
+
+    assert (created.disposition, created.passed, created.quality_status) == (
+        "created",
+        True,
+        WorkflowQuality.NORMAL,
+    )
+    assert replayed == type(replayed)(
+        "replayed",
+        created.review_id,
+        True,
+        WorkflowQuality.NORMAL,
+        None,
+    )
+    reviews = list(await session.scalars(select(ComplianceReview)))
+    stored_calls = list(await session.scalars(select(AgentCall)))
+    assert len(reviews) == 2
+    review = next(item for item in reviews if item.iteration is None)
+    assert (
+        review.id,
+        review.proposal_id,
+        review.proposal_revision_id,
+        review.iteration,
+        review.passed,
+        review.risk_level,
+        review.quality_status,
+        review.error_code,
+        review.required_changes,
+        review.citations,
+    ) == (
+        created.review_id,
+        "proposal-1",
+        "revision-2",
+        None,
+        True,
+        ComplianceRiskLevel.LOW,
+        WorkflowQuality.NORMAL,
+        None,
+        [],
+        [_citation().model_dump(mode="json")],
+    )
+    assert review.semantic_review == response.model_dump(mode="json")
+    assert len(stored_calls) == 1
+    call = stored_calls[0]
+    expected = calls[0]
+    assert (
+        call.workflow_run_id,
+        call.node_name,
+        call.call_type,
+        call.iteration,
+        call.attempt,
+        call.model,
+        call.prompt_version,
+        call.status,
+        call.input_hash,
+        call.prompt_tokens,
+        call.completion_tokens,
+        call.total_tokens,
+        call.duration_ms,
+        call.estimated_cost,
+        call.error_code,
+    ) == (
+        "manual-workflow-1",
+        expected.node_name,
+        expected.call_type,
+        0,
+        expected.attempt,
+        expected.model,
+        expected.prompt_version,
+        expected.status,
+        expected.input_hash,
+        expected.prompt_tokens,
+        expected.completion_tokens,
+        expected.total_tokens,
+        expected.duration_ms,
+        expected.estimated_cost,
+        expected.error_code,
+    )
+
+
+async def test_manual_review_nonpass_stores_exact_two_track_required_changes_and_two_calls(
+    session,
+) -> None:
+    await _seed_manual_chain(session)
+    trusted, deterministic = await _restricted_manual_output(session)
+    response = _semantic_nonpass_response()
+
+    result = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=response,
+        calls=_manual_calls(include_repair=True),
+        error_code=None,
+    )
+
+    assert (result.disposition, result.passed, result.quality_status) == (
+        "created",
+        False,
+        WorkflowQuality.NORMAL,
+    )
+    review = await session.get(ComplianceReview, str(result.review_id))
+    assert review is not None
+    changes = [ValidatedRequiredChange.model_validate(item) for item in review.required_changes]
+    assert [(item.source_track, item.source_violation_code, item.field) for item in changes] == [
+        ("deterministic", "RESTRICTED_PHRASE", "title"),
+        ("semantic", "EXAGGERATION", "title"),
+    ]
+    assert review.semantic_review == response.model_dump(mode="json")
+    assert (review.passed, review.quality_status, review.error_code) == (
+        False,
+        WorkflowQuality.NORMAL,
+        None,
+    )
+    calls = list(
+        await session.scalars(
+            select(AgentCall)
+            .where(AgentCall.workflow_run_id == "manual-workflow-1")
+            .order_by(AgentCall.node_name)
+        )
+    )
+    assert [(item.node_name, item.call_type, item.iteration, item.attempt) for item in calls] == [
+        ("call_product_compliance_agent", AgentCallType.PRIMARY, 0, 1),
+        ("repair_product_compliance_schema", AgentCallType.SCHEMA_REPAIR, 0, 1),
+    ]
+
+
+async def test_manual_review_dependency_failure_is_fixed_degraded_review(session) -> None:
+    await _seed_manual_chain(session)
+    trusted = _trusted_seed()
+
+    result = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=validate_optimization_output(trusted, _proposal_output()),
+        response=None,
+        calls=_manual_calls(error_code="DEEPSEEK_TIMEOUT"),
+        error_code="DEEPSEEK_TIMEOUT",
+    )
+
+    assert (result.disposition, result.passed, result.quality_status, result.error_code) == (
+        "created",
+        False,
+        WorkflowQuality.DEGRADED,
+        "DEEPSEEK_TIMEOUT",
+    )
+    review = await session.get(ComplianceReview, str(result.review_id))
+    assert review is not None
+    assert (
+        review.semantic_review,
+        review.passed,
+        review.risk_level,
+        review.quality_status,
+        review.error_code,
+    ) == (
+        {"status": "unavailable", "error_code": "DEEPSEEK_TIMEOUT"},
+        False,
+        ComplianceRiskLevel.HIGH,
+        WorkflowQuality.DEGRADED,
+        "DEEPSEEK_TIMEOUT",
+    )
+
+
+@pytest.mark.parametrize(
+    ("changed_fact", "expected_disposition", "expected_code"),
+    [
+        ("owner", "lease_lost", None),
+        ("version", "failed", "PRODUCT_VERSION_CONFLICT"),
+        ("citation", "failed", "MANUAL_REVIEW_FACT_ERROR"),
+        ("actor", "failed", "MANUAL_REVIEW_AUTHORIZATION_CHANGED"),
+        ("scope", "failed", "MANUAL_REVIEW_AUTHORIZATION_CHANGED"),
+        ("pointer", "failed", "MANUAL_REVIEW_CONTEXT_INCONSISTENT"),
+    ],
+)
+async def test_manual_review_persistence_rechecks_owner_and_fresh_database_facts(
+    session, changed_fact: str, expected_disposition: str, expected_code: str | None
+) -> None:
+    await _seed_manual_chain(session)
+    if changed_fact == "owner":
+        statement = update(WorkflowRun).where(
+            WorkflowRun.id == "manual-workflow-1"
+        ).values(lease_owner="worker-b")
+    elif changed_fact == "version":
+        statement = update(Product).where(Product.id == "product-1").values(
+            current_version=8
+        )
+    elif changed_fact == "citation":
+        statement = update(KnowledgeDocument).where(
+            KnowledgeDocument.id == "document-1"
+        ).values(enabled=False)
+    elif changed_fact == "actor":
+        statement = update(User).where(User.id == "operator-1").values(
+            status=UserStatus.DISABLED
+        )
+    elif changed_fact == "scope":
+        statement = delete(UserStoreScope).where(
+            UserStoreScope.user_id == "operator-1",
+            UserStoreScope.store_id == "store-1",
+        )
+    else:
+        statement = update(ProductProposal).where(
+            ProductProposal.id == "proposal-1"
+        ).values(active_manual_review_run_id=None)
+    await session.execute(statement.execution_options(synchronize_session=False))
+    await session.commit()
+    trusted = _trusted_seed()
+
+    result = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=validate_optimization_output(trusted, _proposal_output()),
+        response=_passing_response(),
+        calls=_manual_calls(),
+        error_code=None,
+    )
+
+    assert (result.disposition, result.error_code) == (
+        expected_disposition,
+        expected_code,
+    )
+    assert int(
+        await session.scalar(
+            select(func.count())
+            .select_from(ComplianceReview)
+            .where(ComplianceReview.iteration.is_(None))
+        )
+        or 0
+    ) == 0
+    assert int(
+        await session.scalar(
+            select(func.count())
+            .select_from(AgentCall)
+            .where(AgentCall.workflow_run_id == "manual-workflow-1")
+        )
+        or 0
+    ) == 0
+    failed_audits = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_FAILED)
+        )
+        or 0
+    )
+    assert failed_audits == (0 if changed_fact == "owner" else 1)
+
+
+@pytest.mark.parametrize("damage", ["malformed_review", "different_revision", "call"])
+async def test_manual_review_nonexact_or_malformed_replay_fails_closed(
+    session, damage: str
+) -> None:
+    await _seed_manual_chain(session)
+    trusted = _trusted_seed()
+    deterministic = validate_optimization_output(trusted, _proposal_output())
+    response = _passing_response()
+    calls = _manual_calls()
+    created = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=response,
+        calls=calls,
+        error_code=None,
+    )
+    if damage == "malformed_review":
+        statement = update(ComplianceReview).where(
+            ComplianceReview.id == created.review_id
+        ).values(required_changes=[{"source_track": "semantic"}])
+    elif damage == "different_revision":
+        await session.execute(delete(ComplianceReview).where(ComplianceReview.id == "review-1"))
+        statement = update(ComplianceReview).where(
+            ComplianceReview.id == created.review_id
+        ).values(proposal_revision_id="revision-1")
+    else:
+        statement = update(AgentCall).where(
+            AgentCall.workflow_run_id == "manual-workflow-1"
+        ).values(model="different-model")
+    await session.execute(statement.execution_options(synchronize_session=False))
+    await session.commit()
+
+    result = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=response,
+        calls=calls,
+        error_code=None,
+    )
+
+    assert (result.disposition, result.error_code) == (
+        "failed",
+        "MANUAL_REVIEW_REPLAY_CONFLICT",
+    )
+    proposal = await session.get(ProductProposal, "proposal-1", populate_existing=True)
+    assert proposal is not None and proposal.active_manual_review_run_id is None
+    assert int(
+        await session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_FAILED)
+        )
+        or 0
+    ) == 1
+
+
+async def test_manual_review_existing_review_for_different_proposal_fails_context(
+    session,
+) -> None:
+    await _seed_manual_chain(session)
+    trusted = _trusted_seed()
+    deterministic = validate_optimization_output(trusted, _proposal_output())
+    response = _passing_response()
+    created = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=response,
+        calls=_manual_calls(),
+        error_code=None,
+    )
+    analysis = WorkflowRun(
+        id="analysis-2",
+        workflow_type=WorkflowType.ANALYSIS,
+        store_id="store-2",
+        created_by="operator-1",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 2),
+        status=WorkflowStatus.COMPLETED,
+        quality_status=WorkflowQuality.NORMAL,
+        current_step="product_selected",
+    )
+    optimization = WorkflowRun(
+        id="optimization-2",
+        workflow_type=WorkflowType.OPTIMIZATION,
+        store_id="store-2",
+        created_by="operator-1",
+        status=WorkflowStatus.PENDING_MANUAL,
+        quality_status=WorkflowQuality.NORMAL,
+        input={
+            "proposal_id": "proposal-2",
+            "product_id": "product-2",
+            "store_id": "store-2",
+        },
+    )
+    session.add_all([analysis, optimization])
+    await session.flush()
+    candidate = AnalysisCandidate(
+        id="candidate-2",
+        workflow_run_id=analysis.id,
+        product_id="product-2",
+        rank=1,
+        product_code="OTHER-001",
+        anomaly_types=["low_conversion"],
+        metrics=_metrics()
+        .model_copy(update={"product_id": "product-2", "product_code": "OTHER-001"})
+        .model_dump(mode="json"),
+        business_impact=Decimal("1.00"),
+        evidence=["orders=1"],
+        impact_explanation="影响说明",
+        reason="原因",
+        recommended_action="建议",
+        confidence=Decimal("0.8000"),
+    )
+    session.add(candidate)
+    await session.flush()
+    session.add(
+        ProductProposal(
+            id="proposal-2",
+            analysis_run_id=analysis.id,
+            analysis_candidate_id=candidate.id,
+            optimization_run_id=optimization.id,
+            store_id="store-2",
+            product_id="product-2",
+            base_product_version=1,
+            selection_idempotency_hash="6" * 64,
+        )
+    )
+    await session.flush()
+    await session.execute(
+        update(ComplianceReview)
+        .where(ComplianceReview.id == created.review_id)
+        .values(proposal_id="proposal-2")
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+
+    result = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=response,
+        calls=_manual_calls(),
+        error_code=None,
+    )
+
+    assert (result.disposition, result.error_code) == (
+        "failed",
+        "MANUAL_REVIEW_CONTEXT_INCONSISTENT",
+    )
+
+
+async def test_manual_review_integrity_retry_replays_exact_review_and_two_calls(
+    session, monkeypatch
+) -> None:
+    await _seed_manual_chain(session)
+    trusted = _trusted_seed()
+    deterministic = validate_optimization_output(trusted, _proposal_output())
+    response = _passing_response()
+    calls = _manual_calls(include_repair=True)
+    real_flush = session.flush
+    injected = False
+
+    async def race_flush(*args, **kwargs) -> None:
+        nonlocal injected
+        if injected:
+            await real_flush(*args, **kwargs)
+            return
+        injected = True
+        review = next(row for row in session.new if isinstance(row, ComplianceReview))
+        rows = [row for row in session.new if isinstance(row, AgentCall)]
+        await session.rollback()
+        session.add_all([review, *rows])
+        await session.commit()
+        raise IntegrityError("insert", {}, RuntimeError("simulated exact race"))
+
+    monkeypatch.setattr(session, "flush", race_flush)
+
+    result = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=response,
+        calls=calls,
+        error_code=None,
+    )
+
+    assert result.disposition == "replayed"
+    assert int(
+        await session.scalar(
+            select(func.count())
+            .select_from(ComplianceReview)
+            .where(ComplianceReview.iteration.is_(None))
+        )
+        or 0
+    ) == 1
+    assert int(
+        await session.scalar(
+            select(func.count())
+            .select_from(AgentCall)
+            .where(AgentCall.workflow_run_id == "manual-workflow-1")
+        )
+        or 0
+    ) == 2
+
+
+async def test_manual_review_integrity_retry_rechecks_owner_after_rollback(
+    session, monkeypatch
+) -> None:
+    await _seed_manual_chain(session)
+    trusted = _trusted_seed()
+    real_flush = session.flush
+    injected = False
+
+    async def race_flush(*args, **kwargs) -> None:
+        nonlocal injected
+        if injected:
+            await real_flush(*args, **kwargs)
+            return
+        injected = True
+        await session.rollback()
+        await session.execute(
+            update(WorkflowRun)
+            .where(WorkflowRun.id == "manual-workflow-1")
+            .values(lease_owner="worker-b")
+        )
+        await session.commit()
+        raise IntegrityError("insert", {}, RuntimeError("simulated owner race"))
+
+    monkeypatch.setattr(session, "flush", race_flush)
+    result = await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=validate_optimization_output(trusted, _proposal_output()),
+        response=_passing_response(),
+        calls=_manual_calls(),
+        error_code=None,
+    )
+
+    assert result.disposition == "lease_lost"
+    assert await session.scalar(
+        select(ComplianceReview.id).where(ComplianceReview.iteration.is_(None))
+    ) is None
+    assert await session.scalar(
+        select(AgentCall.id).where(AgentCall.workflow_run_id == "manual-workflow-1")
+    ) is None
+
+
+@pytest.mark.parametrize("winner", ["missing", "nonexact"])
+async def test_manual_review_integrity_retry_propagates_nonexact_or_missing_winner(
+    session, monkeypatch, winner: str
+) -> None:
+    await _seed_manual_chain(session)
+    trusted = _trusted_seed()
+    real_flush = session.flush
+    injected = False
+
+    async def race_flush(*args, **kwargs) -> None:
+        nonlocal injected
+        if injected:
+            await real_flush(*args, **kwargs)
+            return
+        injected = True
+        review = next(row for row in session.new if isinstance(row, ComplianceReview))
+        rows = [row for row in session.new if isinstance(row, AgentCall)]
+        await session.rollback()
+        if winner == "nonexact":
+            rows[0].model = "different-model"
+            session.add_all([review, *rows])
+            await session.commit()
+        raise IntegrityError("insert", {}, RuntimeError("simulated missing winner"))
+
+    monkeypatch.setattr(session, "flush", race_flush)
+    with pytest.raises(IntegrityError, match="simulated missing winner"):
+        await manual.persist_manual_compliance_review(
+            session,
+            workflow_run_id="manual-workflow-1",
+            lease_owner="worker-a",
+            trusted=trusted,
+            deterministic=validate_optimization_output(trusted, _proposal_output()),
+            response=_passing_response(),
+            calls=_manual_calls(),
+            error_code=None,
+        )
+
+    expected = 0 if winner == "missing" else 1
+    assert int(
+        await session.scalar(
+            select(func.count())
+            .select_from(ComplianceReview)
+            .where(ComplianceReview.iteration.is_(None))
+        )
+        or 0
+    ) == expected
+    assert int(
+        await session.scalar(
+            select(func.count())
+            .select_from(AgentCall)
+            .where(AgentCall.workflow_run_id == "manual-workflow-1")
+        )
+        or 0
+    ) == expected
+
+
+async def _persist_manual_terminal_case(session, case: str):
+    await _seed_manual_chain(session)
+    if case == "nonpass":
+        trusted, deterministic = await _restricted_manual_output(session)
+        response = _semantic_nonpass_response()
+        calls = _manual_calls(include_repair=True)
+        error_code = None
+    else:
+        trusted = _trusted_seed()
+        deterministic = validate_optimization_output(trusted, _proposal_output())
+        response = _passing_response() if case == "pass" else None
+        error_code = None if case == "pass" else "DEEPSEEK_TIMEOUT"
+        calls = _manual_calls(error_code=error_code)
+    return await manual.persist_manual_compliance_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        trusted=trusted,
+        deterministic=deterministic,
+        response=response,
+        calls=calls,
+        error_code=error_code,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "case",
+        "expected_disposition",
+        "manual_quality",
+        "original_status",
+        "original_quality",
+        "original_step",
+        "expected_error",
+    ),
+    [
+        (
+            "pass",
+            "draft_ready",
+            WorkflowQuality.NORMAL,
+            WorkflowStatus.DRAFT_READY,
+            WorkflowQuality.NORMAL,
+            "manual_review_passed",
+            None,
+        ),
+        (
+            "nonpass",
+            "pending_manual",
+            WorkflowQuality.NORMAL,
+            WorkflowStatus.PENDING_MANUAL,
+            WorkflowQuality.NORMAL,
+            "manual_review_changes_required",
+            None,
+        ),
+        (
+            "degraded",
+            "pending_manual",
+            WorkflowQuality.DEGRADED,
+            WorkflowStatus.PENDING_MANUAL,
+            WorkflowQuality.DEGRADED,
+            "manual_review_degraded",
+            "DEEPSEEK_TIMEOUT",
+        ),
+    ],
+)
+async def test_finalize_manual_review_derives_atomic_terminal_state_from_stored_review(
+    session,
+    case: str,
+    expected_disposition: str,
+    manual_quality: WorkflowQuality,
+    original_status: WorkflowStatus,
+    original_quality: WorkflowQuality,
+    original_step: str,
+    expected_error: str | None,
+) -> None:
+    persisted = await _persist_manual_terminal_case(session, case)
+    assert persisted.disposition == "created"
+
+    result = await manual.finalize_manual_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+    )
+
+    assert (result.disposition, result.error_code) == (
+        expected_disposition,
+        expected_error,
+    )
+    manual_workflow = await session.get(
+        WorkflowRun, "manual-workflow-1", populate_existing=True
+    )
+    original = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    proposal = await session.get(ProductProposal, "proposal-1", populate_existing=True)
+    assert manual_workflow is not None and original is not None and proposal is not None
+    assert (
+        manual_workflow.status,
+        manual_workflow.quality_status,
+        manual_workflow.current_step,
+        manual_workflow.error_code,
+        manual_workflow.lease_owner,
+        manual_workflow.lease_expires_at,
+    ) == (
+        WorkflowStatus.COMPLETED,
+        manual_quality,
+        "completed",
+        expected_error,
+        None,
+        None,
+    )
+    assert (
+        original.status,
+        original.quality_status,
+        original.current_step,
+        original.error_code,
+    ) == (
+        original_status,
+        original_quality,
+        original_step,
+        expected_error,
+    )
+    assert proposal.active_manual_review_run_id is None
+    audits = list(
+        await session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_COMPLETED
+            )
+        )
+    )
+    assert len(audits) == 1
+    assert (audits[0].outcome, audits[0].error_code) == (
+        AuditOutcome.SUCCESS,
+        expected_error,
+    )
+    assert audits[0].details == {
+        "from_status": WorkflowStatus.PROCESSING.value,
+        "to_status": WorkflowStatus.COMPLETED.value,
+        "workflow_type": WorkflowType.MANUAL_REVIEW.value,
+        "quality_status": manual_quality.value,
+        "current_step": "completed",
+        "review_passed": case == "pass",
+        "risk_level": (
+            ComplianceRiskLevel.LOW.value
+            if case == "pass"
+            else ComplianceRiskLevel.MEDIUM.value
+            if case == "nonpass"
+            else ComplianceRiskLevel.HIGH.value
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "MANUAL_REVIEW_FACT_ERROR",
+        "MANUAL_REVIEW_DATABASE_ERROR",
+        "MANUAL_REVIEW_CHECKPOINT_ERROR",
+        "MANUAL_REVIEW_REPLAY_CONFLICT",
+    ],
+)
+async def test_fail_manual_review_is_owner_guarded_atomic_and_audited(
+    session, error_code: str
+) -> None:
+    await _seed_manual_chain(session)
+
+    result = await manual.fail_manual_review_run(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+        error_code=error_code,
+    )
+
+    assert (result.disposition, result.error_code) == ("failed", error_code)
+    manual_workflow = await session.get(
+        WorkflowRun, "manual-workflow-1", populate_existing=True
+    )
+    original = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    proposal = await session.get(ProductProposal, "proposal-1", populate_existing=True)
+    assert manual_workflow is not None and original is not None and proposal is not None
+    assert (manual_workflow.status, manual_workflow.quality_status, manual_workflow.error_code) == (
+        WorkflowStatus.FAILED,
+        WorkflowQuality.DEGRADED,
+        error_code,
+    )
+    assert (original.status, original.quality_status, original.current_step, original.error_code) == (
+        WorkflowStatus.FAILED,
+        WorkflowQuality.DEGRADED,
+        "manual_review_failed",
+        error_code,
+    )
+    assert proposal.active_manual_review_run_id is None
+    audits = list(
+        await session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_FAILED
+            )
+        )
+    )
+    assert len(audits) == 1 and audits[0].error_code == error_code
+
+
+@pytest.mark.parametrize("boundary", ["finalize", "fail"])
+async def test_old_owner_terminal_boundaries_write_nothing(session, boundary: str) -> None:
+    await _seed_manual_chain(session)
+    before_audits = int(await session.scalar(select(func.count()).select_from(AuditEvent)) or 0)
+
+    if boundary == "finalize":
+        result = await manual.finalize_manual_review(
+            session,
+            workflow_run_id="manual-workflow-1",
+            lease_owner="worker-b",
+        )
+    else:
+        result = await manual.fail_manual_review_run(
+            session,
+            workflow_run_id="manual-workflow-1",
+            lease_owner="worker-b",
+            error_code="MANUAL_REVIEW_DATABASE_ERROR",
+        )
+
+    assert result.disposition == "lease_lost"
+    manual_workflow = await session.get(
+        WorkflowRun, "manual-workflow-1", populate_existing=True
+    )
+    original = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    proposal = await session.get(ProductProposal, "proposal-1", populate_existing=True)
+    assert manual_workflow is not None and original is not None and proposal is not None
+    assert (manual_workflow.status, manual_workflow.lease_owner) == (
+        WorkflowStatus.PROCESSING,
+        "worker-a",
+    )
+    assert (original.status, original.current_step) == (
+        WorkflowStatus.PENDING_MANUAL,
+        "manual_review_pending",
+    )
+    assert proposal.active_manual_review_run_id == "manual-run-1"
+    assert int(await session.scalar(select(func.count()).select_from(AuditEvent)) or 0) == before_audits
+
+
+async def test_finalize_rejects_malformed_stored_review_without_caller_boolean_override(
+    session,
+) -> None:
+    persisted = await _persist_manual_terminal_case(session, "pass")
+    await session.execute(
+        update(ComplianceReview)
+        .where(ComplianceReview.id == persisted.review_id)
+        .values(semantic_review={"passed": "yes"})
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+
+    result = await manual.finalize_manual_review(
+        session,
+        workflow_run_id="manual-workflow-1",
+        lease_owner="worker-a",
+    )
+
+    assert (result.disposition, result.error_code) == (
+        "failed",
+        "MANUAL_REVIEW_REPLAY_CONFLICT",
+    )
+    proposal = await session.get(ProductProposal, "proposal-1", populate_existing=True)
+    assert proposal is not None and proposal.active_manual_review_run_id is None
+
+
+async def test_terminal_audit_flush_failure_rolls_back_runs_pointer_and_audit(
+    session, monkeypatch
+) -> None:
+    await _persist_manual_terminal_case(session, "pass")
+
+    async def fail_flush(*args, **kwargs) -> None:
+        raise IntegrityError("insert", {}, RuntimeError("simulated audit failure"))
+
+    monkeypatch.setattr(session, "flush", fail_flush)
+    with pytest.raises(IntegrityError, match="simulated audit failure"):
+        await manual.finalize_manual_review(
+            session,
+            workflow_run_id="manual-workflow-1",
+            lease_owner="worker-a",
+        )
+
+    manual_workflow = await session.get(
+        WorkflowRun, "manual-workflow-1", populate_existing=True
+    )
+    original = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    proposal = await session.get(ProductProposal, "proposal-1", populate_existing=True)
+    assert manual_workflow is not None and original is not None and proposal is not None
+    assert (manual_workflow.status, manual_workflow.lease_owner) == (
+        WorkflowStatus.PROCESSING,
+        "worker-a",
+    )
+    assert (original.status, original.current_step) == (
+        WorkflowStatus.PENDING_MANUAL,
+        "manual_review_pending",
+    )
+    assert proposal.active_manual_review_run_id == "manual-run-1"
+    assert await session.scalar(
+        select(AuditEvent.id).where(
+            AuditEvent.event_type == AuditEventType.MANUAL_REVIEW_COMPLETED
+        )
+    ) is None
