@@ -11,6 +11,7 @@ from sqlalchemy import delete, func, select, update
 from backend.auth import create_access_token, hash_password
 from backend.common import (
     ComplianceRiskLevel,
+    ProposalRevisionOrigin,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -552,11 +553,15 @@ async def test_proposal_read_requires_exact_scope_for_all_allowed_roles_and_retu
 
 
 async def test_proposal_read_returns_linked_revision_and_review_only(client, selection_data, session) -> None:
-    proposal, _ = await _selected_proposal(client, selection_data, session)
+    proposal, optimization = await _selected_proposal(client, selection_data, session)
     revision = ProposalRevision(
         id="revision-1",
         proposal_id=proposal.id,
         iteration=0,
+        revision_number=1,
+        origin=ProposalRevisionOrigin.AGENT,
+        created_by=optimization.created_by,
+        parent_revision_id=None,
         base_product_version=proposal.base_product_version,
         trusted_fact_hash="a" * 64,
         proposal_output={"title": "可信商品标题"},
@@ -644,6 +649,10 @@ async def test_proposal_read_rejects_inconsistent_revision_review_chains(
         id="revision-current",
         proposal_id=proposal.id,
         iteration=0,
+        revision_number=1,
+        origin=ProposalRevisionOrigin.AGENT,
+        created_by="operator-1",
+        parent_revision_id=None,
         base_product_version=7,
         trusted_fact_hash="c" * 64,
         proposal_output={"title": "当前方案"},
@@ -653,6 +662,10 @@ async def test_proposal_read_rejects_inconsistent_revision_review_chains(
         id="revision-other",
         proposal_id=other_proposal.id,
         iteration=0,
+        revision_number=1,
+        origin=ProposalRevisionOrigin.AGENT,
+        created_by="operator-1",
+        parent_revision_id=None,
         base_product_version=7,
         trusted_fact_hash="d" * 64,
         proposal_output={"title": "其他方案"},

@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from backend.common import (
     AgentCallType,
     ComplianceRiskLevel,
+    ProposalRevisionOrigin,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -117,6 +118,10 @@ def _revision(revision_id: str, proposal_id: str, iteration: int = 0, **changes:
         "id": revision_id,
         "proposal_id": proposal_id,
         "iteration": iteration,
+        "revision_number": iteration + 1,
+        "origin": ProposalRevisionOrigin.AGENT,
+        "created_by": "user-1",
+        "parent_revision_id": None,
         "base_product_version": 7,
         "trusted_fact_hash": "b" * 64,
         "proposal_output": {"title": "商品"},
@@ -208,6 +213,12 @@ async def test_typed_workflows_proposal_revision_and_review_persist(session) -> 
     assert analysis.workflow_type is WorkflowType.ANALYSIS
     assert optimization.workflow_type is WorkflowType.OPTIMIZATION
     assert proposal.current_revision_id == revision.id
+    assert (revision.revision_number, revision.origin, revision.created_by, revision.parent_revision_id) == (
+        1,
+        ProposalRevisionOrigin.AGENT,
+        "user-1",
+        None,
+    )
     assert review.risk_level is ComplianceRiskLevel.LOW
     assert set(ProductProposal.__table__.columns).isdisjoint({"status", "quality_status", "error_code"})
 
@@ -280,9 +291,20 @@ async def test_proposal_revisions_reject_invalid_iterations_versions_hashes_and_
 async def test_compliance_reviews_reject_duplicate_and_invalid_typed_values(session) -> None:
     await _add_references(session)
     _, _, _, proposal = await _selection_graph(session, "one")
-    revisions = [_revision(f"revision-{iteration}", proposal.id, iteration) for iteration in range(3)]
-    session.add_all(revisions)
+    revisions = [_revision("revision-0", proposal.id)]
+    session.add(revisions[0])
     await session.flush()
+    for iteration in (1, 2):
+        revisions.append(
+            _revision(
+                f"revision-{iteration}",
+                proposal.id,
+                iteration,
+                parent_revision_id=revisions[-1].id,
+            )
+        )
+        session.add(revisions[-1])
+        await session.flush()
     session.add(_review("review-zero", proposal.id, revisions[0].id, 0))
     await session.flush()
 

@@ -17,6 +17,7 @@ from backend.common import (
     AgentCallType,
     ComplianceRiskLevel,
     KnowledgeVersionStatus,
+    ProposalRevisionOrigin,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -578,7 +579,64 @@ async def test_revision_sequence_uses_complete_normal_failed_review_and_exact_re
     assert replay_zero == type(replay_zero)("replayed", revision_zero.revision_id, None)
     proposal = await session.get(ProductProposal, "proposal-1", populate_existing=True)
     assert proposal is not None and proposal.current_revision_id == revision_one.revision_id
-    assert await session.scalar(select(ProposalRevision).where(ProposalRevision.id == revision_zero.revision_id))
+    stored_zero = await session.scalar(
+        select(ProposalRevision).where(ProposalRevision.id == revision_zero.revision_id)
+    )
+    stored_one = await session.scalar(
+        select(ProposalRevision).where(ProposalRevision.id == revision_one.revision_id)
+    )
+    assert stored_zero is not None and stored_one is not None
+    assert (
+        stored_zero.revision_number,
+        stored_zero.origin,
+        stored_zero.created_by,
+        stored_zero.parent_revision_id,
+    ) == (1, ProposalRevisionOrigin.AGENT, "user-1", None)
+    assert (
+        stored_one.revision_number,
+        stored_one.origin,
+        stored_one.created_by,
+        stored_one.parent_revision_id,
+    ) == (2, ProposalRevisionOrigin.AGENT, "user-1", stored_zero.id)
+
+
+async def test_automatic_revision_load_rejects_a_different_creator(session) -> None:
+    chain = await _chain(session, live=True)
+    revision = await persist_optimization_revision(
+        session,
+        workflow_run_id="optimization-1",
+        lease_owner="worker-a",
+        iteration=0,
+        trusted=_trusted(chain),
+        output=_output(),
+        canonical_citations=[_citation()],
+        calls=_optimization_calls(0),
+    )
+    other = User(
+        id="user-2",
+        username="other-operator",
+        password_hash="hash",
+        role=UserRole.OPERATOR,
+        status=UserStatus.ACTIVE,
+    )
+    session.add(other)
+    await session.flush()
+    await session.execute(
+        update(ProposalRevision)
+        .where(ProposalRevision.id == revision.revision_id)
+        .values(created_by=other.id)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+
+    result = await load_owned_optimization_context(
+        session, workflow_run_id="optimization-1", lease_owner="worker-a"
+    )
+
+    assert (result.disposition, result.error_code) == (
+        "failed",
+        "OPTIMIZATION_CONTEXT_INCONSISTENT",
+    )
 
 
 async def test_failure_review_is_fixed_degraded_and_cannot_unlock_next_iteration(session) -> None:

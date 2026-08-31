@@ -13,6 +13,7 @@ from backend.common import (
     AgentCallType,
     ComplianceRiskLevel,
     KnowledgeVersionStatus,
+    ProposalRevisionOrigin,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -389,6 +390,10 @@ async def _context_progress(
         )
         if revision is None:
             raise ValueError("orphan current revision")
+        if not await _automatic_revision_chain_valid(
+            session, proposal, revision, run.created_by
+        ):
+            raise ValueError("invalid automatic revision chain")
         output = OptimizationProposalOutput.model_validate(revision.proposal_output)
         citations = tuple(CanonicalRuleCitation.model_validate(value) for value in revision.citations)
         citation_ids = [citation.chunk_id for citation in citations]
@@ -684,19 +689,66 @@ async def _audit_matches(
     return _json(observed) == _json(expected)
 
 
+async def _automatic_revision_chain_valid(
+    session: AsyncSession,
+    proposal: ProductProposal,
+    revision: ProposalRevision,
+    created_by: str,
+) -> bool:
+    current = revision
+    while True:
+        iteration = current.iteration
+        if (
+            not isinstance(iteration, int)
+            or not 0 <= iteration <= 2
+            or current.proposal_id != proposal.id
+            or current.revision_number != iteration + 1
+            or current.origin != ProposalRevisionOrigin.AGENT
+            or current.created_by != created_by
+            or current.base_product_version != proposal.base_product_version
+        ):
+            return False
+        if iteration == 0:
+            return current.parent_revision_id is None
+        if current.parent_revision_id is None:
+            return False
+        parent = await session.scalar(
+            select(ProposalRevision)
+            .where(
+                ProposalRevision.id == current.parent_revision_id,
+                ProposalRevision.proposal_id == proposal.id,
+                ProposalRevision.iteration == iteration - 1,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if parent is None:
+            return False
+        current = parent
+
+
 async def _revision_for(
-    session: AsyncSession, proposal_id: str, revision_id: str, iteration: int
+    session: AsyncSession,
+    proposal: ProductProposal,
+    revision_id: str,
+    iteration: int,
+    created_by: str,
 ) -> ProposalRevision | None:
-    return await session.scalar(
+    revision = await session.scalar(
         select(ProposalRevision)
         .where(
             ProposalRevision.id == revision_id,
-            ProposalRevision.proposal_id == proposal_id,
+            ProposalRevision.proposal_id == proposal.id,
             ProposalRevision.iteration == iteration,
         )
         .execution_options(populate_existing=True)
         .with_for_update()
     )
+    if revision is None or not await _automatic_revision_chain_valid(
+        session, proposal, revision, created_by
+    ):
+        return None
+    return revision
 
 
 async def _persist_optimization_revision(
@@ -738,7 +790,10 @@ async def _persist_optimization_revision(
     )
     if existing is not None:
         exact = (
-            existing.base_product_version == locked.context.base_product_version
+            await _automatic_revision_chain_valid(
+                session, locked.proposal, existing, locked.run.created_by
+            )
+            and existing.base_product_version == locked.context.base_product_version
             and existing.trusted_fact_hash == fact_hash
             and _json(existing.proposal_output) == _json(output)
             and _json(existing.citations) == _json(stored_citations)
@@ -755,6 +810,7 @@ async def _persist_optimization_revision(
         raise integrity_error
     if iteration == 0:
         allowed = locked.proposal.current_revision_id is None
+        parent_revision_id = None
     else:
         prior = await session.scalar(
             select(ProposalRevision)
@@ -770,12 +826,16 @@ async def _persist_optimization_revision(
         ) if prior is not None else None
         allowed = bool(
             prior is not None
+            and await _automatic_revision_chain_valid(
+                session, locked.proposal, prior, locked.run.created_by
+            )
             and locked.proposal.current_revision_id == prior.id
             and review is not None
             and review.proposal_id == locked.proposal.id
             and review.iteration == prior.iteration
             and _actionable_prior_review(locked.context, prior, review)
         )
+        parent_revision_id = prior.id if prior is not None else None
     if not allowed:
         await _fail_locked(session, locked.run, "OPTIMIZATION_REPLAY_CONFLICT")
         return RevisionPersistenceResult("failed", None, "OPTIMIZATION_REPLAY_CONFLICT")
@@ -786,6 +846,10 @@ async def _persist_optimization_revision(
         id=str(uuid4()),
         proposal_id=locked.proposal.id,
         iteration=iteration,
+        revision_number=iteration + 1,
+        origin=ProposalRevisionOrigin.AGENT,
+        created_by=locked.run.created_by,
+        parent_revision_id=parent_revision_id,
         base_product_version=locked.context.base_product_version,
         trusted_fact_hash=fact_hash,
         proposal_output=output.model_dump(mode="json"),
@@ -945,7 +1009,9 @@ async def _review_input(
     iteration: int,
     canonical_citations: Sequence[CanonicalRuleCitation],
 ) -> tuple[ProposalRevision, list[dict[str, object]], TrustedOptimizationInput] | None:
-    revision = await _revision_for(session, locked.proposal.id, revision_id, iteration)
+    revision = await _revision_for(
+        session, locked.proposal, revision_id, iteration, locked.run.created_by
+    )
     if revision is None:
         return None
     try:

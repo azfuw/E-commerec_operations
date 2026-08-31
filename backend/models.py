@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -20,9 +21,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.common import (
     AgentCallType,
+    ApprovalActionType,
+    AuditEventType,
+    AuditOutcome,
     ComplianceRiskLevel,
     KnowledgeVersionStatus,
     OrderStatus,
+    ProposalRevisionOrigin,
     RefundStatus,
     UserRole,
     UserStatus,
@@ -220,7 +225,10 @@ class WorkflowRun(Base):
             "((workflow_type = 'analysis' AND start_date IS NOT NULL AND end_date IS NOT NULL "
             "AND start_date <= end_date AND status IN ('accepted', 'processing', 'awaiting_selection', 'completed', 'failed')) "
             "OR (workflow_type = 'optimization' AND start_date IS NULL AND end_date IS NULL "
-            "AND status IN ('accepted', 'processing', 'draft_ready', 'pending_manual', 'failed')))",
+            "AND status IN ('accepted', 'processing', 'draft_ready', 'pending_manual', "
+            "'pending_approval', 'completed', 'rejected', 'failed')) "
+            "OR (workflow_type = 'manual_review' AND start_date IS NULL AND end_date IS NULL "
+            "AND status IN ('accepted', 'processing', 'completed', 'failed')))",
             name="ck_workflow_runs_type_status_dates",
         ),
         CheckConstraint(
@@ -234,6 +242,14 @@ class WorkflowRun(Base):
             "(status = 'processing' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL) "
             "OR (status != 'processing' AND lease_owner IS NULL AND lease_expires_at IS NULL)",
             name="ck_workflow_runs_lease_state",
+        ),
+        Index(
+            "ix_workflow_runs_type_status_lease_created",
+            "workflow_type",
+            "status",
+            "lease_expires_at",
+            "created_at",
+            "id",
         ),
     )
 
@@ -385,6 +401,11 @@ class ProductProposal(Base):
         UniqueConstraint("analysis_run_id", name="uq_product_proposals_analysis_run_id"),
         UniqueConstraint("analysis_candidate_id", name="uq_product_proposals_analysis_candidate_id"),
         UniqueConstraint("optimization_run_id", name="uq_product_proposals_optimization_run_id"),
+        UniqueConstraint(
+            "active_manual_review_run_id",
+            name="uq_product_proposals_active_manual_review_run_id",
+        ),
+        Index("ix_product_proposals_submitted_revision_id", "submitted_revision_id"),
         CheckConstraint("base_product_version >= 1", name="ck_product_proposals_base_product_version"),
         CheckConstraint(
             "length(selection_idempotency_hash) = 64",
@@ -417,6 +438,20 @@ class ProductProposal(Base):
             use_alter=True,
         )
     )
+    active_manual_review_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "manual_review_runs.id",
+            name="fk_product_proposals_active_manual_review_run_id",
+            use_alter=True,
+        )
+    )
+    submitted_revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "proposal_revisions.id",
+            name="fk_product_proposals_submitted_revision_id",
+            use_alter=True,
+        )
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
@@ -427,7 +462,27 @@ class ProposalRevision(Base):
     __tablename__ = "proposal_revisions"
     __table_args__ = (
         UniqueConstraint("proposal_id", "iteration", name="uq_proposal_revisions_proposal_id_iteration"),
-        CheckConstraint("iteration BETWEEN 0 AND 2", name="ck_proposal_revisions_iteration"),
+        UniqueConstraint(
+            "proposal_id",
+            "revision_number",
+            name="uq_proposal_revisions_proposal_revision_number",
+        ),
+        CheckConstraint("revision_number >= 1", name="ck_proposal_revisions_revision_number"),
+        CheckConstraint("origin IN ('agent', 'manual')", name="ck_proposal_revisions_origin"),
+        CheckConstraint(
+            "(origin = 'agent' AND iteration IS NOT NULL AND iteration BETWEEN 0 AND 2) "
+            "OR (origin = 'manual' AND iteration IS NULL)",
+            name="ck_proposal_revisions_origin_iteration",
+        ),
+        CheckConstraint(
+            "(revision_number = 1 AND parent_revision_id IS NULL) "
+            "OR (revision_number > 1 AND parent_revision_id IS NOT NULL)",
+            name="ck_proposal_revisions_parent",
+        ),
+        CheckConstraint(
+            "parent_revision_id IS NULL OR parent_revision_id <> id",
+            name="ck_proposal_revisions_not_self_parent",
+        ),
         CheckConstraint("base_product_version >= 1", name="ck_proposal_revisions_base_product_version"),
         CheckConstraint(
             "length(trusted_fact_hash) = 64", name="ck_proposal_revisions_trusted_fact_hash_length"
@@ -438,7 +493,28 @@ class ProposalRevision(Base):
     proposal_id: Mapped[str] = mapped_column(
         ForeignKey("product_proposals.id", name="fk_proposal_revisions_proposal_id"), nullable=False
     )
-    iteration: Mapped[int] = mapped_column(Integer, nullable=False)
+    iteration: Mapped[int | None] = mapped_column(Integer)
+    revision_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    origin: Mapped[ProposalRevisionOrigin] = mapped_column(
+        Enum(
+            ProposalRevisionOrigin,
+            name="proposal_revision_origin",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=16,
+        ),
+        nullable=False,
+    )
+    created_by: Mapped[str] = mapped_column(
+        ForeignKey("users.id", name="fk_proposal_revisions_created_by"), nullable=False
+    )
+    parent_revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "proposal_revisions.id",
+            name="fk_proposal_revisions_parent_revision_id",
+        )
+    )
     base_product_version: Mapped[int] = mapped_column(Integer, nullable=False)
     trusted_fact_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     proposal_output: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
@@ -451,7 +527,10 @@ class ComplianceReview(Base):
     __table_args__ = (
         UniqueConstraint("proposal_revision_id", name="uq_compliance_reviews_proposal_revision_id"),
         UniqueConstraint("proposal_id", "iteration", name="uq_compliance_reviews_proposal_id_iteration"),
-        CheckConstraint("iteration BETWEEN 0 AND 2", name="ck_compliance_reviews_iteration"),
+        CheckConstraint(
+            "iteration IS NULL OR iteration BETWEEN 0 AND 2",
+            name="ck_compliance_reviews_iteration",
+        ),
         CheckConstraint(
             "risk_level IN ('low', 'medium', 'high')", name="ck_compliance_reviews_risk_level"
         ),
@@ -469,7 +548,7 @@ class ComplianceReview(Base):
         ForeignKey("proposal_revisions.id", name="fk_compliance_reviews_proposal_revision_id"),
         nullable=False,
     )
-    iteration: Mapped[int] = mapped_column(Integer, nullable=False)
+    iteration: Mapped[int | None] = mapped_column(Integer)
     deterministic_checks: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     semantic_review: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -495,6 +574,285 @@ class ComplianceReview(Base):
             values_callable=lambda enum: [member.value for member in enum],
         ),
         nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ManualReviewRun(Base):
+    __tablename__ = "manual_review_runs"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", name="uq_manual_review_runs_workflow_run_id"),
+        UniqueConstraint(
+            "proposal_revision_id", name="uq_manual_review_runs_proposal_revision_id"
+        ),
+        UniqueConstraint(
+            "proposal_id",
+            "submitted_by",
+            "idempotency_key_hash",
+            name="uq_manual_review_runs_proposal_actor_key",
+        ),
+        CheckConstraint(
+            "length(idempotency_key_hash) = 64",
+            name="ck_manual_review_runs_idempotency_hash_length",
+        ),
+        CheckConstraint(
+            "length(request_hash) = 64",
+            name="ck_manual_review_runs_request_hash_length",
+        ),
+        Index(
+            "ix_manual_review_runs_proposal_created",
+            "proposal_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    workflow_run_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_runs.id", name="fk_manual_review_runs_workflow_run_id"),
+        nullable=False,
+    )
+    proposal_id: Mapped[str] = mapped_column(
+        ForeignKey("product_proposals.id", name="fk_manual_review_runs_proposal_id"),
+        nullable=False,
+    )
+    proposal_revision_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "proposal_revisions.id", name="fk_manual_review_runs_proposal_revision_id"
+        ),
+        nullable=False,
+    )
+    submitted_by: Mapped[str] = mapped_column(
+        ForeignKey("users.id", name="fk_manual_review_runs_submitted_by"), nullable=False
+    )
+    idempotency_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ApprovalAction(Base):
+    __tablename__ = "approval_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "proposal_id",
+            "actor_id",
+            "action",
+            "idempotency_key_hash",
+            name="uq_approval_actions_proposal_actor_action_key",
+        ),
+        CheckConstraint(
+            "action IN ('submit', 'approve', 'reject', 'request_changes')",
+            name="ck_approval_actions_action",
+        ),
+        CheckConstraint(
+            "actor_role IN ('operator', 'supervisor', 'admin')",
+            name="ck_approval_actions_actor_role",
+        ),
+        CheckConstraint(
+            "length(idempotency_key_hash) = 64",
+            name="ck_approval_actions_idempotency_hash_length",
+        ),
+        CheckConstraint(
+            "length(request_hash) = 64",
+            name="ck_approval_actions_request_hash_length",
+        ),
+        CheckConstraint(
+            "((action IN ('reject', 'request_changes') AND comment IS NOT NULL "
+            "AND length(trim(comment)) BETWEEN 1 AND 500) "
+            "OR (action IN ('submit', 'approve') AND comment IS NULL))",
+            name="ck_approval_actions_comment",
+        ),
+        Index("ix_approval_actions_proposal_created", "proposal_id", "created_at", "id"),
+        Index("ix_approval_actions_store_created", "store_id", "created_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    proposal_id: Mapped[str] = mapped_column(
+        ForeignKey("product_proposals.id", name="fk_approval_actions_proposal_id"),
+        nullable=False,
+    )
+    proposal_revision_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "proposal_revisions.id", name="fk_approval_actions_proposal_revision_id"
+        ),
+        nullable=False,
+    )
+    store_id: Mapped[str] = mapped_column(
+        ForeignKey("stores.id", name="fk_approval_actions_store_id"), nullable=False
+    )
+    actor_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", name="fk_approval_actions_actor_id"), nullable=False
+    )
+    actor_role: Mapped[UserRole] = mapped_column(
+        Enum(
+            UserRole,
+            name="user_role",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=16,
+        ),
+        nullable=False,
+    )
+    action: Mapped[ApprovalActionType] = mapped_column(
+        Enum(
+            ApprovalActionType,
+            name="approval_action_type",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=32,
+        ),
+        nullable=False,
+    )
+    comment: Mapped[str | None] = mapped_column(String(500))
+    idempotency_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class PublishRecord(Base):
+    __tablename__ = "publish_records"
+    __table_args__ = (
+        UniqueConstraint("proposal_id", name="uq_publish_records_proposal_id"),
+        UniqueConstraint(
+            "proposal_revision_id", name="uq_publish_records_proposal_revision_id"
+        ),
+        UniqueConstraint("approval_action_id", name="uq_publish_records_approval_action_id"),
+        UniqueConstraint(
+            "publish_idempotency_hash",
+            name="uq_publish_records_publish_idempotency_hash",
+        ),
+        CheckConstraint("base_product_version >= 1", name="ck_publish_records_base_version"),
+        CheckConstraint(
+            "published_product_version = base_product_version + 1",
+            name="ck_publish_records_version_increment",
+        ),
+        CheckConstraint(
+            "length(publish_idempotency_hash) = 64",
+            name="ck_publish_records_idempotency_hash_length",
+        ),
+        Index("ix_publish_records_store_published", "store_id", "published_at", "id"),
+        Index("ix_publish_records_product_published", "product_id", "published_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    proposal_id: Mapped[str] = mapped_column(
+        ForeignKey("product_proposals.id", name="fk_publish_records_proposal_id"),
+        nullable=False,
+    )
+    proposal_revision_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "proposal_revisions.id", name="fk_publish_records_proposal_revision_id"
+        ),
+        nullable=False,
+    )
+    product_id: Mapped[str] = mapped_column(
+        ForeignKey("products.id", name="fk_publish_records_product_id"), nullable=False
+    )
+    store_id: Mapped[str] = mapped_column(
+        ForeignKey("stores.id", name="fk_publish_records_store_id"), nullable=False
+    )
+    approved_by: Mapped[str] = mapped_column(
+        ForeignKey("users.id", name="fk_publish_records_approved_by"), nullable=False
+    )
+    approval_action_id: Mapped[str] = mapped_column(
+        ForeignKey("approval_actions.id", name="fk_publish_records_approval_action_id"),
+        nullable=False,
+    )
+    publish_idempotency_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    before_snapshot: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    after_snapshot: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    base_product_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    published_product_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('manual_revision_created', 'manual_review_claimed', "
+            "'manual_review_completed', 'manual_review_failed', 'proposal_submitted', "
+            "'proposal_approved', 'proposal_rejected', 'proposal_changes_requested', "
+            "'simulated_publish_completed', 'authorization_denied')",
+            name="ck_audit_events_event_type",
+        ),
+        CheckConstraint(
+            "outcome IN ('success', 'failed', 'denied')",
+            name="ck_audit_events_outcome",
+        ),
+        CheckConstraint(
+            "actor_role IS NULL OR actor_role IN ('operator', 'supervisor', 'admin')",
+            name="ck_audit_events_actor_role",
+        ),
+        Index("ix_audit_events_store_created", "store_id", "created_at", "id"),
+        Index("ix_audit_events_proposal_created", "proposal_id", "created_at", "id"),
+        Index("ix_audit_events_workflow_created", "workflow_run_id", "created_at", "id"),
+        Index("ix_audit_events_actor_created", "actor_id", "created_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    event_type: Mapped[AuditEventType] = mapped_column(
+        Enum(
+            AuditEventType,
+            name="audit_event_type",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=64,
+        ),
+        nullable=False,
+    )
+    outcome: Mapped[AuditOutcome] = mapped_column(
+        Enum(
+            AuditOutcome,
+            name="audit_outcome",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=16,
+        ),
+        nullable=False,
+    )
+    actor_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", name="fk_audit_events_actor_id")
+    )
+    actor_role: Mapped[UserRole | None] = mapped_column(
+        Enum(
+            UserRole,
+            name="user_role",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=16,
+        )
+    )
+    store_id: Mapped[str] = mapped_column(
+        ForeignKey("stores.id", name="fk_audit_events_store_id"), nullable=False
+    )
+    proposal_id: Mapped[str | None] = mapped_column(
+        ForeignKey("product_proposals.id", name="fk_audit_events_proposal_id")
+    )
+    proposal_revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("proposal_revisions.id", name="fk_audit_events_proposal_revision_id")
+    )
+    workflow_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflow_runs.id", name="fk_audit_events_workflow_run_id")
+    )
+    approval_action_id: Mapped[str | None] = mapped_column(
+        ForeignKey("approval_actions.id", name="fk_audit_events_approval_action_id")
+    )
+    publish_record_id: Mapped[str | None] = mapped_column(
+        ForeignKey("publish_records.id", name="fk_audit_events_publish_record_id")
+    )
+    request_id: Mapped[str | None] = mapped_column(String(64))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    details: Mapped[dict[str, object]] = mapped_column(
+        JSON, default=dict, server_default="{}", nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
