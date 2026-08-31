@@ -45,7 +45,7 @@ from backend.schemas import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class ManualReviewDomainError(Exception):
     code: str
     status_code: int
@@ -168,6 +168,30 @@ async def _authorized_context(
         .with_for_update()
     )
     if proposal is None:
+        raise ManualReviewDomainError("PROPOSAL_NOT_FOUND", 404)
+    original_run = await session.scalar(
+        select(WorkflowRun)
+        .where(WorkflowRun.id == proposal.optimization_run_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    product = await session.scalar(
+        select(Product)
+        .where(Product.id == proposal.product_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if (
+        original_run is None
+        or original_run.workflow_type is not WorkflowType.OPTIMIZATION
+        or original_run.store_id != store.id
+        or not isinstance(original_run.input, dict)
+        or original_run.input.get("proposal_id") != proposal.id
+        or original_run.input.get("product_id") != proposal.product_id
+        or original_run.input.get("store_id") != store.id
+        or product is None
+        or product.store_id != store.id
+    ):
         raise ManualReviewDomainError("PROPOSAL_NOT_FOUND", 404)
     return actor, proposal, store
 

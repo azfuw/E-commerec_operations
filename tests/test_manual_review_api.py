@@ -375,6 +375,19 @@ def test_manual_revision_accepted_has_typed_status_and_domain_error_is_stable() 
         )
 
 
+def test_manual_review_domain_error_allows_standard_traceback_lifecycle() -> None:
+    error = ManualReviewDomainError(code="MANUAL_REVISION_INVALID", status_code=422)
+
+    with pytest.raises(ManualReviewDomainError) as raised:
+        raise error
+
+    raised.value.__traceback__ = None
+    assert (raised.value.code, raised.value.status_code) == (
+        "MANUAL_REVISION_INVALID",
+        422,
+    )
+
+
 def test_compose_manual_output_uses_only_editable_request_and_readonly_parent_groups() -> None:
     request = _request()
     parent = _parent()
@@ -1128,6 +1141,79 @@ async def test_manual_revision_exact_replay_ignores_later_current_and_active_poi
 
     assert replay.status_code == 200
     assert replay.json() == first_body
+    await session.refresh(proposal)
+    assert {
+        "revision": proposal.current_revision_id,
+        "active": proposal.active_manual_review_run_id,
+        "revisions": await _model_count(session, ProposalRevision),
+        "workflows": await _model_count(session, WorkflowRun),
+        "manual_runs": await _model_count(session, ManualReviewRun),
+        "audits": await _model_count(session, AuditEvent),
+    } == before
+
+
+@pytest.mark.parametrize(
+    "ownership_break",
+    ["product-store", "run-store", "run-type", "run-input"],
+)
+async def test_manual_revision_exact_replay_rechecks_product_and_original_run_ownership(
+    manual_client, manual_route_data, session, ownership_break: str
+) -> None:
+    actor = manual_route_data["operator"]
+    first = await manual_client.post(
+        "/proposals/proposal-1/manual-revision",
+        json=_manual_body(),
+        headers=_manual_headers(actor),
+    )
+    assert first.status_code == 202
+    proposal = await session.get(ProductProposal, "proposal-1")
+    assert proposal is not None
+    before = {
+        "revision": proposal.current_revision_id,
+        "active": proposal.active_manual_review_run_id,
+        "revisions": await _model_count(session, ProposalRevision),
+        "workflows": await _model_count(session, WorkflowRun),
+        "manual_runs": await _model_count(session, ManualReviewRun),
+        "audits": await _model_count(session, AuditEvent),
+    }
+    if ownership_break == "product-store":
+        statement = (
+            update(Product)
+            .where(Product.id == "product-1")
+            .values(store_id="store-2")
+        )
+    elif ownership_break == "run-store":
+        statement = (
+            update(WorkflowRun)
+            .where(WorkflowRun.id == "optimization-1")
+            .values(store_id="store-2")
+        )
+    elif ownership_break == "run-type":
+        statement = (
+            update(WorkflowRun)
+            .where(WorkflowRun.id == "optimization-1")
+            .values(
+                workflow_type=WorkflowType.MANUAL_REVIEW,
+                status=WorkflowStatus.COMPLETED,
+            )
+        )
+    else:
+        statement = (
+            update(WorkflowRun)
+            .where(WorkflowRun.id == "optimization-1")
+            .values(input={"proposal_id": "other-proposal"})
+        )
+    await session.execute(statement.execution_options(synchronize_session=False))
+    await session.commit()
+
+    replay = await manual_client.post(
+        "/proposals/proposal-1/manual-revision",
+        json=_manual_body(),
+        headers=_manual_headers(actor),
+    )
+
+    assert replay.status_code == 404
+    assert replay.json() == {"detail": {"code": "PROPOSAL_NOT_FOUND"}}
     await session.refresh(proposal)
     assert {
         "revision": proposal.current_revision_id,
