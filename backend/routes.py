@@ -15,6 +15,7 @@ from backend.analysis_runs import (
 )
 from backend.approvals import (
     ApprovalDomainError,
+    approve_proposal,
     reject_proposal,
     request_proposal_changes,
     submit_proposal,
@@ -82,6 +83,7 @@ from backend.schemas import (
     ProposalDetailView,
     ProposalRevisionView,
     ProposalView,
+    PublishRecordView,
     StoreSummary,
     WorkflowRunView,
 )
@@ -517,6 +519,38 @@ async def request_proposal_changes_route(
     if not result.created:
         response.status_code = status.HTTP_200_OK
     return ApprovalActionView.model_validate(result.action)
+
+
+@router.post(
+    "/approvals/{proposal_id}/approve",
+    response_model=PublishRecordView,
+    status_code=status.HTTP_201_CREATED,
+)
+async def approve_proposal_route(
+    response: Response,
+    proposal_id: Annotated[str, Path(min_length=1, max_length=36)],
+    request: ProposalActionRequest,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> PublishRecordView:
+    try:
+        result = await approve_proposal(
+            session,
+            actor_id=user.id,
+            proposal_id=proposal_id,
+            request=request,
+            idempotency_key=idempotency_key,
+            request_id=_request_id(),
+        )
+    except ApprovalDomainError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code},
+        ) from None
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return PublishRecordView.model_validate(result.publish_record)
 
 
 @router.post(

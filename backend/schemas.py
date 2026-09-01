@@ -291,6 +291,27 @@ class ApprovalActionView(BaseModel):
         return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
+class PublishRecordView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    proposal_id: str
+    proposal_revision_id: str
+    product_id: str
+    store_id: str
+    approved_by: str
+    approval_action_id: str
+    before_snapshot: dict[str, object]
+    after_snapshot: dict[str, object]
+    base_product_version: int
+    published_product_version: int
+    published_at: datetime
+
+    @field_serializer("published_at", when_used="json")
+    def serialize_published_at(self, value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
 class ValidatedRequiredChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

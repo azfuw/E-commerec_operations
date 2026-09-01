@@ -25,7 +25,9 @@ from backend.models import (
     ComplianceReview,
     Product,
     ProductProposal,
+    ProductSku,
     ProposalRevision,
+    PublishRecord,
     Store,
     User,
     UserStoreScope,
@@ -34,6 +36,7 @@ from backend.models import (
 from backend.optimization_runs import _recheck_canonical_citations
 from backend.schemas import (
     CanonicalRuleCitation,
+    OptimizationProposalOutput,
     ProposalActionRequest,
     ProposalCommentActionRequest,
 )
@@ -62,6 +65,13 @@ class ApprovalActionResult:
 
 
 @dataclass(frozen=True)
+class ApprovalPublishResult:
+    action: ApprovalAction
+    publish_record: PublishRecord
+    created: bool
+
+
+@dataclass(frozen=True)
 class _ActionContext:
     actor: User
     store: Store
@@ -79,6 +89,28 @@ def _canonical_json(value: object) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _publish_hash(proposal_id: str, revision_id: str) -> str:
+    encoded = _canonical_json(
+        {
+            "domain": "local-listing-publication-v1",
+            "proposal_id": proposal_id,
+            "proposal_revision_id": revision_id,
+        }
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _product_snapshot(product: Product) -> dict[str, object]:
+    return {
+        "title": product.title,
+        "selling_points": list(product.selling_points),
+        "description": product.description,
+        "search_keywords": list(product.search_keywords),
+        "attributes": dict(product.attributes),
+        "current_version": product.current_version,
+    }
 
 
 def _key_hash(idempotency_key: str | None) -> str:
@@ -250,6 +282,7 @@ async def _matching_audit(
     *,
     context: _ActionContext,
     action: ApprovalAction,
+    expected_publish_record_id: str | None = None,
 ) -> AuditEvent | None:
     event_type, to_status, current_step = _action_spec(action.action)
     audits = list(
@@ -257,11 +290,6 @@ async def _matching_audit(
             select(AuditEvent)
             .where(
                 AuditEvent.event_type == event_type,
-                AuditEvent.outcome == AuditOutcome.SUCCESS,
-                AuditEvent.store_id == context.store.id,
-                AuditEvent.proposal_id == context.proposal.id,
-                AuditEvent.proposal_revision_id == action.proposal_revision_id,
-                AuditEvent.workflow_run_id == context.run.id,
                 AuditEvent.approval_action_id == action.id,
             )
             .execution_options(populate_existing=True)
@@ -277,8 +305,14 @@ async def _matching_audit(
         else WorkflowStatus.PENDING_APPROVAL
     )
     if (
-        audit.actor_id != action.actor_id
+        audit.outcome is not AuditOutcome.SUCCESS
+        or audit.store_id != context.store.id
+        or audit.proposal_id != context.proposal.id
+        or audit.proposal_revision_id != action.proposal_revision_id
+        or audit.workflow_run_id != context.run.id
+        or audit.actor_id != action.actor_id
         or audit.actor_role is not action.actor_role
+        or audit.publish_record_id != expected_publish_record_id
         or audit.error_code is not None
         or audit.details
         != {
@@ -297,6 +331,7 @@ async def _valid_stored_action(
     *,
     context: _ActionContext,
     action: ApprovalAction,
+    expected_publish_record_id: str | None = None,
 ) -> bool:
     comment_valid = (
         isinstance(action.comment, str) and 1 <= len(action.comment.strip()) <= 500
@@ -315,7 +350,13 @@ async def _valid_stored_action(
             else frozenset(UserRole)
         )
         and comment_valid
-        and await _matching_audit(session, context=context, action=action) is not None
+        and await _matching_audit(
+            session,
+            context=context,
+            action=action,
+            expected_publish_record_id=expected_publish_record_id,
+        )
+        is not None
     )
 
 
@@ -389,6 +430,28 @@ async def _legal_replay_state(
         }.get(context.run.status)
         if expected_terminal is None:
             return not terminal_actions
+        if (
+            expected_terminal is ApprovalActionType.APPROVE
+            and len(terminal_actions) == 1
+            and terminal_actions[0].action is ApprovalActionType.APPROVE
+        ):
+            records = list(
+                await session.scalars(
+                    select(PublishRecord)
+                    .where(
+                        PublishRecord.proposal_id == context.proposal.id,
+                        PublishRecord.proposal_revision_id == context.revision.id,
+                    )
+                    .execution_options(populate_existing=True)
+                    .with_for_update()
+                )
+            )
+            return len(records) == 1 and await _valid_publish_chain(
+                session,
+                context=context,
+                action=terminal_actions[0],
+                record=records[0],
+            )
         return (
             len(terminal_actions) == 1
             and terminal_actions[0].action is expected_terminal
@@ -702,6 +765,424 @@ async def _perform_action(
         await session.rollback()
         raise
     except (SQLAlchemyError, ValueError):
+        await session.rollback()
+        raise ApprovalDomainError("PROPOSAL_DATA_INCONSISTENT", 503) from None
+
+
+def _validated_publish_output(
+    context: _ActionContext, skus: list[ProductSku]
+) -> OptimizationProposalOutput:
+    try:
+        output = OptimizationProposalOutput.model_validate(context.revision.proposal_output)
+        attributes = dict(context.product.attributes)
+    except (TypeError, ValueError, ValidationError):
+        raise ApprovalDomainError("PROPOSAL_DATA_INCONSISTENT", 503) from None
+    sku_by_id = {sku.id: sku for sku in skus}
+    facts_valid = all(
+        (
+            completion.current_value == attributes[completion.target_attribute]
+            if completion.target_attribute in attributes
+            else completion.current_value is None
+        )
+        for completion in output.attribute_completions
+    ) and all(
+        suggestion.target_sku_id in sku_by_id
+        and suggestion.current_price == sku_by_id[suggestion.target_sku_id].price
+        for suggestion in output.price_suggestions
+    ) and all(
+        suggestion.target_sku_id in sku_by_id
+        and suggestion.current_code == sku_by_id[suggestion.target_sku_id].code
+        and suggestion.current_spec == sku_by_id[suggestion.target_sku_id].spec
+        for suggestion in output.sku_suggestions
+    )
+    if not facts_valid:
+        raise ApprovalDomainError("TRUSTED_EVIDENCE_INVALID", 422)
+    return output
+
+
+async def _matching_publish_audit(
+    session: AsyncSession,
+    *,
+    context: _ActionContext,
+    action: ApprovalAction,
+    record: PublishRecord,
+) -> bool:
+    audits = list(
+        await session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.event_type == AuditEventType.SIMULATED_PUBLISH_COMPLETED,
+                AuditEvent.approval_action_id == action.id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+    )
+    if len(audits) != 1:
+        return False
+    audit = audits[0]
+    return (
+        audit.outcome is AuditOutcome.SUCCESS
+        and audit.store_id == context.store.id
+        and audit.actor_id == action.actor_id
+        and audit.actor_role is action.actor_role
+        and audit.proposal_id == context.proposal.id
+        and audit.proposal_revision_id == context.revision.id
+        and audit.workflow_run_id == context.run.id
+        and audit.publish_record_id == record.id
+        and audit.error_code is None
+        and audit.details
+        == {
+            "changed_fields": [
+                "title",
+                "selling_points",
+                "description",
+                "keywords",
+                "attribute_completions",
+            ],
+            "published_from_version": record.base_product_version,
+            "published_to_version": record.published_product_version,
+        }
+    )
+
+
+async def _valid_publish_chain(
+    session: AsyncSession,
+    *,
+    context: _ActionContext,
+    action: ApprovalAction,
+    record: PublishRecord,
+) -> bool:
+    try:
+        output = OptimizationProposalOutput.model_validate(context.revision.proposal_output)
+        before_attributes = dict(record.before_snapshot["attributes"])
+        expected_after = {
+            "title": output.title,
+            "selling_points": list(output.selling_points),
+            "description": "\n\n".join(
+                f"{section.heading}\n{section.body}" for section in output.description
+            ),
+            "search_keywords": list(output.keywords),
+            "attributes": {
+                **before_attributes,
+                **{
+                    completion.target_attribute: completion.suggested_value
+                    for completion in output.attribute_completions
+                },
+            },
+            "current_version": record.published_product_version,
+        }
+        current_snapshot = _product_snapshot(context.product)
+    except (KeyError, TypeError, ValueError, ValidationError):
+        return False
+    snapshot_keys = {
+        "title",
+        "selling_points",
+        "description",
+        "search_keywords",
+        "attributes",
+        "current_version",
+    }
+    return (
+        action.action is ApprovalActionType.APPROVE
+        and await _valid_stored_action(
+            session,
+            context=context,
+            action=action,
+            expected_publish_record_id=record.id,
+        )
+        and await _legal_replay_state(session, context=context, action=action)
+        and record.proposal_id == context.proposal.id
+        and record.proposal_revision_id == context.revision.id
+        and record.product_id == context.product.id
+        and record.store_id == context.store.id
+        and record.approved_by == action.actor_id
+        and record.approval_action_id == action.id
+        and record.publish_idempotency_hash
+        == _publish_hash(context.proposal.id, context.revision.id)
+        and record.base_product_version
+        == context.proposal.base_product_version
+        == context.revision.base_product_version
+        and record.published_product_version == record.base_product_version + 1
+        and set(record.before_snapshot) == set(record.after_snapshot) == snapshot_keys
+        and record.before_snapshot["current_version"] == record.base_product_version
+        and record.after_snapshot == expected_after == current_snapshot
+        and context.proposal.current_revision_id == context.revision.id
+        and context.proposal.submitted_revision_id == context.revision.id
+        and context.proposal.active_manual_review_run_id is None
+        and context.run.status is WorkflowStatus.COMPLETED
+        and context.run.quality_status is WorkflowQuality.NORMAL
+        and context.run.current_step == "simulated_published"
+        and context.run.error_code is None
+        and await _matching_publish_audit(
+            session, context=context, action=action, record=record
+        )
+    )
+
+
+async def _publish_replay(
+    session: AsyncSession,
+    *,
+    context: _ActionContext,
+    key_hash: str,
+    request_hash: str,
+) -> ApprovalPublishResult | None:
+    action = await session.scalar(
+        select(ApprovalAction)
+        .where(
+            ApprovalAction.proposal_id == context.proposal.id,
+            ApprovalAction.actor_id == context.actor.id,
+            ApprovalAction.action == ApprovalActionType.APPROVE,
+            ApprovalAction.idempotency_key_hash == key_hash,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if action is not None and action.request_hash != request_hash:
+        raise ApprovalDomainError("IDEMPOTENCY_REPLAY_CONFLICT", 409)
+    record = await session.scalar(
+        select(PublishRecord)
+        .where(PublishRecord.proposal_id == context.proposal.id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if action is not None:
+        if record is None or record.approval_action_id != action.id:
+            raise ApprovalDomainError("PUBLISH_REPLAY_CONFLICT", 409)
+    elif record is not None:
+        action = await session.scalar(
+            select(ApprovalAction)
+            .where(ApprovalAction.id == record.approval_action_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+    else:
+        existing_approve = await session.scalar(
+            select(ApprovalAction.id)
+            .where(
+                ApprovalAction.proposal_id == context.proposal.id,
+                ApprovalAction.action == ApprovalActionType.APPROVE,
+            )
+            .with_for_update()
+        )
+        if existing_approve is not None:
+            raise ApprovalDomainError("PUBLISH_REPLAY_CONFLICT", 409)
+        return None
+    if action is None or record is None or not await _valid_publish_chain(
+        session, context=context, action=action, record=record
+    ):
+        raise ApprovalDomainError("PUBLISH_REPLAY_CONFLICT", 409)
+    return ApprovalPublishResult(action, record, False)
+
+
+async def _first_publish(
+    session: AsyncSession,
+    *,
+    context: _ActionContext,
+    request_hash: str,
+    key_hash: str,
+    request_id: str,
+) -> ApprovalPublishResult:
+    if await _conflicting_terminal_action(session, context):
+        raise ApprovalDomainError("APPROVAL_ACTION_CONFLICT", 409)
+    if (
+        context.run.status is not WorkflowStatus.PENDING_APPROVAL
+        or context.proposal.submitted_revision_id != context.revision.id
+        or context.proposal.current_revision_id != context.revision.id
+        or context.proposal.active_manual_review_run_id is not None
+    ):
+        raise ApprovalDomainError("APPROVAL_STATE_CONFLICT", 409)
+    if (
+        context.product.current_version != context.proposal.base_product_version
+        or context.revision.base_product_version != context.proposal.base_product_version
+    ):
+        raise ApprovalDomainError("PRODUCT_VERSION_CONFLICT", 409)
+    await _current_review(session, context=context, submit=False)
+    skus = list(
+        await session.scalars(
+            select(ProductSku)
+            .where(ProductSku.product_id == context.product.id)
+            .order_by(ProductSku.id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+    )
+    output = _validated_publish_output(context, skus)
+    before_snapshot = _product_snapshot(context.product)
+    context.product.title = output.title
+    context.product.selling_points = list(output.selling_points)
+    context.product.description = "\n\n".join(
+        f"{section.heading}\n{section.body}" for section in output.description
+    )
+    context.product.search_keywords = list(output.keywords)
+    context.product.attributes = {
+        **dict(context.product.attributes),
+        **{
+            completion.target_attribute: completion.suggested_value
+            for completion in output.attribute_completions
+        },
+    }
+    context.product.current_version = context.proposal.base_product_version + 1
+    after_snapshot = _product_snapshot(context.product)
+    await session.flush()
+
+    action = ApprovalAction(
+        id=str(uuid4()),
+        proposal_id=context.proposal.id,
+        proposal_revision_id=context.revision.id,
+        store_id=context.store.id,
+        actor_id=context.actor.id,
+        actor_role=context.actor.role,
+        action=ApprovalActionType.APPROVE,
+        comment=None,
+        idempotency_key_hash=key_hash,
+        request_hash=request_hash,
+    )
+    session.add(action)
+    await session.flush()
+    record = PublishRecord(
+        id=str(uuid4()),
+        proposal_id=context.proposal.id,
+        proposal_revision_id=context.revision.id,
+        product_id=context.product.id,
+        store_id=context.store.id,
+        approved_by=context.actor.id,
+        approval_action_id=action.id,
+        publish_idempotency_hash=_publish_hash(
+            context.proposal.id, context.revision.id
+        ),
+        before_snapshot=before_snapshot,
+        after_snapshot=after_snapshot,
+        base_product_version=context.proposal.base_product_version,
+        published_product_version=context.product.current_version,
+    )
+    session.add(record)
+    await session.flush()
+    add_audit_event(
+        session,
+        event_type=AuditEventType.PROPOSAL_APPROVED,
+        outcome=AuditOutcome.SUCCESS,
+        store_id=context.store.id,
+        actor_id=context.actor.id,
+        actor_role=context.actor.role,
+        proposal_id=context.proposal.id,
+        proposal_revision_id=context.revision.id,
+        workflow_run_id=context.run.id,
+        approval_action_id=action.id,
+        publish_record_id=record.id,
+        request_id=request_id,
+        details={
+            "from_status": WorkflowStatus.PENDING_APPROVAL.value,
+            "to_status": WorkflowStatus.COMPLETED.value,
+            "quality_status": WorkflowQuality.NORMAL.value,
+            "current_step": "simulated_published",
+        },
+    )
+    await session.flush()
+    add_audit_event(
+        session,
+        event_type=AuditEventType.SIMULATED_PUBLISH_COMPLETED,
+        outcome=AuditOutcome.SUCCESS,
+        store_id=context.store.id,
+        actor_id=context.actor.id,
+        actor_role=context.actor.role,
+        proposal_id=context.proposal.id,
+        proposal_revision_id=context.revision.id,
+        workflow_run_id=context.run.id,
+        approval_action_id=action.id,
+        publish_record_id=record.id,
+        request_id=request_id,
+        details={
+            "changed_fields": [
+                "title",
+                "selling_points",
+                "description",
+                "keywords",
+                "attribute_completions",
+            ],
+            "published_from_version": record.base_product_version,
+            "published_to_version": record.published_product_version,
+        },
+    )
+    await session.flush()
+    context.run.status = WorkflowStatus.COMPLETED
+    context.run.quality_status = WorkflowQuality.NORMAL
+    context.run.current_step = "simulated_published"
+    context.run.error_code = None
+    await session.flush()
+    await session.commit()
+    return ApprovalPublishResult(action, record, True)
+
+
+async def approve_proposal(
+    session: AsyncSession,
+    *,
+    actor_id: str,
+    proposal_id: str,
+    request: ProposalActionRequest,
+    idempotency_key: str | None,
+    request_id: str,
+) -> ApprovalPublishResult:
+    key_hash = _key_hash(idempotency_key)
+
+    async def load_and_replay() -> tuple[
+        _ActionContext, ApprovalPublishResult | None, str
+    ]:
+        context = await _authorized_context(
+            session,
+            actor_id=actor_id,
+            proposal_id=proposal_id,
+            revision_id=request.revision_id,
+        )
+        if context.actor.role not in _APPROVAL_ROLES:
+            await _deny_role(session, context=context, request_id=request_id)
+        request_hash = _request_hash(
+            action=ApprovalActionType.APPROVE,
+            actor_id=actor_id,
+            proposal_id=proposal_id,
+            request=request,
+            base_product_version=context.proposal.base_product_version,
+        )
+        replay = await _publish_replay(
+            session,
+            context=context,
+            key_hash=key_hash,
+            request_hash=request_hash,
+        )
+        return context, replay, request_hash
+
+    try:
+        context, replay, request_hash = await load_and_replay()
+        if replay is not None:
+            await session.commit()
+            return replay
+        return await _first_publish(
+            session,
+            context=context,
+            request_hash=request_hash,
+            key_hash=key_hash,
+            request_id=request_id,
+        )
+    except IntegrityError:
+        await session.rollback()
+        try:
+            context, replay, _ = await load_and_replay()
+            if replay is not None:
+                await session.commit()
+                return replay
+            if await _conflicting_terminal_action(session, context):
+                raise ApprovalDomainError("APPROVAL_ACTION_CONFLICT", 409)
+            raise ApprovalDomainError("PROPOSAL_DATA_INCONSISTENT", 503)
+        except ApprovalDomainError:
+            await session.rollback()
+            raise
+        except SQLAlchemyError:
+            await session.rollback()
+            raise ApprovalDomainError("PROPOSAL_DATA_INCONSISTENT", 503) from None
+    except ApprovalDomainError:
+        await session.rollback()
+        raise
+    except (SQLAlchemyError, TypeError, ValueError):
         await session.rollback()
         raise ApprovalDomainError("PROPOSAL_DATA_INCONSISTENT", 503) from None
 

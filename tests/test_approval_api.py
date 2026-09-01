@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -12,7 +14,9 @@ from backend.common import (
     ApprovalActionType,
     AuditEventType,
     AuditOutcome,
+    OrderStatus,
     ProposalRevisionOrigin,
+    RefundStatus,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -23,17 +27,24 @@ from backend.models import (
     ApprovalAction,
     AuditEvent,
     ComplianceReview,
+    InventorySnapshot,
     KnowledgeDocument,
+    Order,
+    OrderItem,
     Product,
     ProductProposal,
+    ProductSku,
     ProposalRevision,
+    PublishRecord,
     Store,
+    TrafficDaily,
     User,
     UserStoreScope,
     WorkflowRun,
 )
 from backend.schemas import (
     ApprovalActionView,
+    PublishRecordView,
     ProposalActionRequest,
     ProposalCommentActionRequest,
 )
@@ -70,6 +81,107 @@ async def _action_counts(session) -> tuple[int, int]:
     return (
         int(await session.scalar(select(func.count()).select_from(ApprovalAction)) or 0),
         int(await session.scalar(select(func.count()).select_from(AuditEvent)) or 0),
+    )
+
+
+async def _publish_count(session) -> int:
+    return int(await session.scalar(select(func.count()).select_from(PublishRecord)) or 0)
+
+
+def _published_output(parent: ProposalRevision) -> dict[str, object]:
+    output = dict(parent.proposal_output)
+    output.update(
+        {
+            "title": "优选精梳棉家居商品",
+            "selling_points": ["精梳棉触感", "适合日常家居"],
+            "description": [
+                {
+                    "heading": "商品详情",
+                    "body": "精梳棉材质，适合日常使用。",
+                    "evidence": [{"kind": "citation", "value": "rule-chunk-1"}],
+                },
+                {
+                    "heading": "使用说明",
+                    "body": "请按洗护标签清洁。",
+                    "evidence": [{"kind": "citation", "value": "rule-chunk-1"}],
+                },
+            ],
+            "keywords": ["精梳棉", "家居"],
+            "attribute_completions": [
+                {
+                    "target_attribute": "材质",
+                    "current_value": "棉",
+                    "suggested_value": "精梳棉",
+                    "reason": "补全可信材质",
+                    "evidence": [
+                        {"kind": "fact", "value": "product.attributes.材质"}
+                    ],
+                }
+            ],
+        }
+    )
+    return output
+
+
+async def _prepare_publish_output(session, parent: ProposalRevision) -> None:
+    await session.execute(
+        update(ProposalRevision)
+        .where(ProposalRevision.id == parent.id)
+        .values(proposal_output=_published_output(parent))
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+
+
+async def _seed_immutable_business_facts(session) -> None:
+    order = Order(
+        id="order-1",
+        store_id="store-1",
+        ordered_at=datetime(2026, 8, 1, tzinfo=UTC),
+        status=OrderStatus.PAID,
+        total_amount=Decimal("100.00"),
+    )
+    session.add(order)
+    await session.flush()
+    session.add_all(
+        [
+            OrderItem(
+                id="order-item-1",
+                order_id=order.id,
+                product_id="product-1",
+                sku_id="sku-1",
+                quantity=1,
+                unit_price=Decimal("100.00"),
+                refund_status=RefundStatus.NONE,
+            ),
+            TrafficDaily(
+                id="traffic-1",
+                store_id="store-1",
+                product_id="product-1",
+                metric_date=date(2026, 8, 1),
+                impressions=100,
+                clicks=10,
+                visitors=8,
+                add_to_carts=2,
+            ),
+            InventorySnapshot(
+                id="inventory-1",
+                store_id="store-1",
+                sku_id="sku-1",
+                snapshot_date=date(2026, 8, 1),
+                on_hand=10,
+                inbound=3,
+            ),
+        ]
+    )
+    await session.commit()
+
+
+async def _approve(client, actor: User, *, key: str = "approve-key", revision_id: str = "revision-1"):
+    return await client.post(
+        "/approvals/proposal-1/approve",
+        json=_body(revision_id),
+        headers=_headers(actor, key),
     )
 
 
@@ -1170,3 +1282,659 @@ async def test_integrity_race_reloads_and_replays_the_exact_action_winner(
         assert result.created is False
     expected = 1 if action_name == "submit" else 2
     assert await _action_counts(session) == (expected, expected)
+
+
+@pytest.mark.parametrize("actor_name", ["supervisor", "admin"])
+async def test_approve_atomically_publishes_only_the_allowed_listing_fields_once(
+    manual_client, manual_route_data, session, actor_name: str
+) -> None:
+    actor = manual_route_data[actor_name]
+    parent = manual_route_data["parent"]
+    await _prepare_publish_output(session, parent)
+    await _seed_immutable_business_facts(session)
+    await _submit(manual_client, actor)
+    product = await session.get(Product, "product-1", populate_existing=True)
+    sku = await session.get(ProductSku, "sku-1", populate_existing=True)
+    inventory = await session.get(InventorySnapshot, "inventory-1")
+    order = await session.get(Order, "order-1")
+    order_item = await session.get(OrderItem, "order-item-1")
+    traffic = await session.get(TrafficDaily, "traffic-1")
+    assert all(value is not None for value in (product, sku, inventory, order, order_item, traffic))
+    product_immutable_before = (
+        product.code,
+        product.category,
+        product.brand,
+        product.enabled,
+    )
+    sku_before = (sku.code, dict(sku.spec), sku.price, sku.current_stock)
+    inventory_before = (inventory.on_hand, inventory.inbound)
+    order_before = (order.status, order.total_amount)
+    order_item_before = (
+        order_item.quantity,
+        order_item.unit_price,
+        order_item.refund_status,
+    )
+    traffic_before = (
+        traffic.impressions,
+        traffic.clicks,
+        traffic.visitors,
+        traffic.add_to_carts,
+    )
+
+    response = await _approve(manual_client, actor)
+
+    assert response.status_code == 201
+    record = await session.scalar(select(PublishRecord))
+    action = await session.scalar(
+        select(ApprovalAction).where(ApprovalAction.action == ApprovalActionType.APPROVE)
+    )
+    assert record is not None and action is not None
+    assert response.json() == PublishRecordView.model_validate(record).model_dump(mode="json")
+    product = await session.get(Product, "product-1", populate_existing=True)
+    sku = await session.get(ProductSku, "sku-1", populate_existing=True)
+    inventory = await session.get(InventorySnapshot, "inventory-1", populate_existing=True)
+    order = await session.get(Order, "order-1", populate_existing=True)
+    order_item = await session.get(OrderItem, "order-item-1", populate_existing=True)
+    traffic = await session.get(TrafficDaily, "traffic-1", populate_existing=True)
+    run = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    assert all(value is not None for value in (product, sku, inventory, order, order_item, traffic, run))
+    assert (
+        product.title,
+        product.selling_points,
+        product.description,
+        product.search_keywords,
+        product.attributes,
+        product.current_version,
+    ) == (
+        "优选精梳棉家居商品",
+        ["精梳棉触感", "适合日常家居"],
+        "商品详情\n精梳棉材质，适合日常使用。\n\n使用说明\n请按洗护标签清洁。",
+        ["精梳棉", "家居"],
+        {"材质": "精梳棉"},
+        8,
+    )
+    assert product_immutable_before == (
+        product.code,
+        product.category,
+        product.brand,
+        product.enabled,
+    )
+    assert sku_before == (sku.code, dict(sku.spec), sku.price, sku.current_stock)
+    assert inventory_before == (inventory.on_hand, inventory.inbound)
+    assert order_before == (order.status, order.total_amount)
+    assert order_item_before == (
+        order_item.quantity,
+        order_item.unit_price,
+        order_item.refund_status,
+    )
+    assert traffic_before == (
+        traffic.impressions,
+        traffic.clicks,
+        traffic.visitors,
+        traffic.add_to_carts,
+    )
+    assert (run.status, run.quality_status, run.current_step, run.error_code) == (
+        WorkflowStatus.COMPLETED,
+        WorkflowQuality.NORMAL,
+        "simulated_published",
+        None,
+    )
+    assert (
+        record.proposal_id,
+        record.proposal_revision_id,
+        record.product_id,
+        record.store_id,
+        record.approved_by,
+        record.approval_action_id,
+        record.base_product_version,
+        record.published_product_version,
+    ) == (
+        "proposal-1",
+        "revision-1",
+        "product-1",
+        "store-1",
+        actor.id,
+        action.id,
+        7,
+        8,
+    )
+    assert set(record.before_snapshot) == set(record.after_snapshot) == {
+        "title",
+        "selling_points",
+        "description",
+        "search_keywords",
+        "attributes",
+        "current_version",
+    }
+    assert record.before_snapshot["current_version"] == 7
+    assert record.after_snapshot == {
+        "title": product.title,
+        "selling_points": product.selling_points,
+        "description": product.description,
+        "search_keywords": product.search_keywords,
+        "attributes": product.attributes,
+        "current_version": 8,
+    }
+    audits = list(
+        await session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.event_type.in_(
+                    {
+                        AuditEventType.PROPOSAL_APPROVED,
+                        AuditEventType.SIMULATED_PUBLISH_COMPLETED,
+                    }
+                )
+            )
+        )
+    )
+    assert len(audits) == 2
+    assert {audit.approval_action_id for audit in audits} == {action.id}
+    assert {audit.publish_record_id for audit in audits} == {record.id}
+    assert next(
+        audit for audit in audits if audit.event_type is AuditEventType.PROPOSAL_APPROVED
+    ).details == {
+        "from_status": "pending_approval",
+        "to_status": "completed",
+        "quality_status": "normal",
+        "current_step": "simulated_published",
+    }
+    assert next(
+        audit
+        for audit in audits
+        if audit.event_type is AuditEventType.SIMULATED_PUBLISH_COMPLETED
+    ).details == {
+        "changed_fields": [
+            "title",
+            "selling_points",
+            "description",
+            "keywords",
+            "attribute_completions",
+        ],
+        "published_from_version": 7,
+        "published_to_version": 8,
+    }
+    assert await _model_count(session, ApprovalAction) == 2
+    assert await _publish_count(session) == 1
+    assert await _model_count(session, AuditEvent) == 3
+    serialized = response.text
+    assert "approve-key" not in serialized
+    assert record.publish_idempotency_hash not in serialized
+    assert action.idempotency_key_hash not in serialized
+    assert action.request_hash not in serialized
+
+
+async def test_operator_approve_is_denied_with_one_safe_audit_and_no_publish(
+    manual_client, manual_route_data, session
+) -> None:
+    actor = manual_route_data["operator"]
+    await _submit(manual_client, actor)
+    product = await session.get(Product, "product-1")
+    assert product is not None
+    before = (product.title, product.current_version, await _action_counts(session))
+
+    response = await _approve(manual_client, actor)
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": {"code": "PROPOSAL_ACTION_FORBIDDEN"}}
+    product = await session.get(Product, "product-1", populate_existing=True)
+    assert product is not None and (product.title, product.current_version) == before[:2]
+    assert await _model_count(session, ApprovalAction) == 1
+    assert await _publish_count(session) == 0
+    audits = list(await session.scalars(select(AuditEvent).order_by(AuditEvent.created_at)))
+    assert len(audits) == before[2][1] + 1
+    assert (
+        audits[-1].event_type,
+        audits[-1].outcome,
+        audits[-1].error_code,
+        audits[-1].details,
+    ) == (
+        AuditEventType.AUTHORIZATION_DENIED,
+        AuditOutcome.DENIED,
+        "PROPOSAL_ACTION_FORBIDDEN",
+        {},
+    )
+
+
+@pytest.mark.parametrize("actor_name", ["operator", "supervisor", "admin"])
+async def test_approve_requires_fresh_exact_scope_for_every_role(
+    manual_client, manual_route_data, session, actor_name: str
+) -> None:
+    actor = manual_route_data[actor_name]
+    await _submit(manual_client, actor)
+    await session.execute(
+        delete(UserStoreScope).where(
+            UserStoreScope.user_id == actor.id,
+            UserStoreScope.store_id == "store-1",
+        )
+    )
+    await session.commit()
+    before = await _action_counts(session)
+
+    response = await _approve(manual_client, actor)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": {"code": "PROPOSAL_NOT_FOUND"}}
+    assert await _action_counts(session) == before
+    assert await _publish_count(session) == 0
+
+
+async def test_approve_exact_and_completed_new_key_replay_return_one_publish(
+    manual_client, manual_route_data, session
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _prepare_publish_output(session, manual_route_data["parent"])
+    await _submit(manual_client, actor)
+    first = await _approve(manual_client, actor, key="approve-replay-key")
+    assert first.status_code == 201
+    before = (await _action_counts(session), await _publish_count(session))
+
+    same_key = await _approve(manual_client, actor, key="approve-replay-key")
+    new_key = await _approve(manual_client, actor, key="approve-new-key")
+
+    assert same_key.status_code == new_key.status_code == 200
+    assert same_key.json() == new_key.json() == first.json()
+    assert (await _action_counts(session), await _publish_count(session)) == before
+    product = await session.get(Product, "product-1", populate_existing=True)
+    assert product is not None and product.current_version == 8
+
+
+async def test_approve_same_key_different_owned_revision_conflicts_before_completed_gate(
+    manual_client, manual_route_data, session
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _submit(manual_client, actor)
+    first = await _approve(manual_client, actor, key="approve-same-key")
+    assert first.status_code == 201
+    parent = manual_route_data["parent"]
+    session.add(
+        ProposalRevision(
+            id="revision-2",
+            proposal_id="proposal-1",
+            iteration=None,
+            revision_number=2,
+            origin=ProposalRevisionOrigin.MANUAL,
+            created_by=actor.id,
+            parent_revision_id="revision-1",
+            base_product_version=7,
+            trusted_fact_hash="e" * 64,
+            proposal_output=parent.proposal_output,
+            citations=parent.citations,
+        )
+    )
+    await session.commit()
+    before = (await _action_counts(session), await _publish_count(session))
+
+    conflict = await _approve(
+        manual_client, actor, key="approve-same-key", revision_id="revision-2"
+    )
+
+    assert conflict.status_code == 409
+    assert conflict.json() == {"detail": {"code": "IDEMPOTENCY_REPLAY_CONFLICT"}}
+    assert (await _action_counts(session), await _publish_count(session)) == before
+
+
+@pytest.mark.parametrize(
+    ("winner", "loser"),
+    [
+        ("approve", "reject"),
+        ("approve", "request-changes"),
+        ("reject", "approve"),
+        ("request-changes", "approve"),
+    ],
+)
+async def test_approve_and_terminal_conflicts_keep_only_the_winner(
+    manual_client, manual_route_data, session, winner: str, loser: str
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _submit(manual_client, actor)
+    winner_response = (
+        await _approve(manual_client, actor, key="winner-key")
+        if winner == "approve"
+        else await manual_client.post(
+            f"/approvals/proposal-1/{winner}",
+            json=_body(comment="赢家意见"),
+            headers=_headers(actor, "winner-key"),
+        )
+    )
+    assert winner_response.status_code == 201
+    before = (await _action_counts(session), await _publish_count(session))
+
+    loser_response = (
+        await _approve(manual_client, actor, key="loser-key")
+        if loser == "approve"
+        else await manual_client.post(
+            f"/approvals/proposal-1/{loser}",
+            json=_body(comment="输家意见"),
+            headers=_headers(actor, "loser-key"),
+        )
+    )
+
+    assert loser_response.status_code == 409
+    assert loser_response.json() == {"detail": {"code": "APPROVAL_ACTION_CONFLICT"}}
+    assert (await _action_counts(session), await _publish_count(session)) == before
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("product-version", "PRODUCT_VERSION_CONFLICT"),
+        ("submitted-pointer", "APPROVAL_STATE_CONFLICT"),
+        ("current-pointer", "APPROVAL_STATE_CONFLICT"),
+        ("review-failed", "PROPOSAL_DATA_INCONSISTENT"),
+        ("review-quality", "PROPOSAL_DATA_INCONSISTENT"),
+        ("citation", "TRUSTED_EVIDENCE_INVALID"),
+        ("sku-price", "TRUSTED_EVIDENCE_INVALID"),
+        ("sku-identity", "TRUSTED_EVIDENCE_INVALID"),
+    ],
+)
+async def test_approve_rechecks_version_pointers_review_citations_and_sku_facts(
+    manual_client, manual_route_data, session, case: str, expected_code: str
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _submit(manual_client, actor)
+    if case == "product-version":
+        statement = update(Product).where(Product.id == "product-1").values(current_version=8)
+    elif case == "submitted-pointer":
+        statement = update(ProductProposal).where(ProductProposal.id == "proposal-1").values(
+            submitted_revision_id=None
+        )
+    elif case == "current-pointer":
+        statement = update(ProductProposal).where(ProductProposal.id == "proposal-1").values(
+            current_revision_id=None
+        )
+    elif case == "review-failed":
+        statement = update(ComplianceReview).where(ComplianceReview.id == "review-1").values(
+            passed=False
+        )
+    elif case == "review-quality":
+        statement = update(ComplianceReview).where(ComplianceReview.id == "review-1").values(
+            quality_status=WorkflowQuality.DEGRADED
+        )
+    elif case == "citation":
+        statement = update(KnowledgeDocument).where(KnowledgeDocument.id == "document-1").values(
+            current_version_id=None
+        )
+    elif case == "sku-price":
+        statement = update(ProductSku).where(ProductSku.id == "sku-1").values(
+            price=Decimal("101.00")
+        )
+    else:
+        statement = update(ProductSku).where(ProductSku.id == "sku-1").values(
+            code="SKU-CHANGED"
+        )
+    await session.execute(statement.execution_options(synchronize_session=False))
+    await session.commit()
+    before = (await _action_counts(session), await _publish_count(session))
+
+    response = await _approve(manual_client, actor)
+
+    assert response.status_code == (422 if expected_code == "TRUSTED_EVIDENCE_INVALID" else 409 if expected_code != "PROPOSAL_DATA_INCONSISTENT" else 503)
+    assert response.json() == {"detail": {"code": expected_code}}
+    assert (await _action_counts(session), await _publish_count(session)) == before
+
+
+@pytest.mark.parametrize("corruption", ["snapshot", "submit-audit-publish"])
+async def test_submit_replay_rejects_a_corrupted_completed_publish_chain(
+    manual_client, manual_route_data, session, corruption: str
+) -> None:
+    actor = manual_route_data["supervisor"]
+    submit_key = "completed-submit-replay"
+    await _submit(manual_client, actor, key=submit_key)
+    approved = await _approve(manual_client, actor, key="completed-approve")
+    assert approved.status_code == 201
+    record = await session.scalar(select(PublishRecord))
+    assert record is not None
+    if corruption == "snapshot":
+        record.after_snapshot = {**record.after_snapshot, "title": "伪造标题"}
+    else:
+        submit_audit = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.event_type == AuditEventType.PROPOSAL_SUBMITTED
+            )
+        )
+        assert submit_audit is not None
+        submit_audit.publish_record_id = record.id
+    await session.commit()
+    before = (await _action_counts(session), await _publish_count(session))
+
+    replay = await manual_client.post(
+        "/proposals/proposal-1/submit",
+        json=_body(),
+        headers=_headers(actor, submit_key),
+    )
+
+    assert replay.status_code == 503
+    assert replay.json() == {"detail": {"code": "PROPOSAL_DATA_INCONSISTENT"}}
+    assert (await _action_counts(session), await _publish_count(session)) == before
+
+
+async def test_approve_replay_rejects_an_extra_misbound_publish_audit(
+    manual_client, manual_route_data, session
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _submit(manual_client, actor)
+    approve_key = "extra-publish-audit"
+    approved = await _approve(manual_client, actor, key=approve_key)
+    assert approved.status_code == 201
+    publish_audit = await session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.event_type == AuditEventType.SIMULATED_PUBLISH_COMPLETED
+        )
+    )
+    assert publish_audit is not None
+    session.add(
+        AuditEvent(
+            id="extra-publish-audit",
+            event_type=publish_audit.event_type,
+            outcome=publish_audit.outcome,
+            actor_id=publish_audit.actor_id,
+            actor_role=publish_audit.actor_role,
+            store_id=publish_audit.store_id,
+            proposal_id=publish_audit.proposal_id,
+            proposal_revision_id=publish_audit.proposal_revision_id,
+            workflow_run_id=publish_audit.workflow_run_id,
+            approval_action_id=publish_audit.approval_action_id,
+            publish_record_id=None,
+            request_id=publish_audit.request_id,
+            error_code=None,
+            details=dict(publish_audit.details),
+        )
+    )
+    await session.commit()
+    before = (await _action_counts(session), await _publish_count(session))
+
+    replay = await _approve(manual_client, actor, key=approve_key)
+
+    assert replay.status_code == 409
+    assert replay.json() == {"detail": {"code": "PUBLISH_REPLAY_CONFLICT"}}
+    assert (await _action_counts(session), await _publish_count(session)) == before
+
+
+async def test_approve_replay_rejects_an_extra_misbound_primary_audit(
+    manual_client, manual_route_data, session
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _submit(manual_client, actor)
+    approve_key = "extra-primary-audit"
+    approved = await _approve(manual_client, actor, key=approve_key)
+    assert approved.status_code == 201
+    approved_audit = await session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.event_type == AuditEventType.PROPOSAL_APPROVED
+        )
+    )
+    assert approved_audit is not None
+    session.add(
+        AuditEvent(
+            id="extra-approved-audit",
+            event_type=approved_audit.event_type,
+            outcome=approved_audit.outcome,
+            actor_id=approved_audit.actor_id,
+            actor_role=approved_audit.actor_role,
+            store_id="store-2",
+            proposal_id=approved_audit.proposal_id,
+            proposal_revision_id=approved_audit.proposal_revision_id,
+            workflow_run_id=approved_audit.workflow_run_id,
+            approval_action_id=approved_audit.approval_action_id,
+            publish_record_id=approved_audit.publish_record_id,
+            request_id=approved_audit.request_id,
+            error_code=approved_audit.error_code,
+            details=dict(approved_audit.details),
+        )
+    )
+    await session.commit()
+    before = (await _action_counts(session), await _publish_count(session))
+
+    replay = await _approve(manual_client, actor, key=approve_key)
+
+    assert replay.status_code == 409
+    assert replay.json() == {"detail": {"code": "PUBLISH_REPLAY_CONFLICT"}}
+    assert (await _action_counts(session), await _publish_count(session)) == before
+
+
+@pytest.mark.parametrize(
+    "corruption", ["snapshot", "hash", "action", "approved-audit-publish"]
+)
+async def test_approve_replay_rejects_non_exact_immutable_publish_chains(
+    manual_client, manual_route_data, session, corruption: str
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _submit(manual_client, actor)
+    first = await _approve(manual_client, actor, key="corrupt-replay")
+    assert first.status_code == 201
+    record = await session.scalar(select(PublishRecord))
+    action = await session.scalar(
+        select(ApprovalAction).where(ApprovalAction.action == ApprovalActionType.APPROVE)
+    )
+    assert record is not None and action is not None
+    if corruption == "snapshot":
+        record.after_snapshot = {**record.after_snapshot, "title": "伪造标题"}
+    elif corruption == "hash":
+        record.publish_idempotency_hash = "f" * 64
+    elif corruption == "action":
+        action.store_id = "store-2"
+    else:
+        approved_audit = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.event_type == AuditEventType.PROPOSAL_APPROVED
+            )
+        )
+        assert approved_audit is not None
+        approved_audit.publish_record_id = None
+    await session.commit()
+    before = (await _action_counts(session), await _publish_count(session))
+
+    replay = await _approve(manual_client, actor, key="corrupt-replay")
+
+    assert replay.status_code == 409
+    assert replay.json() == {"detail": {"code": "PUBLISH_REPLAY_CONFLICT"}}
+    assert (await _action_counts(session), await _publish_count(session)) == before
+
+
+@pytest.mark.parametrize("fail_at", range(1, 7))
+async def test_approve_rolls_back_every_publish_boundary(
+    manual_client, manual_route_data, session, monkeypatch, fail_at: int
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _prepare_publish_output(session, manual_route_data["parent"])
+    await _submit(manual_client, actor)
+    product = await session.get(Product, "product-1", populate_existing=True)
+    run = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    assert product is not None and run is not None
+    product_before = (
+        product.title,
+        list(product.selling_points),
+        product.description,
+        list(product.search_keywords),
+        dict(product.attributes),
+        product.current_version,
+    )
+    run_before = (run.status, run.quality_status, run.current_step, run.error_code)
+    counts_before = (await _action_counts(session), await _publish_count(session))
+    original_flush = session.flush
+    calls = 0
+
+    async def fail_after_flush(*args, **kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        await original_flush(*args, **kwargs)
+        if calls == fail_at:
+            raise SQLAlchemyError(f"simulated publish boundary {fail_at}")
+
+    monkeypatch.setattr(session, "flush", fail_after_flush)
+    response = await _approve(manual_client, actor, key=f"rollback-{fail_at}")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "PROPOSAL_DATA_INCONSISTENT"}}
+    monkeypatch.undo()
+    await session.rollback()
+    product = await session.get(Product, "product-1", populate_existing=True)
+    run = await session.get(WorkflowRun, "optimization-1", populate_existing=True)
+    assert product is not None and run is not None
+    assert (
+        product.title,
+        list(product.selling_points),
+        product.description,
+        list(product.search_keywords),
+        dict(product.attributes),
+        product.current_version,
+    ) == product_before
+    assert (run.status, run.quality_status, run.current_step, run.error_code) == run_before
+    assert (await _action_counts(session), await _publish_count(session)) == counts_before
+
+
+async def test_approve_integrity_race_recovers_the_single_completed_winner(
+    manual_route_data, session, monkeypatch
+) -> None:
+    from backend.approvals import approve_proposal, submit_proposal
+
+    actor = manual_route_data["supervisor"]
+    actor_id = actor.id
+    submitted = await submit_proposal(
+        session,
+        actor_id=actor_id,
+        proposal_id="proposal-1",
+        request=ProposalActionRequest(revision_id="revision-1"),
+        idempotency_key="publish-race-submit",
+        request_id="publish-race-submit-request",
+    )
+    assert submitted.created is True
+    original_flush = session.flush
+    raced = False
+
+    async def race_flush(*args, **kwargs) -> None:
+        nonlocal raced
+        if raced:
+            await original_flush(*args, **kwargs)
+            return
+        raced = True
+        await session.rollback()
+        monkeypatch.setattr(session, "flush", original_flush)
+        winner = await approve_proposal(
+            session,
+            actor_id=actor_id,
+            proposal_id="proposal-1",
+            request=ProposalActionRequest(revision_id="revision-1"),
+            idempotency_key="publish-winner-key",
+            request_id="publish-winner-request",
+        )
+        assert winner.created is True
+        monkeypatch.setattr(session, "flush", race_flush)
+        raise IntegrityError("insert", {}, RuntimeError("simulated publish race"))
+
+    monkeypatch.setattr(session, "flush", race_flush)
+    result = await approve_proposal(
+        session,
+        actor_id=actor_id,
+        proposal_id="proposal-1",
+        request=ProposalActionRequest(revision_id="revision-1"),
+        idempotency_key="publish-loser-key",
+        request_id="publish-loser-request",
+    )
+
+    assert result.created is False
+    assert await _publish_count(session) == 1
+    assert await _model_count(session, ApprovalAction) == 2
+    assert await _model_count(session, AuditEvent) == 3
+    product = await session.get(Product, "product-1", populate_existing=True)
+    assert product is not None and product.current_version == 8
