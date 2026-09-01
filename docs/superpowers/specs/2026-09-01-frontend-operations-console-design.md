@@ -1,6 +1,6 @@
 # 运营管理台前端设计
 
-> 状态：逐节设计已批准，待书面规格审核
+> 状态：已批准
 > 日期：2026-09-01
 > 项目路径：`D:\E-commerce_operations`
 > 上游：[总设计](2026-08-25-ecommerce-operations-design.md)、[商品优化与合规设计](2026-08-28-product-optimization-compliance-design.md)、[人工修订、审批与模拟发布设计](2026-08-31-manual-review-approval-publish-design.md)
