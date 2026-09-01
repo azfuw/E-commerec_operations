@@ -7,7 +7,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 
 from backend.common import (
     ApprovalActionType,
+    AuditEventType,
+    AuditOutcome,
     ComplianceRiskLevel,
+    ProposalRevisionOrigin,
     UserRole,
     WorkflowQuality,
     WorkflowStatus,
@@ -312,6 +315,59 @@ class PublishRecordView(BaseModel):
         return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
+class ApprovalListItem(BaseModel):
+    proposal_id: str
+    proposal_revision_id: str
+    revision_number: int
+    store_id: str
+    product_id: str
+    submitted_by: str
+    status: Literal["pending_approval"]
+    submitted_at: datetime
+
+    @field_serializer("submitted_at", when_used="json")
+    def serialize_submitted_at(self, value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+class ApprovalListView(BaseModel):
+    items: list[ApprovalListItem]
+    page: int
+    page_size: int
+    total: int
+
+
+class AuditEventView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    event_type: AuditEventType
+    outcome: AuditOutcome
+    actor_id: str | None
+    actor_role: UserRole | None
+    store_id: str
+    proposal_id: str | None
+    proposal_revision_id: str | None
+    workflow_run_id: str | None
+    approval_action_id: str | None
+    publish_record_id: str | None
+    request_id: str | None
+    error_code: str | None
+    details: dict[str, object]
+    created_at: datetime
+
+    @field_serializer("created_at", when_used="json")
+    def serialize_created_at(self, value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+class AuditEventListView(BaseModel):
+    items: list[AuditEventView]
+    page: int
+    page_size: int
+    total: int
+
+
 class ValidatedRequiredChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -477,16 +533,24 @@ class OptimizationWorkflowSummary(BaseModel):
 
 
 class ProposalRevisionView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
-    iteration: int
+    iteration: int | None
+    revision_number: int
+    origin: ProposalRevisionOrigin
+    created_by: str
+    parent_revision_id: str | None
     base_product_version: int
     proposal_output: dict[str, object]
     citations: list[dict[str, object]]
 
 
 class ComplianceReviewView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
-    iteration: int
+    iteration: int | None
     deterministic_checks: dict[str, object]
     semantic_review: dict[str, object]
     passed: bool
@@ -510,11 +574,25 @@ class ProposalView(BaseModel):
     updated_at: datetime
 
 
+class ManualReviewSummary(BaseModel):
+    manual_review_run_id: str
+    workflow_run_id: str
+    proposal_revision_id: str
+    status: WorkflowStatus
+    quality_status: WorkflowQuality
+    current_step: str | None
+    error_code: str | None
+
+
 class ProposalDetailView(BaseModel):
     proposal: ProposalView
     optimization_run: OptimizationWorkflowSummary
     current_revision: ProposalRevisionView | None
     current_review: ComplianceReviewView | None
+    active_manual_review: ManualReviewSummary | None
+    submitted_revision: ProposalRevisionView | None
+    latest_action: ApprovalActionView | None
+    publish_record: PublishRecordView | None
 
 
 class AnalysisCandidateView(BaseModel):

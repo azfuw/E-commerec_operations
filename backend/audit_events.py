@@ -1,20 +1,25 @@
 import json
 import unicodedata
+from dataclasses import dataclass
 from uuid import uuid4
 
+from sqlalchemy import and_, func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.common import (
+    ApprovalActionType,
     AuditEventType,
     AuditOutcome,
     ComplianceRiskLevel,
     ProposalRevisionOrigin,
     UserRole,
+    UserStatus,
     WorkflowQuality,
     WorkflowStatus,
     WorkflowType,
 )
-from backend.models import AuditEvent
+from backend.models import ApprovalAction, AuditEvent, Store, User, UserStoreScope
 
 
 AUDIT_DETAIL_KEYS = frozenset(
@@ -37,6 +42,12 @@ AUDIT_DETAIL_KEYS = frozenset(
 _EDITABLE_FIELDS = frozenset(
     {"title", "selling_points", "description", "keywords", "attribute_completions"}
 )
+
+
+@dataclass
+class AuditEventDomainError(Exception):
+    code: str
+    status_code: int
 
 
 def _safe_details(details: dict[str, object]) -> None:
@@ -127,3 +138,72 @@ def add_audit_event(
     )
     session.add(event)
     return event
+
+
+async def list_audit_events(
+    session: AsyncSession,
+    *,
+    actor_id: str,
+    page: int,
+    page_size: int,
+    store_id: str | None,
+    proposal_id: str | None,
+    action: ApprovalActionType | None,
+) -> tuple[list[AuditEvent], int]:
+    try:
+        actor = await session.scalar(
+            select(User)
+            .where(User.id == actor_id)
+            .execution_options(populate_existing=True)
+        )
+        if (
+            actor is None
+            or actor.status is not UserStatus.ACTIVE
+            or actor.role not in {UserRole.SUPERVISOR, UserRole.ADMIN}
+        ):
+            raise AuditEventDomainError("PROPOSAL_ACTION_FORBIDDEN", 403)
+
+        statement = (
+            select(AuditEvent)
+            .join(Store, Store.id == AuditEvent.store_id)
+            .join(
+                UserStoreScope,
+                and_(
+                    UserStoreScope.user_id == actor.id,
+                    UserStoreScope.store_id == AuditEvent.store_id,
+                ),
+            )
+            .where(Store.enabled.is_(True))
+        )
+        if store_id is not None:
+            statement = statement.where(AuditEvent.store_id == store_id)
+        if proposal_id is not None:
+            statement = statement.where(AuditEvent.proposal_id == proposal_id)
+        if action is not None:
+            statement = statement.join(
+                ApprovalAction,
+                and_(
+                    ApprovalAction.id == AuditEvent.approval_action_id,
+                    ApprovalAction.store_id == AuditEvent.store_id,
+                ),
+            ).where(ApprovalAction.action == action)
+
+        total = int(
+            await session.scalar(select(func.count()).select_from(statement.subquery())) or 0
+        )
+        events = list(
+            await session.scalars(
+                statement.order_by(AuditEvent.created_at, AuditEvent.id)
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        )
+        for event in events:
+            _safe_details(event.details)
+        return events, total
+    except AuditEventDomainError:
+        await session.rollback()
+        raise
+    except (SQLAlchemyError, ValueError):
+        await session.rollback()
+        raise AuditEventDomainError("PROPOSAL_DATA_INCONSISTENT", 503) from None

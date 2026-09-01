@@ -24,6 +24,7 @@ from backend.common import (
     WorkflowType,
 )
 from backend.models import (
+    AnalysisCandidate,
     ApprovalAction,
     AuditEvent,
     ComplianceReview,
@@ -183,6 +184,182 @@ async def _approve(client, actor: User, *, key: str = "approve-key", revision_id
         json=_body(revision_id),
         headers=_headers(actor, key),
     )
+
+
+_UNSAFE_READ_KEYS = {
+    "idempotency_key_hash",
+    "request_hash",
+    "trusted_fact_hash",
+    "publish_idempotency_hash",
+    "lease_owner",
+    "lease_expires_at",
+    "checkpoint",
+    "input",
+    "output",
+    "prompt",
+    "provider",
+    "path",
+    "vector",
+    "authorization",
+    "key",
+    "raw_response",
+}
+
+
+def _nested_keys(value: object) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | {
+            nested
+            for child in value.values()
+            for nested in _nested_keys(child)
+        }
+    if isinstance(value, list):
+        return {nested for child in value for nested in _nested_keys(child)}
+    return set()
+
+
+def _assert_safe_read(response, caplog) -> None:
+    assert not _UNSAFE_READ_KEYS & {key.lower() for key in _nested_keys(response.json())}
+    captured = caplog.text.lower()
+    assert not any(
+        value in captured
+        for value in (
+            "idempotency_key_hash",
+            "request_hash",
+            "trusted_fact_hash",
+            "publish_idempotency_hash",
+            "lease_owner",
+            "lease_expires_at",
+            "checkpoint",
+            "authorization",
+            "deepseek_api_key",
+            "raw_response",
+        )
+    )
+
+
+async def _pending_list_item(
+    session,
+    data: dict[str, object],
+    *,
+    suffix: str,
+    store: Store,
+    product: Product,
+    actor: User,
+    created_at: datetime,
+) -> tuple[ProductProposal, ProposalRevision, ApprovalAction]:
+    source = data["candidate"]
+    analysis = WorkflowRun(
+        id=f"analysis-list-{suffix}",
+        workflow_type=WorkflowType.ANALYSIS,
+        store_id=store.id,
+        created_by=actor.id,
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 2),
+        status=WorkflowStatus.COMPLETED,
+        quality_status=WorkflowQuality.NORMAL,
+        current_step="product_selected",
+        created_at=created_at,
+    )
+    optimization = WorkflowRun(
+        id=f"optimization-list-{suffix}",
+        workflow_type=WorkflowType.OPTIMIZATION,
+        store_id=store.id,
+        created_by=actor.id,
+        status=WorkflowStatus.PENDING_APPROVAL,
+        quality_status=WorkflowQuality.NORMAL,
+        current_step="pending_approval",
+        input={
+            "proposal_id": f"proposal-list-{suffix}",
+            "source_analysis_run_id": analysis.id,
+            "analysis_candidate_id": f"candidate-list-{suffix}",
+            "product_id": product.id,
+            "store_id": store.id,
+        },
+        created_at=created_at,
+    )
+    session.add_all([analysis, optimization])
+    await session.flush()
+    candidate = AnalysisCandidate(
+        id=f"candidate-list-{suffix}",
+        workflow_run_id=analysis.id,
+        product_id=product.id,
+        rank=1,
+        product_code=product.code,
+        anomaly_types=list(source.anomaly_types),
+        metrics=dict(source.metrics),
+        business_impact=source.business_impact,
+        evidence=list(source.evidence),
+        impact_explanation=source.impact_explanation,
+        reason=source.reason,
+        recommended_action=source.recommended_action,
+        confidence=source.confidence,
+        created_at=created_at,
+    )
+    session.add(candidate)
+    await session.flush()
+    proposal = ProductProposal(
+        id=f"proposal-list-{suffix}",
+        analysis_run_id=analysis.id,
+        analysis_candidate_id=candidate.id,
+        optimization_run_id=optimization.id,
+        store_id=store.id,
+        product_id=product.id,
+        base_product_version=product.current_version,
+        selection_idempotency_hash=suffix[0] * 64,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    session.add(proposal)
+    await session.flush()
+    revision = ProposalRevision(
+        id=f"revision-list-{suffix}",
+        proposal_id=proposal.id,
+        iteration=0,
+        revision_number=1,
+        origin=ProposalRevisionOrigin.AGENT,
+        created_by=actor.id,
+        parent_revision_id=None,
+        base_product_version=product.current_version,
+        trusted_fact_hash=suffix[-1] * 64,
+        proposal_output={"title": f"列表方案 {suffix}"},
+        citations=[],
+        created_at=created_at,
+    )
+    session.add(revision)
+    await session.flush()
+    review = ComplianceReview(
+        id=f"review-list-{suffix}",
+        proposal_id=proposal.id,
+        proposal_revision_id=revision.id,
+        iteration=0,
+        deterministic_checks={"passed": True},
+        semantic_review={"passed": True},
+        passed=True,
+        risk_level=data["review"].risk_level,
+        required_changes=[],
+        citations=[],
+        quality_status=WorkflowQuality.NORMAL,
+        created_at=created_at,
+    )
+    action = ApprovalAction(
+        id=f"action-list-{suffix}",
+        proposal_id=proposal.id,
+        proposal_revision_id=revision.id,
+        store_id=store.id,
+        actor_id=actor.id,
+        actor_role=actor.role,
+        action=ApprovalActionType.SUBMIT,
+        comment=None,
+        idempotency_key_hash="e" * 64,
+        request_hash="f" * 64,
+        created_at=created_at,
+    )
+    session.add_all([review, action])
+    proposal.current_revision_id = revision.id
+    proposal.submitted_revision_id = revision.id
+    await session.flush()
+    return proposal, revision, action
 
 
 def test_action_requests_enforce_resource_comment_and_extra_boundaries() -> None:
@@ -1536,6 +1713,273 @@ async def test_approve_exact_and_completed_new_key_replay_return_one_publish(
     assert (await _action_counts(session), await _publish_count(session)) == before
     product = await session.get(Product, "product-1", populate_existing=True)
     assert product is not None and product.current_version == 8
+
+
+async def test_approval_list_enforces_scope_stable_pagination_total_and_safe_output(
+    manual_client, manual_route_data, session, caplog
+) -> None:
+    created_at = datetime(2026, 8, 31, 12, 0, tzinfo=UTC)
+    first, _, _ = await _pending_list_item(
+        session,
+        manual_route_data,
+        suffix="a",
+        store=manual_route_data["store"],
+        product=manual_route_data["product"],
+        actor=manual_route_data["operator"],
+        created_at=created_at,
+    )
+    second, _, _ = await _pending_list_item(
+        session,
+        manual_route_data,
+        suffix="b",
+        store=manual_route_data["store"],
+        product=manual_route_data["product"],
+        actor=manual_route_data["supervisor"],
+        created_at=created_at,
+    )
+    rejected, _, _ = await _pending_list_item(
+        session,
+        manual_route_data,
+        suffix="rejected",
+        store=manual_route_data["store"],
+        product=manual_route_data["product"],
+        actor=manual_route_data["operator"],
+        created_at=created_at,
+    )
+    rejected_run = await session.get(WorkflowRun, rejected.optimization_run_id)
+    assert rejected_run is not None
+    rejected_run.status = WorkflowStatus.REJECTED
+    rejected_run.current_step = "rejected"
+    await _pending_list_item(
+        session,
+        manual_route_data,
+        suffix="foreign",
+        store=manual_route_data["other_store"],
+        product=manual_route_data["other_product"],
+        actor=manual_route_data["other"],
+        created_at=created_at,
+    )
+    await session.commit()
+
+    for actor_name in ("supervisor", "admin"):
+        first_page = await manual_client.get(
+            "/approvals?page=1&page_size=1",
+            headers=_headers(manual_route_data[actor_name], None),
+        )
+        second_page = await manual_client.get(
+            "/approvals?page=2&page_size=1",
+            headers=_headers(manual_route_data[actor_name], None),
+        )
+        assert first_page.status_code == second_page.status_code == 200
+        assert first_page.json()["total"] == second_page.json()["total"] == 2
+        assert first_page.json()["page"] == 1
+        assert second_page.json()["page"] == 2
+        assert first_page.json()["page_size"] == second_page.json()["page_size"] == 1
+        assert first_page.json()["items"] == [
+            {
+                "proposal_id": first.id,
+                "proposal_revision_id": "revision-list-a",
+                "revision_number": 1,
+                "store_id": "store-1",
+                "product_id": "product-1",
+                "submitted_by": "operator-1",
+                "status": "pending_approval",
+                "submitted_at": "2026-08-31T12:00:00Z",
+            }
+        ]
+        assert second_page.json()["items"] == [
+            {
+                "proposal_id": second.id,
+                "proposal_revision_id": "revision-list-b",
+                "revision_number": 1,
+                "store_id": "store-1",
+                "product_id": "product-1",
+                "submitted_by": "supervisor-1",
+                "status": "pending_approval",
+                "submitted_at": "2026-08-31T12:00:00Z",
+            }
+        ]
+        assert rejected.id not in first_page.text + second_page.text
+        _assert_safe_read(first_page, caplog)
+        _assert_safe_read(second_page, caplog)
+
+    stale_scope = await session.get(
+        UserStoreScope,
+        {"user_id": "admin-1", "store_id": "store-1"},
+    )
+    assert stale_scope is not None
+    await session.execute(
+        delete(UserStoreScope).where(
+            UserStoreScope.user_id == "admin-1",
+            UserStoreScope.store_id == "store-1",
+        )
+    )
+    await session.commit()
+    refreshed = await manual_client.get(
+        "/approvals", headers=_headers(manual_route_data["admin"], None)
+    )
+    assert refreshed.status_code == 200
+    assert refreshed.json()["items"] == []
+    assert refreshed.json()["total"] == 0
+
+
+@pytest.mark.parametrize("path", ["/approvals", "/audit-events"])
+async def test_approval_and_audit_lists_forbid_operator(
+    manual_client, manual_route_data, path: str
+) -> None:
+    response = await manual_client.get(
+        path, headers=_headers(manual_route_data["operator"], None)
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": {"code": "PROPOSAL_ACTION_FORBIDDEN"}
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/approvals?page=0",
+        "/approvals?page_size=0",
+        "/approvals?page_size=101",
+        "/audit-events?page=0",
+        "/audit-events?page_size=0",
+        "/audit-events?page_size=101",
+        "/audit-events?store_id=",
+        f"/audit-events?store_id={'s' * 37}",
+        "/audit-events?proposal_id=",
+        f"/audit-events?proposal_id={'p' * 37}",
+        "/audit-events?action=not-an-action",
+    ],
+)
+async def test_approval_and_audit_list_query_bounds_return_422(
+    manual_client, manual_route_data, path: str
+) -> None:
+    response = await manual_client.get(
+        path, headers=_headers(manual_route_data["supervisor"], None)
+    )
+
+    assert response.status_code == 422
+
+
+async def test_audit_list_filters_through_action_and_excludes_foreign_scope_safely(
+    manual_client, manual_route_data, session, caplog
+) -> None:
+    created_at = datetime(2026, 8, 31, 13, 0, tzinfo=UTC)
+    actions = [
+        ApprovalAction(
+            id=f"audit-action-{action.value}",
+            proposal_id="proposal-1",
+            proposal_revision_id="revision-1",
+            store_id="store-1",
+            actor_id="supervisor-1",
+            actor_role=UserRole.SUPERVISOR,
+            action=action,
+            comment=None,
+            idempotency_key_hash=character * 64,
+            request_hash=character.upper() * 64,
+            created_at=created_at,
+        )
+        for action, character in (
+            (ApprovalActionType.SUBMIT, "1"),
+            (ApprovalActionType.APPROVE, "2"),
+        )
+    ]
+    session.add_all(actions)
+    await session.flush()
+    session.add_all(
+        [
+            AuditEvent(
+                id="audit-submit",
+                event_type=AuditEventType.PROPOSAL_APPROVED,
+                outcome=AuditOutcome.SUCCESS,
+                actor_id="supervisor-1",
+                actor_role=UserRole.SUPERVISOR,
+                store_id="store-1",
+                proposal_id="proposal-1",
+                proposal_revision_id="revision-1",
+                workflow_run_id="optimization-1",
+                approval_action_id=actions[0].id,
+                request_id="audit-submit-request",
+                details={"from_status": "pending_approval", "to_status": "completed"},
+                created_at=created_at,
+            ),
+            AuditEvent(
+                id="audit-approve",
+                event_type=AuditEventType.PROPOSAL_SUBMITTED,
+                outcome=AuditOutcome.SUCCESS,
+                actor_id="supervisor-1",
+                actor_role=UserRole.SUPERVISOR,
+                store_id="store-1",
+                proposal_id="proposal-1",
+                proposal_revision_id="revision-1",
+                workflow_run_id="optimization-1",
+                approval_action_id=actions[1].id,
+                request_id="audit-approve-request",
+                details={"to_status": "pending_approval"},
+                created_at=created_at,
+            ),
+            AuditEvent(
+                id="audit-foreign",
+                event_type=AuditEventType.AUTHORIZATION_DENIED,
+                outcome=AuditOutcome.DENIED,
+                actor_id="other-1",
+                actor_role=UserRole.OPERATOR,
+                store_id="store-2",
+                request_id="audit-foreign-request",
+                details={},
+                created_at=created_at,
+            ),
+        ]
+    )
+    await session.commit()
+
+    response = await manual_client.get(
+        "/audit-events?page=1&page_size=1&store_id=store-1&proposal_id=proposal-1&action=approve",
+        headers=_headers(manual_route_data["admin"], None),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["page"] == response.json()["page_size"] == 1
+    item = response.json()["items"][0]
+    assert set(item) == {
+        "id",
+        "event_type",
+        "outcome",
+        "actor_id",
+        "actor_role",
+        "store_id",
+        "proposal_id",
+        "proposal_revision_id",
+        "workflow_run_id",
+        "approval_action_id",
+        "publish_record_id",
+        "request_id",
+        "error_code",
+        "details",
+        "created_at",
+    }
+    assert item == {
+        "id": "audit-approve",
+        "event_type": "proposal_submitted",
+        "outcome": "success",
+        "actor_id": "supervisor-1",
+        "actor_role": "supervisor",
+        "store_id": "store-1",
+        "proposal_id": "proposal-1",
+        "proposal_revision_id": "revision-1",
+        "workflow_run_id": "optimization-1",
+        "approval_action_id": "audit-action-approve",
+        "publish_record_id": None,
+        "request_id": "audit-approve-request",
+        "error_code": None,
+        "details": {"to_status": "pending_approval"},
+        "created_at": "2026-08-31T13:00:00Z",
+    }
+    assert "audit-foreign" not in response.text
+    _assert_safe_read(response, caplog)
 
 
 async def test_approve_same_key_different_owned_revision_conflicts_before_completed_gate(

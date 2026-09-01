@@ -1,6 +1,6 @@
 import hashlib
 from collections.abc import AsyncIterator
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -10,6 +10,7 @@ from sqlalchemy import delete, func, select, update
 
 from backend.auth import create_access_token, hash_password
 from backend.common import (
+    ApprovalActionType,
     ComplianceRiskLevel,
     ProposalRevisionOrigin,
     UserRole,
@@ -23,16 +24,25 @@ from backend.database import get_session
 from backend.main import create_app
 from backend.models import (
     AnalysisCandidate,
+    ApprovalAction,
     ComplianceReview,
+    ManualReviewRun,
     Product,
     ProductProposal,
     ProposalRevision,
+    PublishRecord,
     Store,
     User,
     UserStoreScope,
     WorkflowRun,
 )
 from backend.proposals import select_product_for_optimization
+from tests.test_manual_review_api import (
+    _manual_body,
+    _manual_headers,
+    manual_client,
+    manual_route_data,
+)
 
 
 def _headers(token: str, *, idempotency_key: str | None = None) -> dict[str, str]:
@@ -196,6 +206,60 @@ async def client(session) -> AsyncIterator[AsyncClient]:
 
 def _token(user: User) -> str:
     return create_access_token(user, get_settings())
+
+
+_UNSAFE_PROPOSAL_READ_KEYS = {
+    "idempotency_key_hash",
+    "request_hash",
+    "trusted_fact_hash",
+    "publish_idempotency_hash",
+    "lease_owner",
+    "lease_expires_at",
+    "checkpoint",
+    "input",
+    "output",
+    "prompt",
+    "provider",
+    "path",
+    "vector",
+    "authorization",
+    "key",
+    "raw_response",
+}
+
+
+def _proposal_read_keys(value: object) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | {
+            nested
+            for child in value.values()
+            for nested in _proposal_read_keys(child)
+        }
+    if isinstance(value, list):
+        return {nested for child in value for nested in _proposal_read_keys(child)}
+    return set()
+
+
+def _assert_safe_proposal_read(response, caplog) -> None:
+    assert not _UNSAFE_PROPOSAL_READ_KEYS & {
+        key.lower() for key in _proposal_read_keys(response.json())
+    }
+    captured = caplog.text.lower()
+    assert not any(
+        value in captured
+        for value in (
+            "idempotency_key_hash",
+            "request_hash",
+            "trusted_fact_hash",
+            "publish_idempotency_hash",
+            "lease_owner",
+            "lease_expires_at",
+            "checkpoint",
+            "authorization",
+            "deepseek_api_key",
+            "raw_response",
+        )
+    )
 
 
 async def test_select_product_commits_all_four_selection_changes_once(
@@ -596,6 +660,10 @@ async def test_proposal_read_returns_linked_revision_and_review_only(client, sel
     assert body["current_revision"] == {
         "id": revision.id,
         "iteration": 0,
+        "revision_number": 1,
+        "origin": "agent",
+        "created_by": optimization.created_by,
+        "parent_revision_id": None,
         "base_product_version": 7,
         "proposal_output": {"title": "可信商品标题"},
         "citations": [{"chunk_id": "chunk-1"}],
@@ -780,3 +848,206 @@ async def test_optimization_workflow_view_keeps_typed_null_dates(client, selecti
         "candidates_ready": False,
         "error_code": None,
     }
+
+
+async def test_proposal_read_returns_safe_manual_revision_and_active_review_summary(
+    manual_client, manual_route_data, session, caplog
+) -> None:
+    accepted = await manual_client.post(
+        "/proposals/proposal-1/manual-revision",
+        json=_manual_body(),
+        headers=_manual_headers(manual_route_data["operator"], "proposal-read-manual-key"),
+    )
+    assert accepted.status_code == 202
+    manual = await session.scalar(select(ManualReviewRun))
+    assert manual is not None
+
+    response = await manual_client.get(
+        "/proposals/proposal-1",
+        headers=_manual_headers(manual_route_data["operator"], None),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert {
+        field: body["current_revision"][field]
+        for field in (
+            "id",
+            "iteration",
+            "revision_number",
+            "origin",
+            "created_by",
+            "parent_revision_id",
+        )
+    } == {
+        "id": manual.proposal_revision_id,
+        "iteration": None,
+        "revision_number": 2,
+        "origin": "manual",
+        "created_by": "operator-1",
+        "parent_revision_id": "revision-1",
+    }
+    assert body["current_review"] is None
+    assert body["active_manual_review"] == {
+        "manual_review_run_id": manual.id,
+        "workflow_run_id": manual.workflow_run_id,
+        "proposal_revision_id": manual.proposal_revision_id,
+        "status": "accepted",
+        "quality_status": "normal",
+        "current_step": "accepted",
+        "error_code": None,
+    }
+    assert body["submitted_revision"] is None
+    assert body["latest_action"] is None
+    assert body["publish_record"] is None
+    _assert_safe_proposal_read(response, caplog)
+
+
+async def test_proposal_read_returns_safe_submitted_action_and_publish_summaries(
+    manual_client, manual_route_data, session, caplog
+) -> None:
+    proposal = manual_route_data["proposal"]
+    parent = manual_route_data["parent"]
+    optimization = manual_route_data["optimization"]
+    proposal.submitted_revision_id = parent.id
+    optimization.status = WorkflowStatus.COMPLETED
+    optimization.current_step = "simulated_published"
+    action = ApprovalAction(
+        id="proposal-read-approve-action",
+        proposal_id=proposal.id,
+        proposal_revision_id=parent.id,
+        store_id=proposal.store_id,
+        actor_id="supervisor-1",
+        actor_role=UserRole.SUPERVISOR,
+        action=ApprovalActionType.APPROVE,
+        comment=None,
+        idempotency_key_hash="8" * 64,
+        request_hash="9" * 64,
+        created_at=datetime(2026, 8, 31, 15, 0, tzinfo=UTC),
+    )
+    session.add(action)
+    await session.flush()
+    publish = PublishRecord(
+        id="proposal-read-publish",
+        proposal_id=proposal.id,
+        proposal_revision_id=parent.id,
+        product_id=proposal.product_id,
+        store_id=proposal.store_id,
+        approved_by="supervisor-1",
+        approval_action_id=action.id,
+        publish_idempotency_hash="7" * 64,
+        before_snapshot={"current_version": 7},
+        after_snapshot={"current_version": 8},
+        base_product_version=7,
+        published_product_version=8,
+        published_at=datetime(2026, 8, 31, 15, 1, tzinfo=UTC),
+    )
+    session.add(publish)
+    await session.commit()
+
+    response = await manual_client.get(
+        "/proposals/proposal-1",
+        headers=_manual_headers(manual_route_data["admin"], None),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["current_revision"]["iteration"] == 0
+    assert body["current_revision"]["revision_number"] == 1
+    assert body["current_revision"]["origin"] == "agent"
+    assert body["current_revision"]["created_by"] == "operator-1"
+    assert body["current_revision"]["parent_revision_id"] is None
+    assert body["current_review"]["iteration"] == 0
+    assert body["active_manual_review"] is None
+    assert body["submitted_revision"]["id"] == parent.id
+    assert body["latest_action"] == {
+        "id": action.id,
+        "proposal_id": proposal.id,
+        "proposal_revision_id": parent.id,
+        "actor_id": "supervisor-1",
+        "actor_role": "supervisor",
+        "action": "approve",
+        "comment": None,
+        "created_at": "2026-08-31T15:00:00Z",
+    }
+    assert body["publish_record"] == {
+        "id": publish.id,
+        "proposal_id": proposal.id,
+        "proposal_revision_id": parent.id,
+        "product_id": proposal.product_id,
+        "store_id": proposal.store_id,
+        "approved_by": "supervisor-1",
+        "approval_action_id": action.id,
+        "before_snapshot": {"current_version": 7},
+        "after_snapshot": {"current_version": 8},
+        "base_product_version": 7,
+        "published_product_version": 8,
+        "published_at": "2026-08-31T15:01:00Z",
+    }
+    _assert_safe_proposal_read(response, caplog)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["active_manual_workflow_store", "latest_action_store", "publish_product"],
+)
+async def test_proposal_read_rejects_inconsistent_manual_approval_publish_links_from_stale_rows(
+    manual_client, manual_route_data, session, corruption: str
+) -> None:
+    proposal = manual_route_data["proposal"]
+    parent = manual_route_data["parent"]
+    action = None
+    if corruption == "active_manual_workflow_store":
+        accepted = await manual_client.post(
+            "/proposals/proposal-1/manual-revision",
+            json=_manual_body(),
+            headers=_manual_headers(manual_route_data["operator"], "stale-manual-key"),
+        )
+        assert accepted.status_code == 202
+        await session.execute(
+            update(WorkflowRun)
+            .where(WorkflowRun.id == accepted.json()["manual_review_workflow_run_id"])
+            .values(store_id="store-2")
+            .execution_options(synchronize_session=False)
+        )
+    else:
+        action = ApprovalAction(
+            id=f"inconsistent-{corruption}-action",
+            proposal_id=proposal.id,
+            proposal_revision_id=parent.id,
+            store_id="store-2" if corruption == "latest_action_store" else proposal.store_id,
+            actor_id="supervisor-1",
+            actor_role=UserRole.SUPERVISOR,
+            action=ApprovalActionType.APPROVE,
+            comment=None,
+            idempotency_key_hash="4" * 64,
+            request_hash="5" * 64,
+        )
+        session.add(action)
+        await session.flush()
+        if corruption == "publish_product":
+            session.add(
+                PublishRecord(
+                    id="inconsistent-publish",
+                    proposal_id=proposal.id,
+                    proposal_revision_id=parent.id,
+                    product_id="product-2",
+                    store_id=proposal.store_id,
+                    approved_by="supervisor-1",
+                    approval_action_id=action.id,
+                    publish_idempotency_hash="6" * 64,
+                    before_snapshot={"current_version": 7},
+                    after_snapshot={"current_version": 8},
+                    base_product_version=7,
+                    published_product_version=8,
+                )
+            )
+    await session.commit()
+
+    response = await manual_client.get(
+        "/proposals/proposal-1",
+        headers=_manual_headers(manual_route_data["operator"], None),
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "PROPOSAL_DATA_INCONSISTENT"}}

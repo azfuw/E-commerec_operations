@@ -7,13 +7,24 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.common import UserRole, UserStatus, WorkflowQuality, WorkflowStatus, WorkflowType
+from backend.common import (
+    ApprovalActionType,
+    ProposalRevisionOrigin,
+    UserRole,
+    UserStatus,
+    WorkflowQuality,
+    WorkflowStatus,
+    WorkflowType,
+)
 from backend.models import (
     AnalysisCandidate,
+    ApprovalAction,
     ComplianceReview,
+    ManualReviewRun,
     Product,
     ProductProposal,
     ProposalRevision,
+    PublishRecord,
     Store,
     User,
     UserStoreScope,
@@ -40,6 +51,11 @@ class ProposalReadResult:
     optimization_run: WorkflowRun
     current_revision: ProposalRevision | None
     current_review: ComplianceReview | None
+    active_manual_review_run: ManualReviewRun | None
+    active_manual_workflow: WorkflowRun | None
+    submitted_revision: ProposalRevision | None
+    latest_action: ApprovalAction | None
+    publish_record: PublishRecord | None
 
 
 async def _selection_context(
@@ -296,6 +312,19 @@ async def get_proposal_for_actor(
             lock=False,
             error_code="PROPOSAL_DATA_INCONSISTENT",
         )
+        product = await session.scalar(
+            select(Product)
+            .where(Product.id == proposal.product_id)
+            .execution_options(populate_existing=True)
+        )
+        if (
+            product is None
+            or product.store_id != store.id
+            or optimization_run.store_id != store.id
+            or optimization_run.input.get("product_id") != product.id
+            or optimization_run.input.get("store_id") != store.id
+        ):
+            raise ProposalDomainError("PROPOSAL_DATA_INCONSISTENT", 503)
 
         revision = None
         review = None
@@ -324,11 +353,123 @@ async def get_proposal_for_actor(
             )
             if review is None and any_review is not None:
                 raise ProposalDomainError("PROPOSAL_DATA_INCONSISTENT", 503)
+
+        active_manual_review_run = None
+        active_manual_workflow = None
+        if proposal.active_manual_review_run_id is not None:
+            active_manual_review_run = await session.scalar(
+                select(ManualReviewRun)
+                .where(
+                    ManualReviewRun.id == proposal.active_manual_review_run_id,
+                    ManualReviewRun.proposal_id == proposal.id,
+                )
+                .execution_options(populate_existing=True)
+            )
+            if active_manual_review_run is not None:
+                active_manual_workflow = await session.scalar(
+                    select(WorkflowRun)
+                    .where(WorkflowRun.id == active_manual_review_run.workflow_run_id)
+                    .execution_options(populate_existing=True)
+                )
+            if (
+                active_manual_review_run is None
+                or active_manual_workflow is None
+                or active_manual_workflow.workflow_type is not WorkflowType.MANUAL_REVIEW
+                or active_manual_workflow.status
+                not in {WorkflowStatus.ACCEPTED, WorkflowStatus.PROCESSING}
+                or active_manual_workflow.store_id != store.id
+                or active_manual_workflow.created_by != active_manual_review_run.submitted_by
+                or not isinstance(active_manual_workflow.input, dict)
+                or active_manual_workflow.input.get("manual_review_run_id")
+                != active_manual_review_run.id
+                or active_manual_workflow.input.get("proposal_id") != proposal.id
+                or active_manual_workflow.input.get("proposal_revision_id")
+                != active_manual_review_run.proposal_revision_id
+                or active_manual_workflow.input.get("product_id") != product.id
+                or active_manual_workflow.input.get("store_id") != store.id
+                or revision is None
+                or revision.id != active_manual_review_run.proposal_revision_id
+                or revision.origin is not ProposalRevisionOrigin.MANUAL
+                or revision.created_by != active_manual_review_run.submitted_by
+            ):
+                raise ProposalDomainError("PROPOSAL_DATA_INCONSISTENT", 503)
+
+        submitted_revision = None
+        if proposal.submitted_revision_id is not None:
+            submitted_revision = await session.scalar(
+                select(ProposalRevision)
+                .where(
+                    ProposalRevision.id == proposal.submitted_revision_id,
+                    ProposalRevision.proposal_id == proposal.id,
+                )
+                .execution_options(populate_existing=True)
+            )
+            if submitted_revision is None:
+                raise ProposalDomainError("PROPOSAL_DATA_INCONSISTENT", 503)
+
+        latest_action = await session.scalar(
+            select(ApprovalAction)
+            .where(ApprovalAction.proposal_id == proposal.id)
+            .order_by(ApprovalAction.created_at.desc(), ApprovalAction.id.desc())
+            .limit(1)
+            .execution_options(populate_existing=True)
+        )
+        if latest_action is not None:
+            action_revision = await session.scalar(
+                select(ProposalRevision.id).where(
+                    ProposalRevision.id == latest_action.proposal_revision_id,
+                    ProposalRevision.proposal_id == proposal.id,
+                )
+            )
+            if latest_action.store_id != store.id or action_revision is None:
+                raise ProposalDomainError("PROPOSAL_DATA_INCONSISTENT", 503)
+
+        publish_record = await session.scalar(
+            select(PublishRecord)
+            .where(PublishRecord.proposal_id == proposal.id)
+            .execution_options(populate_existing=True)
+        )
+        if publish_record is not None:
+            publish_action = await session.scalar(
+                select(ApprovalAction)
+                .where(ApprovalAction.id == publish_record.approval_action_id)
+                .execution_options(populate_existing=True)
+            )
+            snapshot_keys = {
+                "title",
+                "selling_points",
+                "description",
+                "search_keywords",
+                "attributes",
+                "current_version",
+            }
+            if (
+                publish_record.store_id != store.id
+                or publish_record.product_id != product.id
+                or submitted_revision is None
+                or publish_record.proposal_revision_id != submitted_revision.id
+                or publish_action is None
+                or publish_action.action is not ApprovalActionType.APPROVE
+                or publish_action.proposal_id != proposal.id
+                or publish_action.proposal_revision_id != publish_record.proposal_revision_id
+                or publish_action.store_id != store.id
+                or publish_action.actor_id != publish_record.approved_by
+                or not isinstance(publish_record.before_snapshot, dict)
+                or not isinstance(publish_record.after_snapshot, dict)
+                or not set(publish_record.before_snapshot) <= snapshot_keys
+                or not set(publish_record.after_snapshot) <= snapshot_keys
+            ):
+                raise ProposalDomainError("PROPOSAL_DATA_INCONSISTENT", 503)
         return ProposalReadResult(
             proposal=proposal,
             optimization_run=optimization_run,
             current_revision=revision,
             current_review=review,
+            active_manual_review_run=active_manual_review_run,
+            active_manual_workflow=active_manual_workflow,
+            submitted_revision=submitted_revision,
+            latest_action=latest_action,
+            publish_record=publish_record,
         )
     except ProposalDomainError:
         await session.rollback()

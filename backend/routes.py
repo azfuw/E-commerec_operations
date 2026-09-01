@@ -16,10 +16,12 @@ from backend.analysis_runs import (
 from backend.approvals import (
     ApprovalDomainError,
     approve_proposal,
+    list_pending_approvals,
     reject_proposal,
     request_proposal_changes,
     submit_proposal,
 )
+from backend.audit_events import AuditEventDomainError, list_audit_events
 from backend.auth import (
     create_access_token,
     get_current_user,
@@ -27,7 +29,14 @@ from backend.auth import (
     require_store_access,
     verify_password,
 )
-from backend.common import KnowledgeVersionStatus, UserRole, UserStatus, WorkflowStatus, WorkflowType
+from backend.common import (
+    ApprovalActionType,
+    KnowledgeVersionStatus,
+    UserRole,
+    UserStatus,
+    WorkflowStatus,
+    WorkflowType,
+)
 from backend.config import Settings, get_settings
 from backend.database import get_session
 from backend.knowledge_content import KnowledgeContentError, read_and_validate_upload, store_validated_upload
@@ -67,11 +76,16 @@ from backend.schemas import (
     AnalysisRunAccepted,
     AnalysisRunRequest,
     ApprovalActionView,
+    ApprovalListItem,
+    ApprovalListView,
+    AuditEventListView,
+    AuditEventView,
     ComplianceReviewView,
     KnowledgeCitation,
     KnowledgeEnvelope,
     KnowledgeSearchRequest,
     LoginRequest,
+    ManualReviewSummary,
     ManualRevisionAccepted,
     ManualRevisionRequest,
     OptimizationWorkflowSummary,
@@ -331,6 +345,72 @@ async def select_product_route(
     )
 
 
+@router.get("/approvals", response_model=ApprovalListView)
+async def list_approvals_route(
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ApprovalListView:
+    try:
+        rows, total = await list_pending_approvals(
+            session,
+            actor_id=user.id,
+            page=page,
+            page_size=page_size,
+        )
+    except ApprovalDomainError as error:
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code}) from None
+    return ApprovalListView(
+        items=[
+            ApprovalListItem(
+                proposal_id=row.proposal_id,
+                proposal_revision_id=row.proposal_revision_id,
+                revision_number=row.revision_number,
+                store_id=row.store_id,
+                product_id=row.product_id,
+                submitted_by=row.submitted_by,
+                status="pending_approval",
+                submitted_at=row.submitted_at,
+            )
+            for row in rows
+        ],
+        page=page,
+        page_size=page_size,
+        total=total,
+    )
+
+
+@router.get("/audit-events", response_model=AuditEventListView)
+async def list_audit_events_route(
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    store_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    proposal_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    action: ApprovalActionType | None = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> AuditEventListView:
+    try:
+        events, total = await list_audit_events(
+            session,
+            actor_id=user.id,
+            page=page,
+            page_size=page_size,
+            store_id=store_id,
+            proposal_id=proposal_id,
+            action=action,
+        )
+    except AuditEventDomainError as error:
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code}) from None
+    return AuditEventListView(
+        items=[AuditEventView.model_validate(event) for event in events],
+        page=page,
+        page_size=page_size,
+        total=total,
+    )
+
+
 @router.get("/proposals/{proposal_id}", response_model=ProposalDetailView)
 async def read_proposal_route(
     proposal_id: str,
@@ -343,6 +423,8 @@ async def read_proposal_route(
         raise HTTPException(status_code=error.status_code, detail={"code": error.code}) from None
     revision = result.current_revision
     review = result.current_review
+    manual = result.active_manual_review_run
+    manual_workflow = result.active_manual_workflow
     return ProposalDetailView(
         proposal=ProposalView(
             id=result.proposal.id,
@@ -363,29 +445,28 @@ async def read_proposal_route(
             quality_status=result.optimization_run.quality_status,
             error_code=result.optimization_run.error_code,
         ),
-        current_revision=None
-        if revision is None
-        else ProposalRevisionView(
-            id=revision.id,
-            iteration=revision.iteration,
-            base_product_version=revision.base_product_version,
-            proposal_output=revision.proposal_output,
-            citations=revision.citations,
+        current_revision=None if revision is None else ProposalRevisionView.model_validate(revision),
+        current_review=None if review is None else ComplianceReviewView.model_validate(review),
+        active_manual_review=None
+        if manual is None or manual_workflow is None
+        else ManualReviewSummary(
+            manual_review_run_id=manual.id,
+            workflow_run_id=manual_workflow.id,
+            proposal_revision_id=manual.proposal_revision_id,
+            status=manual_workflow.status,
+            quality_status=manual_workflow.quality_status,
+            current_step=manual_workflow.current_step,
+            error_code=manual_workflow.error_code,
         ),
-        current_review=None
-        if review is None
-        else ComplianceReviewView(
-            id=review.id,
-            iteration=review.iteration,
-            deterministic_checks=review.deterministic_checks,
-            semantic_review=review.semantic_review,
-            passed=review.passed,
-            risk_level=review.risk_level,
-            quality_status=review.quality_status,
-            required_changes=review.required_changes,
-            citations=review.citations,
-            error_code=review.error_code,
-        ),
+        submitted_revision=None
+        if result.submitted_revision is None
+        else ProposalRevisionView.model_validate(result.submitted_revision),
+        latest_action=None
+        if result.latest_action is None
+        else ApprovalActionView.model_validate(result.latest_action),
+        publish_record=None
+        if result.publish_record is None
+        else PublishRecordView.model_validate(result.publish_record),
     )
 
 

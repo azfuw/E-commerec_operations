@@ -1,10 +1,11 @@
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -72,6 +73,17 @@ class ApprovalPublishResult:
 
 
 @dataclass(frozen=True)
+class ApprovalReadResult:
+    proposal_id: str
+    proposal_revision_id: str
+    revision_number: int
+    store_id: str
+    product_id: str
+    submitted_by: str
+    submitted_at: datetime
+
+
+@dataclass(frozen=True)
 class _ActionContext:
     actor: User
     store: Store
@@ -79,6 +91,93 @@ class _ActionContext:
     run: WorkflowRun
     product: Product
     revision: ProposalRevision
+
+
+async def list_pending_approvals(
+    session: AsyncSession, *, actor_id: str, page: int, page_size: int
+) -> tuple[list[ApprovalReadResult], int]:
+    try:
+        actor = await session.scalar(
+            select(User)
+            .where(User.id == actor_id)
+            .execution_options(populate_existing=True)
+        )
+        if (
+            actor is None
+            or actor.status is not UserStatus.ACTIVE
+            or actor.role not in _APPROVAL_ROLES
+        ):
+            raise ApprovalDomainError("PROPOSAL_ACTION_FORBIDDEN", 403)
+
+        statement = (
+            select(
+                ProductProposal.id,
+                ProposalRevision.id,
+                ProposalRevision.revision_number,
+                ProductProposal.store_id,
+                ProductProposal.product_id,
+                ApprovalAction.actor_id,
+                ApprovalAction.created_at,
+            )
+            .join(
+                WorkflowRun,
+                WorkflowRun.id == ProductProposal.optimization_run_id,
+            )
+            .join(Store, Store.id == ProductProposal.store_id)
+            .join(
+                UserStoreScope,
+                and_(
+                    UserStoreScope.user_id == actor.id,
+                    UserStoreScope.store_id == ProductProposal.store_id,
+                ),
+            )
+            .join(
+                Product,
+                and_(
+                    Product.id == ProductProposal.product_id,
+                    Product.store_id == ProductProposal.store_id,
+                ),
+            )
+            .join(
+                ProposalRevision,
+                and_(
+                    ProposalRevision.id == ProductProposal.submitted_revision_id,
+                    ProposalRevision.proposal_id == ProductProposal.id,
+                ),
+            )
+            .join(
+                ApprovalAction,
+                and_(
+                    ApprovalAction.proposal_id == ProductProposal.id,
+                    ApprovalAction.proposal_revision_id == ProposalRevision.id,
+                    ApprovalAction.store_id == ProductProposal.store_id,
+                    ApprovalAction.action == ApprovalActionType.SUBMIT,
+                ),
+            )
+            .where(
+                Store.enabled.is_(True),
+                WorkflowRun.workflow_type == WorkflowType.OPTIMIZATION,
+                WorkflowRun.store_id == ProductProposal.store_id,
+                WorkflowRun.status == WorkflowStatus.PENDING_APPROVAL,
+            )
+        )
+        total = int(
+            await session.scalar(select(func.count()).select_from(statement.subquery())) or 0
+        )
+        rows = (
+            await session.execute(
+                statement.order_by(ApprovalAction.created_at, ApprovalAction.id)
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).all()
+        return ([ApprovalReadResult(*row) for row in rows], total)
+    except ApprovalDomainError:
+        await session.rollback()
+        raise
+    except SQLAlchemyError:
+        await session.rollback()
+        raise ApprovalDomainError("PROPOSAL_DATA_INCONSISTENT", 503) from None
 
 
 def _canonical_json(value: object) -> str:
