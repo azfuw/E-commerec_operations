@@ -1314,14 +1314,8 @@ async def _persist_manual_compliance_review(
         await session.scalars(
             select(ComplianceReview)
             .where(
-                or_(
-                    ComplianceReview.proposal_revision_id
-                    == context.proposal_revision_id,
-                    and_(
-                        ComplianceReview.proposal_id == context.proposal_id,
-                        ComplianceReview.iteration.is_(None),
-                    ),
-                )
+                ComplianceReview.proposal_revision_id
+                == context.proposal_revision_id
             )
             .order_by(ComplianceReview.created_at, ComplianceReview.id)
             .execution_options(populate_existing=True)
