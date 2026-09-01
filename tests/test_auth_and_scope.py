@@ -110,6 +110,21 @@ async def test_active_user_can_log_in(client, auth_data) -> None:
     assert response.json()["access_token"]
 
 
+async def test_current_user_returns_database_identity(
+    client, auth_data, operator_token
+) -> None:
+    response = await client.get(
+        "/auth/me", headers={"Authorization": f"Bearer {operator_token}"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": "operator-user",
+        "username": "operator",
+        "role": "operator",
+    }
+
+
 async def test_operator_only_sees_assigned_stores(client, auth_data, operator_token) -> None:
     response = await client.get(
         "/stores", headers={"Authorization": f"Bearer {operator_token}"}

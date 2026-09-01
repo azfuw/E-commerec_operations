@@ -81,6 +81,7 @@ from backend.schemas import (
     AuditEventListView,
     AuditEventView,
     ComplianceReviewView,
+    CurrentUserView,
     KnowledgeCitation,
     KnowledgeEnvelope,
     KnowledgeSearchRequest,
@@ -100,6 +101,13 @@ from backend.schemas import (
     PublishRecordView,
     StoreSummary,
     WorkflowRunView,
+    WorkbenchTaskListView,
+    WorkbenchTaskView,
+)
+from backend.workbench import (
+    WorkbenchDomainError,
+    WorkbenchKind,
+    list_workbench_tasks,
 )
 
 router = APIRouter()
@@ -203,6 +211,13 @@ async def login(
     return AccessToken(access_token=create_access_token(user, settings))
 
 
+@router.get("/auth/me", response_model=CurrentUserView)
+async def read_current_user(
+    user: User = Depends(get_current_user),
+) -> CurrentUserView:
+    return CurrentUserView(id=user.id, username=user.username, role=user.role)
+
+
 @router.get("/stores", response_model=list[StoreSummary])
 async def list_stores(
     user: User = Depends(get_current_user),
@@ -213,6 +228,40 @@ async def list_stores(
         statement = statement.join(UserStoreScope).where(UserStoreScope.user_id == user.id)
     stores = (await session.scalars(statement.order_by(Store.code))).all()
     return [StoreSummary(id=store.id, code=store.code, name=store.name) for store in stores]
+
+
+@router.get("/workbench/tasks", response_model=WorkbenchTaskListView)
+async def list_workbench_tasks_route(
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    store_id: str | None = None,
+    kind: WorkbenchKind | None = None,
+    status_filter: Annotated[
+        WorkflowStatus | None, Query(alias="status")
+    ] = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> WorkbenchTaskListView:
+    try:
+        rows, total = await list_workbench_tasks(
+            session,
+            actor_id=user.id,
+            page=page,
+            page_size=page_size,
+            store_id=store_id,
+            kind=kind,
+            status=status_filter,
+        )
+    except WorkbenchDomainError as error:
+        raise HTTPException(
+            status_code=error.status_code, detail={"code": error.code}
+        ) from None
+    return WorkbenchTaskListView(
+        items=[WorkbenchTaskView(**row.__dict__) for row in rows],
+        page=page,
+        page_size=page_size,
+        total=total,
+    )
 
 
 @router.get("/stores/{store_id}/products", response_model=list[ProductSummary])

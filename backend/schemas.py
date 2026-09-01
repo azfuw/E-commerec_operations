@@ -28,6 +28,12 @@ class AccessToken(BaseModel):
     token_type: Literal["bearer"] = "bearer"
 
 
+class CurrentUserView(BaseModel):
+    id: str
+    username: str
+    role: UserRole
+
+
 class StoreSummary(BaseModel):
     id: str
     code: str
@@ -510,6 +516,43 @@ class WorkflowRunView(BaseModel):
     attempt_count: int
     candidates_ready: bool
     error_code: str | None
+
+
+class WorkbenchTaskView(BaseModel):
+    id: str
+    kind: Literal["analysis", "proposal"]
+    store_id: str
+    product_id: str | None
+    analysis_run_id: str
+    proposal_id: str | None
+    workflow_run_id: str
+    workflow_type: WorkflowType
+    status: WorkflowStatus
+    quality_status: WorkflowQuality
+    current_step: str | None
+    action_required: Literal[
+        "wait",
+        "select_product",
+        "edit_proposal",
+        "submit_proposal",
+        "review_approval",
+        "view_result",
+        "resolve_failure",
+    ]
+    requires_current_user_action: bool
+    created_by: str
+    updated_at: datetime
+
+    @field_serializer("updated_at", when_used="json")
+    def serialize_updated_at(self, value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+class WorkbenchTaskListView(BaseModel):
+    items: list[WorkbenchTaskView]
+    page: int
+    page_size: int
+    total: int
 
 
 class ProductSelectionRequest(BaseModel):
