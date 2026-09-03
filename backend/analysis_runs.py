@@ -162,7 +162,7 @@ async def persist_analysis_completion(
 
     for candidate in candidates:
         values = {
-            "id": str(uuid4()),
+            "id": candidate.id,
             "workflow_run_id": workflow_run_id,
             "product_id": candidate.product_id,
             "rank": candidate.rank,

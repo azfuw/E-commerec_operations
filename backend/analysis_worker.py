@@ -2,6 +2,7 @@ from dataclasses import asdict
 from datetime import date
 from decimal import Decimal
 from typing import TypedDict
+from uuid import uuid4
 
 import httpx
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -188,6 +189,7 @@ def _merge_candidates(
     trusted = {candidate.product_id: candidate for candidate in facts.candidates}
     return [
         AnalysisCandidateView(
+            id=str(uuid4()),
             product_id=draft.product_id,
             rank=draft.rank,
             product_code=trusted[draft.product_id].product_code,
