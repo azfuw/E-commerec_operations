@@ -21,6 +21,10 @@ function logout(): void {
           <el-icon><House /></el-icon>
           <span>工作台</span>
         </router-link>
+        <router-link class="nav-link" :to="{ name: 'proposals' }">
+          <el-icon><House /></el-icon>
+          <span>优化任务</span>
+        </router-link>
       </nav>
     </aside>
     <div class="app-workspace">

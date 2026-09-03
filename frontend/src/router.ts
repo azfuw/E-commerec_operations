@@ -19,6 +19,7 @@ export function createAppRouter() {
         children: [
           { path: '', redirect: { name: 'workbench' } },
           { path: 'workbench', name: 'workbench', component: WorkbenchPage },
+          { path: 'proposals', name: 'proposals', component: WorkbenchPage },
         ],
       },
       { path: '/:pathMatch(.*)*', redirect: { name: 'workbench' } },

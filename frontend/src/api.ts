@@ -1,5 +1,12 @@
 import { clearSession, session, setCurrentUser, setToken } from './session'
-import type { AccessToken, CurrentUser } from './types'
+import type {
+  AccessToken,
+  CurrentUser,
+  StoreSummary,
+  TaskKind,
+  WorkbenchTaskList,
+  WorkflowStatus,
+} from './types'
 
 export class ApiError extends Error {
   constructor(
@@ -100,4 +107,32 @@ export async function restoreSession(): Promise<void> {
   } finally {
     session.ready = true
   }
+}
+
+export async function listWorkbenchTasks(
+  query: {
+    page: number
+    pageSize: number
+    storeId?: string
+    kind?: TaskKind
+    status?: WorkflowStatus
+  },
+  signal?: AbortSignal,
+): Promise<WorkbenchTaskList> {
+  const params = new URLSearchParams({
+    page: String(query.page),
+    page_size: String(query.pageSize),
+  })
+  if (query.storeId) params.set('store_id', query.storeId)
+  if (query.kind) params.set('kind', query.kind)
+  if (query.status) params.set('status', query.status)
+  const request: RequestInit = {}
+  if (signal) request.signal = signal
+  return apiRequest<WorkbenchTaskList>(`/workbench/tasks?${params}`, request)
+}
+
+export async function listStores(signal?: AbortSignal): Promise<StoreSummary[]> {
+  const request: RequestInit = {}
+  if (signal) request.signal = signal
+  return apiRequest<StoreSummary[]>('/stores', request)
 }
