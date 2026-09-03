@@ -128,3 +128,186 @@ export type ProductSelection = {
   optimization_workflow_run_id: string
   status: 'accepted'
 }
+
+export type EvidenceRef = {
+  kind: 'fact' | 'citation'
+  value: string
+}
+
+export type OutputCitation = {
+  chunk_id: string
+}
+
+export type DescriptionSection = {
+  heading: string
+  body: string
+  evidence: EvidenceRef[]
+}
+
+export type OptimizationChange = {
+  field: 'title' | 'selling_points' | 'description' | 'keywords'
+  current_value: string | string[] | DescriptionSection[]
+  suggested_value: string | string[] | DescriptionSection[]
+  reason: string
+  evidence: EvidenceRef[]
+}
+
+export type AttributeCompletion = {
+  target_attribute: string
+  current_value: string | null
+  suggested_value: string
+  reason: string
+  evidence: EvidenceRef[]
+}
+
+export type PriceSuggestion = {
+  target_sku_id: string
+  current_price: string
+  suggested_price: string
+  reason: string
+  evidence: EvidenceRef[]
+}
+
+export type SkuSuggestion = {
+  target_sku_id: string
+  current_code: string
+  current_spec: Record<string, string>
+  suggested_code: string
+  suggested_spec: Record<string, string>
+  reason: string
+  evidence: EvidenceRef[]
+}
+
+export type OptimizationProposalOutput = {
+  title: string
+  selling_points: string[]
+  description: DescriptionSection[]
+  keywords: string[]
+  attribute_completions: AttributeCompletion[]
+  changes: OptimizationChange[]
+  citations: OutputCitation[]
+  price_suggestions: PriceSuggestion[]
+  sku_suggestions: SkuSuggestion[]
+}
+
+export type CanonicalRuleCitation = {
+  document_id: string
+  version_id: string
+  chunk_id: string
+  document_name: string
+  version_number: number
+  category: string
+  canonical_text: string
+  active: boolean
+  applicable: boolean
+}
+
+export type ProposalRevision = {
+  id: string
+  iteration: number | null
+  revision_number: number
+  origin: 'agent' | 'manual'
+  created_by: string
+  parent_revision_id: string | null
+  base_product_version: number
+  proposal_output: OptimizationProposalOutput
+  citations: CanonicalRuleCitation[]
+}
+
+export type RequiredChange = {
+  source_track: string
+  source_violation_code: string
+  field: string
+  instruction: string
+  citation_chunk_ids: string[]
+}
+
+export type ComplianceReview = {
+  id: string
+  iteration: number | null
+  deterministic_checks: Record<string, unknown>
+  semantic_review: Record<string, unknown>
+  passed: boolean
+  risk_level: 'low' | 'medium' | 'high'
+  quality_status: WorkflowQuality
+  required_changes: RequiredChange[]
+  citations: OutputCitation[]
+  error_code: string | null
+}
+
+export type ProposalDetail = {
+  proposal: {
+    id: string
+    analysis_run_id: string
+    analysis_candidate_id: string
+    optimization_run_id: string
+    store_id: string
+    product_id: string
+    base_product_version: number
+    current_revision_id: string | null
+    created_at: string
+    updated_at: string
+  }
+  optimization_run: {
+    id: string
+    workflow_type: WorkflowType
+    status: WorkflowStatus
+    quality_status: WorkflowQuality
+    error_code: string | null
+  }
+  current_revision: ProposalRevision | null
+  current_review: ComplianceReview | null
+  active_manual_review: {
+    manual_review_run_id: string
+    workflow_run_id: string
+    proposal_revision_id: string
+    status: WorkflowStatus
+    quality_status: WorkflowQuality
+    current_step: string | null
+    error_code: string | null
+  } | null
+  submitted_revision: ProposalRevision | null
+  latest_action: ApprovalAction | null
+  publish_record: {
+    id: string
+    proposal_id: string
+    proposal_revision_id: string
+    product_id: string
+    store_id: string
+    approved_by: string
+    approval_action_id: string
+    before_snapshot: Record<string, unknown>
+    after_snapshot: Record<string, unknown>
+    base_product_version: number
+    published_product_version: number
+    published_at: string
+  } | null
+}
+
+export type ManualRevisionRequest = {
+  parent_revision_id: string
+  base_product_version: number
+  title: string
+  selling_points: string[]
+  description: DescriptionSection[]
+  keywords: string[]
+  attribute_completions: AttributeCompletion[]
+  changes: OptimizationChange[]
+}
+
+export type ManualRevisionAccepted = {
+  revision_id: string
+  manual_review_workflow_run_id: string
+  status: 'accepted'
+}
+
+export type ApprovalAction = {
+  id: string
+  proposal_id: string
+  proposal_revision_id: string
+  actor_id: string
+  actor_role: UserRole
+  action: 'submit' | 'approve' | 'reject' | 'request_changes'
+  comment: string | null
+  created_at: string
+}

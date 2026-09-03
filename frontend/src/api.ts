@@ -6,6 +6,10 @@ import type {
   AnalysisRunRequest,
   CurrentUser,
   ProductSelection,
+  ProposalDetail,
+  ManualRevisionAccepted,
+  ManualRevisionRequest,
+  ApprovalAction,
   StoreSummary,
   TaskKind,
   WorkbenchTaskList,
@@ -184,4 +188,43 @@ export function selectProduct(
       body: JSON.stringify({ candidate_id: candidateId }),
     },
   )
+}
+
+export function getProposal(id: string, signal?: AbortSignal): Promise<ProposalDetail> {
+  const request: RequestInit = {}
+  if (signal) request.signal = signal
+  return apiRequest<ProposalDetail>(`/proposals/${encodeURIComponent(id)}`, request)
+}
+
+export function createManualRevision(
+  proposalId: string,
+  body: ManualRevisionRequest,
+  idempotencyKey: string,
+): Promise<ManualRevisionAccepted> {
+  return apiRequest<ManualRevisionAccepted>(
+    `/proposals/${encodeURIComponent(proposalId)}/manual-revision`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify(body),
+    },
+  )
+}
+
+export function submitProposal(
+  proposalId: string,
+  revisionId: string,
+  idempotencyKey: string,
+): Promise<ApprovalAction> {
+  return apiRequest<ApprovalAction>(`/proposals/${encodeURIComponent(proposalId)}/submit`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': idempotencyKey,
+    },
+    body: JSON.stringify({ revision_id: revisionId }),
+  })
 }
