@@ -1,3 +1,4 @@
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, Request, status
@@ -5,9 +6,13 @@ from fastapi.exception_handlers import http_exception_handler, request_validatio
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import FileResponse
+from starlette.staticfiles import StaticFiles
 
 from backend.routes import router
 from backend.schemas import KnowledgeEnvelope, KnowledgeError
+
+DEFAULT_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 
 def _knowledge_error_response(
@@ -53,7 +58,21 @@ def _knowledge_http_mapping(exception: StarletteHTTPException) -> tuple[str, str
     return "validation_error", safe_code or "KNOWLEDGE_REQUEST_INVALID", "Knowledge request is invalid"
 
 
-def create_app() -> FastAPI:
+def _mount_frontend(app: FastAPI, frontend_dist: Path) -> None:
+    index = frontend_dist / "index.html"
+    if not frontend_dist.is_dir() or not index.is_file():
+        return
+    assets = frontend_dist / "assets"
+    if assets.is_dir():
+        app.mount("/app/assets", StaticFiles(directory=assets), name="frontend-assets")
+
+    @app.get("/app", include_in_schema=False)
+    @app.get("/app/{path:path}", include_in_schema=False)
+    async def frontend() -> FileResponse:
+        return FileResponse(index)
+
+
+def create_app(frontend_dist: Path | None = None) -> FastAPI:
     app = FastAPI(title="智营台 API", version="0.1.0")
     app.include_router(router)
 
@@ -87,6 +106,7 @@ def create_app() -> FastAPI:
     async def liveness() -> dict[str, str]:
         return {"status": "ok"}
 
+    _mount_frontend(app, frontend_dist or DEFAULT_FRONTEND_DIST)
     return app
 
 
