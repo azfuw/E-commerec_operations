@@ -8,6 +8,8 @@ import {
   getWorkflowRun,
   submitProposal,
 } from '../api'
+import { canApprove } from '../capabilities'
+import ApprovalActions from '../components/ApprovalActions.vue'
 import CompliancePanel from '../components/CompliancePanel.vue'
 import InlineError from '../components/InlineError.vue'
 import ManualRevisionForm from '../components/ManualRevisionForm.vue'
@@ -15,6 +17,7 @@ import ProposalDiff from '../components/ProposalDiff.vue'
 import { buildManualRevisionRequest } from '../manualRevision'
 import type { ManualRevisionFormValue } from '../manualRevision'
 import type { ProposalDetail, WorkflowRun, WorkflowStatus } from '../types'
+import { session } from '../session'
 import { useSerialPoll } from '../useSerialPoll'
 
 const route = useRoute()
@@ -46,6 +49,20 @@ const canEdit = computed(
 const canSubmit = computed(
   () => !isMobile && status.value === 'draft_ready' && Boolean(detail.value?.current_revision),
 )
+const showApprovalActions = computed(
+  () =>
+    Boolean(
+      session.user &&
+        status.value &&
+        detail.value?.current_revision &&
+        canApprove(session.user.role, status.value, isMobile),
+    ),
+)
+const publishFields = ['title', 'selling_points', 'description', 'search_keywords', 'attributes']
+
+function displaySnapshot(value: unknown): string {
+  return typeof value === 'string' ? value : JSON.stringify(value)
+}
 
 const stages = computed(() => {
   const current = stageIndex(status.value)
@@ -235,6 +252,38 @@ onMounted(() => void loadProposal())
         <p v-if="status === 'pending_approval'" data-test="pending-reason">
           等待主管或管理员审批，当前方案不可编辑。
         </p>
+        <ApprovalActions
+          v-if="showApprovalActions && session.user"
+          :proposal-id="detail.proposal.id"
+          :revision-id="detail.current_revision.id"
+          :actor-role="session.user.role"
+          :status="detail.optimization_run.status"
+          :pending="false"
+          @success="loadProposal"
+        />
+
+        <section v-if="detail.publish_record" class="publish-record" data-test="publish-record">
+          <h2>本地模拟发布结果</h2>
+          <p>
+            商品版本 {{ detail.publish_record.base_product_version }} →
+            {{ detail.publish_record.published_product_version }}
+          </p>
+          <div class="publish-diff">
+            <div data-test="publish-before">
+              <h3>发布前</h3>
+              <p v-for="field in publishFields" :key="field">
+                {{ field }}：{{ displaySnapshot(detail.publish_record.before_snapshot[field]) }}
+              </p>
+            </div>
+            <div data-test="publish-after">
+              <h3>发布后</h3>
+              <p v-for="field in publishFields" :key="field">
+                {{ field }}：{{ displaySnapshot(detail.publish_record.after_snapshot[field]) }}
+              </p>
+            </div>
+          </div>
+          <p><strong>价格、SKU、库存与真实平台均未变化。</strong></p>
+        </section>
       </template>
     </template>
   </section>
@@ -287,8 +336,31 @@ onMounted(() => void loadProposal())
   margin-top: 20px;
 }
 
+.publish-record {
+  margin-top: 20px;
+  padding: 20px;
+  border: 1px solid #86a69f;
+  background: #f0fdfa;
+}
+
+.publish-record h2,
+.publish-record h3 {
+  margin-top: 0;
+}
+
+.publish-diff {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 767px) {
   .timeline {
+    grid-template-columns: 1fr;
+  }
+
+  .publish-diff {
     grid-template-columns: 1fr;
   }
 }

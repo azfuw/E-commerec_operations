@@ -188,6 +188,15 @@ input {
   .login-panel {
     padding: 24px;
   }
+
+  .mobile-action-dock {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    padding: 12px;
+    border-top: 1px solid #dbe2e8;
+    background: var(--app-surface);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

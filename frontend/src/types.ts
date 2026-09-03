@@ -268,20 +268,7 @@ export type ProposalDetail = {
   } | null
   submitted_revision: ProposalRevision | null
   latest_action: ApprovalAction | null
-  publish_record: {
-    id: string
-    proposal_id: string
-    proposal_revision_id: string
-    product_id: string
-    store_id: string
-    approved_by: string
-    approval_action_id: string
-    before_snapshot: Record<string, unknown>
-    after_snapshot: Record<string, unknown>
-    base_product_version: number
-    published_product_version: number
-    published_at: string
-  } | null
+  publish_record: PublishRecord | null
 }
 
 export type ManualRevisionRequest = {
@@ -310,4 +297,37 @@ export type ApprovalAction = {
   action: 'submit' | 'approve' | 'reject' | 'request_changes'
   comment: string | null
   created_at: string
+}
+
+export type PublishRecord = {
+  id: string
+  proposal_id: string
+  proposal_revision_id: string
+  product_id: string
+  store_id: string
+  approved_by: string
+  approval_action_id: string
+  before_snapshot: Record<string, unknown>
+  after_snapshot: Record<string, unknown>
+  base_product_version: number
+  published_product_version: number
+  published_at: string
+}
+
+export type ApprovalListItem = {
+  proposal_id: string
+  proposal_revision_id: string
+  revision_number: number
+  store_id: string
+  product_id: string
+  submitted_by: string
+  status: 'pending_approval'
+  submitted_at: string
+}
+
+export type ApprovalList = {
+  items: ApprovalListItem[]
+  page: number
+  page_size: number
+  total: number
 }

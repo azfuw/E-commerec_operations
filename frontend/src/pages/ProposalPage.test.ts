@@ -1,10 +1,10 @@
 import { flushPromises, mount } from '@vue/test-utils'
-import ElementPlus from 'element-plus'
+import ElementPlus, { ElMessageBox } from 'element-plus'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { clearSession, setCurrentUser } from '../session'
-import type { ProposalDetail, WorkflowStatus } from '../types'
+import type { ProposalDetail, UserRole, WorkflowStatus } from '../types'
 import ProposalPage from './ProposalPage.vue'
 
 function proposalDetail(status: WorkflowStatus = 'pending_manual'): ProposalDetail {
@@ -175,8 +175,8 @@ function setMobile(mobile: boolean): void {
   }))
 }
 
-async function mountProposal() {
-  setCurrentUser({ id: 'operator-1', username: 'operator', role: 'operator' })
+async function mountProposal(role: UserRole = 'operator') {
+  setCurrentUser({ id: `${role}-1`, username: role, role })
   const router = createRouter({
     history: createMemoryHistory('/app/'),
     routes: [
@@ -588,6 +588,74 @@ describe('ProposalPage', () => {
     expect(wrapper.get('[data-test="proposal-diff"]').text()).toContain('父版本标题')
     expect(wrapper.get('[data-test="proposal-refresh-error"]').text()).toContain('方案加载失败')
     expect(wrapper.find('[data-test="retry-proposal"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('lets a mobile supervisor approve, reloads facts, and shows local publish boundaries', async () => {
+    setMobile(true)
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    let proposalReads = 0
+    let approveWrites = 0
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path === '/proposals/proposal-1' && !init?.method) {
+        proposalReads += 1
+        const current = proposalDetail(proposalReads === 1 ? 'pending_approval' : 'completed')
+        if (proposalReads > 1) {
+          current.publish_record = {
+            id: 'publish-1',
+            proposal_id: 'proposal-1',
+            proposal_revision_id: 'revision-2',
+            product_id: 'product-1',
+            store_id: 'store-1',
+            approved_by: 'supervisor-1',
+            approval_action_id: 'action-1',
+            before_snapshot: {
+              title: '原商品标题',
+              selling_points: ['原卖点'],
+              description: '原始详情',
+              search_keywords: ['原关键词'],
+              attributes: { 材质: '棉' },
+              current_version: 7,
+            },
+            after_snapshot: {
+              title: '父版本标题',
+              selling_points: ['父版本卖点'],
+              description: '商品详情\n父版本详情',
+              search_keywords: ['父版本关键词'],
+              attributes: { 材质: '精梳棉' },
+              current_version: 8,
+            },
+            base_product_version: 7,
+            published_product_version: 8,
+            published_at: '2026-09-03T09:00:00Z',
+          }
+        }
+        return response(current)
+      }
+      if (path === '/approvals/proposal-1/approve') {
+        approveWrites += 1
+        return response({ id: 'publish-1' }, 201)
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+
+    const { wrapper } = await mountProposal('supervisor')
+    await flushPromises()
+    expect(wrapper.find('[data-test="submit-manual"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="submit-proposal"]').exists()).toBe(false)
+    await wrapper.get('[data-test="approve-action"]').trigger('click')
+    await flushPromises()
+
+    expect(approveWrites).toBe(1)
+    expect(proposalReads).toBe(2)
+    expect(wrapper.get('[data-test="publish-record"]').text()).toContain('本地模拟')
+    expect(wrapper.get('[data-test="publish-record"]').text()).toContain('7 → 8')
+    expect(wrapper.get('[data-test="publish-record"]').text()).toContain(
+      '价格、SKU、库存与真实平台均未变化',
+    )
+    expect(wrapper.get('[data-test="publish-before"]').text()).toContain('原商品标题')
+    expect(wrapper.get('[data-test="publish-after"]').text()).toContain('父版本标题')
     wrapper.unmount()
   })
 })

@@ -10,6 +10,8 @@ import type {
   ManualRevisionAccepted,
   ManualRevisionRequest,
   ApprovalAction,
+  ApprovalList,
+  PublishRecord,
   StoreSummary,
   TaskKind,
   WorkbenchTaskList,
@@ -226,5 +228,53 @@ export function submitProposal(
       'Idempotency-Key': idempotencyKey,
     },
     body: JSON.stringify({ revision_id: revisionId }),
+  })
+}
+
+export function listApprovals(
+  page: number,
+  pageSize: number,
+  signal?: AbortSignal,
+): Promise<ApprovalList> {
+  const request: RequestInit = {}
+  if (signal) request.signal = signal
+  return apiRequest<ApprovalList>(`/approvals?page=${page}&page_size=${pageSize}`, request)
+}
+
+export function approveProposal(
+  id: string,
+  revisionId: string,
+  key: string,
+): Promise<PublishRecord> {
+  return apiRequest<PublishRecord>(`/approvals/${encodeURIComponent(id)}/approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+    body: JSON.stringify({ revision_id: revisionId }),
+  })
+}
+
+export function rejectProposal(
+  id: string,
+  revisionId: string,
+  comment: string,
+  key: string,
+): Promise<ApprovalAction> {
+  return apiRequest<ApprovalAction>(`/approvals/${encodeURIComponent(id)}/reject`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+    body: JSON.stringify({ revision_id: revisionId, comment }),
+  })
+}
+
+export function requestProposalChanges(
+  id: string,
+  revisionId: string,
+  comment: string,
+  key: string,
+): Promise<ApprovalAction> {
+  return apiRequest<ApprovalAction>(`/approvals/${encodeURIComponent(id)}/request-changes`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+    body: JSON.stringify({ revision_id: revisionId, comment }),
   })
 }

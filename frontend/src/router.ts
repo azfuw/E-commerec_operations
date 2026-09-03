@@ -6,6 +6,7 @@ import LoginPage from './pages/LoginPage.vue'
 import AnalysisPage from './pages/AnalysisPage.vue'
 import AnalysisRunPage from './pages/AnalysisRunPage.vue'
 import ProposalPage from './pages/ProposalPage.vue'
+import ApprovalsPage from './pages/ApprovalsPage.vue'
 import WorkbenchPage from './pages/WorkbenchPage.vue'
 import { session } from './session'
 
@@ -26,6 +27,12 @@ export function createAppRouter() {
           { path: 'analysis/:runId', name: 'analysis-run', component: AnalysisRunPage },
           { path: 'proposals', name: 'proposals', component: WorkbenchPage },
           { path: 'proposals/:proposalId', name: 'proposal', component: ProposalPage },
+          {
+            path: 'approvals',
+            name: 'approvals',
+            component: ApprovalsPage,
+            meta: { approvalOnly: true },
+          },
         ],
       },
       { path: '/:pathMatch(.*)*', redirect: { name: 'workbench' } },

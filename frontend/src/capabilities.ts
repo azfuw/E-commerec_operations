@@ -24,6 +24,10 @@ export function canSubmitProposal(
   return !isMobile && status === 'draft_ready'
 }
 
-export function canApprove(role: UserRole, status: WorkflowStatus): boolean {
+export function canApprove(
+  role: UserRole,
+  status: WorkflowStatus,
+  _isMobile = false,
+): boolean {
   return (role === 'supervisor' || role === 'admin') && status === 'pending_approval'
 }

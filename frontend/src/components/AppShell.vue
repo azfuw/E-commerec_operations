@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { House, SwitchButton, TrendCharts } from '@element-plus/icons-vue'
+import { Checked, House, SwitchButton, TrendCharts } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 
 import { clearSession, session } from '../session'
 
 const router = useRouter()
+const isMobile =
+  typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 767px)').matches
+const canReview = session.user?.role === 'supervisor' || session.user?.role === 'admin'
 
 function logout(): void {
   clearSession()
@@ -21,13 +24,17 @@ function logout(): void {
           <el-icon><House /></el-icon>
           <span>工作台</span>
         </router-link>
-        <router-link class="nav-link" :to="{ name: 'analysis' }">
+        <router-link v-if="!isMobile" class="nav-link" :to="{ name: 'analysis' }">
           <el-icon><TrendCharts /></el-icon>
           <span>经营分析</span>
         </router-link>
         <router-link class="nav-link" :to="{ name: 'proposals' }">
           <el-icon><House /></el-icon>
           <span>优化任务</span>
+        </router-link>
+        <router-link v-if="canReview" class="nav-link" :to="{ name: 'approvals' }">
+          <el-icon><Checked /></el-icon>
+          <span>待审批</span>
         </router-link>
       </nav>
     </aside>
