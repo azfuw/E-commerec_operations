@@ -641,6 +641,7 @@ class ProposalDetailView(BaseModel):
 class AnalysisCandidateView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    id: str
     product_id: str
     rank: int
     product_code: str

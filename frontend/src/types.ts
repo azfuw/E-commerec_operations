@@ -67,3 +67,64 @@ export type WorkbenchTaskList = {
   page_size: number
   total: number
 }
+
+export type AnalysisRunRequest = {
+  store_id: string
+  start_date: string
+  end_date: string
+}
+
+export type AnalysisRunAccepted = {
+  workflow_run_id: string
+  status: 'accepted'
+}
+
+export type WorkflowRun = {
+  id: string
+  workflow_type: WorkflowType
+  store_id: string
+  start_date: string | null
+  end_date: string | null
+  status: WorkflowStatus
+  quality_status: WorkflowQuality
+  current_step: string | null
+  attempt_count: number
+  candidates_ready: boolean
+  error_code: string | null
+}
+
+export type ProductMetrics = {
+  product_id: string | null
+  product_code: string | null
+  impressions: number
+  clicks: number
+  orders: number
+  units: number
+  revenue: string
+  refunds: number
+  ctr: string
+  conversion_rate: string
+  refund_rate: string
+  average_order_value: string
+}
+
+export type AnalysisCandidate = {
+  id: string
+  product_id: string
+  rank: number
+  product_code: string
+  anomaly_types: string[]
+  metrics: ProductMetrics
+  business_impact: string
+  evidence: string[]
+  impact_explanation: string
+  reason: string
+  recommended_action: string
+  confidence: string
+}
+
+export type ProductSelection = {
+  proposal_id: string
+  optimization_workflow_run_id: string
+  status: 'accepted'
+}

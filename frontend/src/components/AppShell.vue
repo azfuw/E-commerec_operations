@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { House, SwitchButton } from '@element-plus/icons-vue'
+import { House, SwitchButton, TrendCharts } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 
 import { clearSession, session } from '../session'
@@ -20,6 +20,10 @@ function logout(): void {
         <router-link class="nav-link" :to="{ name: 'workbench' }">
           <el-icon><House /></el-icon>
           <span>工作台</span>
+        </router-link>
+        <router-link class="nav-link" :to="{ name: 'analysis' }">
+          <el-icon><TrendCharts /></el-icon>
+          <span>经营分析</span>
         </router-link>
         <router-link class="nav-link" :to="{ name: 'proposals' }">
           <el-icon><House /></el-icon>

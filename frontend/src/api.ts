@@ -1,10 +1,15 @@
 import { clearSession, session, setCurrentUser, setToken } from './session'
 import type {
   AccessToken,
+  AnalysisCandidate,
+  AnalysisRunAccepted,
+  AnalysisRunRequest,
   CurrentUser,
+  ProductSelection,
   StoreSummary,
   TaskKind,
   WorkbenchTaskList,
+  WorkflowRun,
   WorkflowStatus,
 } from './types'
 
@@ -135,4 +140,48 @@ export async function listStores(signal?: AbortSignal): Promise<StoreSummary[]> 
   const request: RequestInit = {}
   if (signal) request.signal = signal
   return apiRequest<StoreSummary[]>('/stores', request)
+}
+
+export function createAnalysisRun(body: AnalysisRunRequest): Promise<AnalysisRunAccepted> {
+  return apiRequest<AnalysisRunAccepted>('/analysis-runs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function getWorkflowRun(id: string, signal?: AbortSignal): Promise<WorkflowRun> {
+  const request: RequestInit = {}
+  if (signal) request.signal = signal
+  return apiRequest<WorkflowRun>(`/workflow-runs/${encodeURIComponent(id)}`, request)
+}
+
+export function listAnalysisCandidates(
+  id: string,
+  signal?: AbortSignal,
+): Promise<AnalysisCandidate[]> {
+  const request: RequestInit = {}
+  if (signal) request.signal = signal
+  return apiRequest<AnalysisCandidate[]>(
+    `/analysis-runs/${encodeURIComponent(id)}/candidates`,
+    request,
+  )
+}
+
+export function selectProduct(
+  analysisRunId: string,
+  candidateId: string,
+  idempotencyKey: string,
+): Promise<ProductSelection> {
+  return apiRequest<ProductSelection>(
+    `/analysis-runs/${encodeURIComponent(analysisRunId)}/select-product`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify({ candidate_id: candidateId }),
+    },
+  )
 }

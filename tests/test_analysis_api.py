@@ -320,6 +320,10 @@ async def test_ready_candidates_are_rank_ordered_and_unknown_runs_need_authentic
     unauthenticated_candidates = await client.get("/analysis-runs/missing-run/candidates")
 
     assert candidates.status_code == 200
+    assert [candidate["id"] for candidate in candidates.json()] == [
+        "candidate-1",
+        "candidate-2",
+    ]
     assert [candidate["rank"] for candidate in candidates.json()] == [1, 2]
     assert unknown_workflow.status_code == 404
     assert unknown_candidates.status_code == 404

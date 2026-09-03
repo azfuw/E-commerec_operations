@@ -3,6 +3,8 @@ import { createRouter, createWebHistory } from 'vue-router'
 import AppShell from './components/AppShell.vue'
 import ForbiddenPage from './pages/ForbiddenPage.vue'
 import LoginPage from './pages/LoginPage.vue'
+import AnalysisPage from './pages/AnalysisPage.vue'
+import AnalysisRunPage from './pages/AnalysisRunPage.vue'
 import WorkbenchPage from './pages/WorkbenchPage.vue'
 import { session } from './session'
 
@@ -19,6 +21,8 @@ export function createAppRouter() {
         children: [
           { path: '', redirect: { name: 'workbench' } },
           { path: 'workbench', name: 'workbench', component: WorkbenchPage },
+          { path: 'analysis', name: 'analysis', component: AnalysisPage },
+          { path: 'analysis/:runId', name: 'analysis-run', component: AnalysisRunPage },
           { path: 'proposals', name: 'proposals', component: WorkbenchPage },
         ],
       },
