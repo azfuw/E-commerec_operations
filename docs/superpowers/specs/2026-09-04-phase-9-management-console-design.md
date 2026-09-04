@@ -12,7 +12,7 @@
 - 管理员可在浏览器管理既有知识文档、版本状态和停用操作；所有角色可在授权店铺上下文内使用既有知识检索。
 - 固定、离线、无真实模型调用的 Agent 评测可由受控本地 CLI 持久化到 PostgreSQL，主管和管理员可查看安全结果，浏览器不能发起评测写入。
 - 主管和管理员可按授权范围读取安全的 Agent 调用摘要与完整的只追加审计记录。
-- 管理员可管理现有用户的角色、启停状态、店铺授权，以及现有店铺的名称和启停状态。
+- 管理员可管理现有用户的角色、启停状态、店铺授权，以及现有店铺的启停状态。
 - Vue 管理台增加“知识库”“Agent 评测”“审计日志”“系统管理”四个导航模块，并沿用既有任务工作台和审批流程。
 
 本阶段不做以下事项：
@@ -31,14 +31,14 @@
 管理员知识操作 ──> 既有 FastAPI 知识 API ──> PostgreSQL + 既有知识 Worker
 授权店铺检索 ──> 既有 /knowledge/search ──> 既有本地检索链路
 
-固定离线 fixture ──> 本地受控 CLI/service ──> evaluation_runs/results
+固定离线 fixture ──> 受控本地 CLI ──> evaluation_runs/results
                                                     │
 Vue 管理控制台 ──> 既有 api.ts ──> 只读评测 / Agent 调用 / 审计 API
                                                     │
 管理员用户/店铺操作 ──> 锁定事务 ──> users/stores/scopes + audit_events
 ```
 
-`agent_calls` 继续是实际工作流调用的安全可观测事实，不替代评测运行或评测结果。`evaluation_runs`、`evaluation_cases` 与 `evaluation_results` 是固定离线评测的独立事实。浏览器只读取这些事实，不保存或触发任一评测。
+`agent_calls` 继续是实际工作流调用的安全可观测事实，不替代评测运行或评测结果。`evaluation_runs` 是运行级事实头，`evaluation_cases` 是版本化 fixture，`evaluation_results` 是逐用例证据；浏览器只读取这些事实，不保存或触发任一评测。
 
 现有 `session.ts`、`api.ts`、Vue Router、Element Plus、`/app` 同源托管与 `sessionStorage` JWT 保持不变。`api.ts` 仍是唯一网络边界：受保护 GET 使用 `cache: "no-store"`，所有页面通过其统一处理安全 HTTP 错误。前端路由、按钮与移动端显示只是体验控制；服务端每次请求重新加载用户、角色、店铺状态、范围和资源归属。
 
@@ -53,7 +53,7 @@ Vue 管理控制台 ──> 既有 api.ts ──> 只读评测 / Agent 调用 / 
 | 查看本店范围的 Agent 评测和调用摘要 | 否 | 是 | 是，所有范围 |
 | 查看审计 | 否 | 是，授权店铺 | 是，全部记录 |
 | 管理用户角色、用户状态和店铺范围 | 否 | 否 | 是 |
-| 管理店铺名称与启停 | 否 | 否 | 是 |
+| 管理店铺启停状态 | 否 | 否 | 是 |
 | 提交、审批自己的方案 | 保持既有规则 | 保持既有自审规则 | 保持既有自审规则 |
 
 `UserStoreScope` 继续是 `operator` 和 `supervisor` 的店铺限制事实。`admin` 对全部店铺具有管理和只读可见性，不依赖是否存在单独的 `UserStoreScope` 行；所有查询路径必须统一这一规则，不能出现认证辅助函数允许管理员、但工作台、审计、审批或新管理读模型因无 scope 行而返回空结果的分裂行为。
@@ -82,6 +82,8 @@ Vue 管理控制台 ──> 既有 api.ts ──> 只读评测 / Agent 调用 / 
 阶段九使用一个位于 `0005_manual_review_approval_publish` 之后的 Alembic revision。迁移不改写既有业务数据、不重新解释 `workflow_runs`、`AgentCall`、proposal revision 或审批 iteration 语义。
 
 ### 4.1 Fixed evaluation facts
+
+已批准的初始评测数据草案只有 `evaluation_cases` 与 `evaluation_results`。本设计保留的 `evaluation_runs` 是唯一额外评测实体：它是表达一次运行的版本/范围/终态元数据、保存失败但零逐用例结果的运行、并为稳定 `GET /agent-evaluations/runs` 列表提供事实头所必需。它不是独立服务、在线评测能力或浏览器写入口，也不引入其他评测聚合、队列或执行实体。
 
 `evaluation_cases` 保存受版本控制的固定离线用例，而非浏览器表单输入。
 
@@ -177,7 +179,7 @@ GET /agent-calls?page&page_size&store_id&workflow_type&node_name&status&error_co
 
 `GET /agent-calls` 通过 `AgentCall -> WorkflowRun -> Store` 的资源链实时授权。它只返回 `workflow_run_id`、store/workflow type、node name、call type、iteration、attempt、model、prompt version、status、token 汇总、duration、可选 estimated cost、安全 error code 和时间戳。它绝不返回 `input_hash`、workflow input/output、请求 headers、Prompt、response、思维链、checkpoint、租约或 provider 诊断。supervisor 仅看授权店铺；admin 看全部；operator 403。
 
-评测持久化没有 HTTP 写接口。固定离线 CLI/service 是唯一写入入口，要求显式本地写入开关和 `--write-results`，并仅使用版本化 fixture、fake loader 与 MockTransport。没有开关时只计算并输出本地安全汇总，不写数据库；不开真实 provider、RAG 模型、Milvus 或网络。它不会读取 API Key，也不会把原始输入或结果输出到日志、数据库或 shell。
+评测持久化没有 HTTP 写接口。受控本地 CLI 是唯一写入入口，要求显式本地写入开关和 `--write-results`，并仅使用版本化 fixture、fake loader 与 MockTransport。没有开关时只计算并输出本地安全汇总，不写数据库；不开真实 provider、RAG 模型、Milvus 或网络。它不会读取 API Key，也不会把原始输入或结果输出到日志、数据库或 shell，也不创建独立评测服务、在线任务或浏览器写模型。
 
 ### 5.3 Audit reads
 
@@ -195,7 +197,7 @@ GET   /admin/stores?page&page_size&enabled
 PATCH /admin/stores/{store_id}
 ```
 
-所有这些接口仅允许当前启用 admin。`GET /admin/users` 只返回 `id`、`username`、`role`、`status`、`created_at` 和安全的 `store_ids`；绝不返回 password hash、JWT、认证时间、Cookie 或登录失败细节。`PATCH /admin/users/{user_id}` 接受至少一个 `role` 或 `status` 的完整目标值，且无额外字段。`PUT /admin/users/{user_id}/store-scopes` 接受唯一、长度受限的 `store_ids` 数组，表示替换后的完整集合。`GET /admin/stores` 返回 `id`、`name`、`code`、`enabled`、`created_at`；`PATCH /admin/stores/{store_id}` 仅接受至少一个 `name` 或 `enabled`，不改稳定 `id` 或唯一 `code`。
+所有这些接口仅允许当前启用 admin。`GET /admin/users` 只返回 `id`、`username`、`role`、`status`、`created_at` 和安全的 `store_ids`；绝不返回 password hash、JWT、认证时间、Cookie 或登录失败细节。`PATCH /admin/users/{user_id}` 接受至少一个 `role` 或 `status` 的完整目标值，且无额外字段。`PUT /admin/users/{user_id}/store-scopes` 接受唯一、长度受限的 `store_ids` 数组，表示替换后的完整集合。`GET /admin/stores` 返回稳定只读的 `id`、`name`、`code`、`enabled`、`created_at`；`PATCH /admin/stores/{store_id}` 只接受完整目标值 `{"enabled": boolean}`，不得接受 `name`、`code` 或 `id`。
 
 管理员 mutation 均使用上文的锁定事务并在成功状态写入同一事务内追加安全 audit event。重复相同 PUT/PATCH 只保持请求的目标状态，绝不产生重复 scope 或删除历史；每次被接受的管理动作仍保留自己的只追加 audit 事实。并发版本冲突或受保护 admin 违反返回稳定 409。服务端不会因为前端已禁用按钮而跳过这些检查。
 
@@ -208,7 +210,7 @@ PATCH /admin/stores/{store_id}
 | 知识库 | `/app/knowledge` | operator、supervisor、admin | 授权店铺搜索；admin 额外看到文档、版本和停用管理。 |
 | Agent 评测 | `/app/agent-evaluations` | supervisor、admin | 安全 run 列表、run 详情和安全调用摘要入口；无“运行评测”按钮。 |
 | 审计日志 | `/app/audit-events` | supervisor、admin | server-side filters、分页和 text-bound safe details。 |
-| 系统管理 | `/app/admin` | admin | “用户与权限”“店铺管理”两个页签。 |
+| 系统管理 | `/app/admin` | admin | “用户与权限”“店铺启停”两个页签。 |
 
 页面继续使用 Element Plus 表格、筛选器、抽屉、表单和 status tag；不引入图表库、全局状态库或第二套组件体系。评测以数字、状态表格和明细抽屉展示，审计 details 以字段化文本展示，所有服务端文本通过 Vue text binding 渲染，禁止 `v-html`。
 
@@ -232,27 +234,28 @@ Phase 9 新增或扩展的 API、CLI 输出、评测事实、日志、审计、�
 
 固定离线评测以仓库版本控制的 synthetic fixtures 为输入。CLI 对每个启用 case 构造可信、最小输入，调用确定性 validator 或 MockTransport 驱动的现有客户端边界，收集闭集 metrics，并按既有 `knowledge_evaluation.py` 的确定性排序和指标计算原则生成结果。它不改生产 Prompt、不需要新的真实 smoke，也不扩张已有 Agent retry 语义。
 
-运行顺序为：加载固定 case 版本 → 检查显式持久化开关 → 创建内存结果 → 完成每个 case 的闭集验证 → 单事务写入 immutable run 与全部 results → 写一条安全 audit event。任一步事实、schema、事务或 allowlist 校验失败时，回滚结果并只提交安全 `failed` run；不会重试真实 provider，不会将失败假装成通过，也不会写部分 case 结果。
+运行顺序为：加载固定 case 版本 → 检查显式持久化开关 → 创建内存结果 → 完成每个 case 的闭集验证 → 单事务写入 immutable run 与全部 results → 写一条安全 audit event。任一步事实、schema、事务或 allowlist 校验失败时，先回滚这笔成功写入事务；再以独立事务写入安全 `failed` run（零 results）。若该失败记录事务也不能提交，则不持久化任何评测事实并向 CLI 返回失败。不会重试真实 provider，不会将失败假装成通过，也不会写部分 case 结果。
 
 新评测运行不是在线质量承诺。阶段九只展示固定、可重放的离线证据；阶段十才可在单独授权下评估真实模型、故障注入和完整端到端表现。
 
 ## 9. Test matrix and acceptance criteria
 
-普通测试全部离线：清空 DeepSeek、PostgreSQL 集成、知识集成与真实 smoke opt-in；使用 SQLite/fake、MockTransport、固定 fixture 和内存前端数据。不加载本地模型、不下载模型、不访问网络、不执行真实 provider。
+普通单元与前端 fixture 测试全部离线：清空 DeepSeek、知识集成与真实 smoke opt-in，使用 SQLite/fake、MockTransport、固定 fixture 和内存前端数据。不加载本地模型、不下载模型、不访问网络、不执行真实 provider。本机 PostgreSQL 是必须通过的集成门禁，通过显式 `RUN_POSTGRES_INTEGRATION=1` 启用，且同样不需要网络、DeepSeek、模型下载或真实 provider。
 
 | 层级 | 必须覆盖 |
 |---|---|
 | 迁移与模型 | 评测三表、FK、closed enum、JSON allowlist、唯一 `(run, case, agent type)`、索引、旧行兼容；无阶段九事实时 downgrade 可逆，有事实时明确拒绝。 |
-| 离线 CLI/service | 固定 case 的确定性结果、禁用 case 排除、每次新 run 不覆盖历史、成功原子完整写入、失败无半 results、无网络/Key/provider。 |
+| 离线 CLI | 固定 case 的确定性结果、禁用 case 排除、每次新 run 不覆盖历史、成功原子完整写入、失败无半 results、无网络/Key/provider。 |
 | 评测与调用 API | 匿名 401、operator 403、supervisor 仅授权 store、admin 全部、global run 仅 admin、分页/筛选边界、跨店/未知 ID 不泄露、安全字段闭集。 |
 | 审计 | 既有 store/proposal/action 行为回归；新增 filters、稳定排序、disabled-store 历史、global-event admin 可见性、safe details 拒绝、无敏感内容。 |
 | Admin API | 角色/状态 schema、scope 的原子替换、重复/未知/禁用 store 拒绝、禁用后历史保留、每次成功 mutation 一条安全 audit、self-disable/self-demotion/零 enabled-admin 与并发写入防护。 |
 | 知识管理 | admin 管理、非 admin 拒绝 mutation、scope-validated search、文档/版本安全列表、zero-hit/low-confidence/error 区分、无原文下载/路径/向量泄露。 |
 | 前端单元 | 四导航的角色与设备显示、mobile deep-link 零管理 API 请求、loading/empty/filtered-empty/error/403 状态、filters/paging、文本绑定、admin 安全确认。 |
 | 前端浏览器 fixture | desktop/tablet 使用知识、评测、审计和系统管理的可见路径；mobile 限制；仅确定性 API fixture，不称为真实服务 E2E。 |
-| 最终门禁 | 全量 pytest、前端 typecheck/test/build、compileall、Alembic current/check、docker compose config、git diff --check 与干净 Git 状态。 |
+| 本机 PostgreSQL opt-in | 在不启用知识/DeepSeek/真实 smoke 且不访问外网的本地 PostgreSQL 中，以 `RUN_POSTGRES_INTEGRATION=1` 执行 Alembic upgrade/downgrade：验证新表、FK、CHECK/enum、JSON allowlist、唯一约束和索引实际生效；验证无阶段九事实时 downgrade 成功、有事实时稳定拒绝；使用两个独立事务/连接复现并发最后 admin 禁用或降级并始终保留至少一个 enabled admin；验证 scope 完整替换、管理 mutation 与 audit、成功 evaluation header/results 与 audit、失败零-result run 的关键事务原子性。 |
+| 最终门禁 | 全量 pytest、前端 typecheck/test/build、compileall、本机 PostgreSQL 上的 Alembic upgrade/downgrade/current/check、docker compose config、git diff --check 与干净 Git 状态。 |
 
-阶段九验收完成时，管理控制台只能陈述：本地知识管理、固定离线评测持久化、安全调用/审计可见性、用户/店铺权限管理及 fixture 浏览器链路已经按验证证据完成。它不得陈述真实平台发布、真实模型评测、故障注入或完整真实服务浏览器 E2E 已完成。
+阶段九最终验收必须同时包含普通离线门禁和上述本机 PostgreSQL opt-in 门禁；仅 SQLite 或静态 Alembic `check` 不足以证明迁移、约束、并发保护和事务语义。验收完成时，管理控制台只能陈述：本地知识管理、固定离线评测持久化、安全调用/审计可见性、用户权限与店铺启停管理及 fixture 浏览器链路已经按验证证据完成。它不得陈述真实平台发布、真实模型评测、故障注入或完整真实服务浏览器 E2E 已完成。
 
 ## 10. Compatibility and deferred Phase 10 work
 
