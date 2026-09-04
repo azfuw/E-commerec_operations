@@ -286,3 +286,22 @@ export function searchKnowledge(query: import('./types').KnowledgeSearchQuery, s
     body: JSON.stringify(query), ...(signal ? { signal } : {}),
   })
 }
+
+export function listKnowledgeDocuments(query: { page: number; category?: string; enabled?: boolean; version_status?: string }, signal?: AbortSignal): Promise<import('./types').KnowledgeEnvelope<import('./types').KnowledgeDocumentList>> {
+  const params = new URLSearchParams({ page: String(query.page), page_size: '20' })
+  if (query.category) params.set('category', query.category)
+  if (query.enabled !== undefined) params.set('enabled', String(query.enabled))
+  if (query.version_status) params.set('version_status', query.version_status)
+  return apiRequest(`/knowledge/documents?${params}`, signal ? { signal } : {})
+}
+export function getKnowledgeVersions(id: string, page: number, signal?: AbortSignal): Promise<import('./types').KnowledgeVersionHistory> {
+  return apiRequest(`/knowledge/documents/${encodeURIComponent(id)}/versions?page=${page}&page_size=20`, signal ? { signal } : {})
+}
+export function uploadKnowledgeDocument(body: FormData, documentId?: string, signal?: AbortSignal): Promise<import('./types').KnowledgeEnvelope<{ document_id: string; version_id: string; status: string }>> {
+  return apiRequest(documentId ? `/knowledge/documents/${encodeURIComponent(documentId)}/versions` : '/knowledge/documents', {
+    method: 'POST', body, headers: { 'Idempotency-Key': crypto.randomUUID() }, ...(signal ? { signal } : {}),
+  })
+}
+export function disableKnowledgeDocument(id: string, signal?: AbortSignal): Promise<import('./types').KnowledgeEnvelope<{ document_id: string; enabled: boolean }>> {
+  return apiRequest(`/knowledge/documents/${encodeURIComponent(id)}/disable`, { method: 'POST', ...(signal ? { signal } : {}) })
+}

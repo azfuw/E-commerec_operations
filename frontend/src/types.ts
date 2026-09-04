@@ -355,3 +355,38 @@ export interface KnowledgeEnvelope<T> {
   error: { code: string; category: string } | null
 }
 export type KnowledgeSearchResult = KnowledgeEnvelope<{ citations: KnowledgeCitation[] }>
+
+export interface KnowledgeDocument {
+  document_id: string
+  name: string
+  category: string
+  enabled: boolean
+  current_version_id: string | null
+  current_version_status: string | null
+}
+export interface KnowledgeDocumentList {
+  items: KnowledgeDocument[]
+  page: number
+  page_size: number
+  total: number
+}
+export interface KnowledgeVersion {
+  id: string
+  version_number: number
+  status: string
+  parser_version: string | null
+  chunker_version: string | null
+  embedding_version: string | null
+  error_code: string | null
+  created_at: string
+}
+export interface KnowledgeVersionHistory {
+  document_id: string
+  name: string
+  category: string
+  enabled: boolean
+  items: KnowledgeVersion[]
+  page: number
+  page_size: number
+  total: number
+}
