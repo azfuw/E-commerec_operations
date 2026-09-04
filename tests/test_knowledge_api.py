@@ -16,7 +16,7 @@ from backend.database import get_session
 from backend.knowledge_index import HybridVector, KnowledgeDependencyError
 from backend.knowledge_search import get_knowledge_search_loader
 from backend.main import create_app
-from backend.models import KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion, User
+from backend.models import KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion, User, Store, UserStoreScope
 
 
 def _headers(token: str, **extra: str) -> dict[str, str]:
@@ -87,6 +87,9 @@ async def knowledge_api(session, tmp_path: Path):
         for role in (UserRole.ADMIN, UserRole.OPERATOR, UserRole.SUPERVISOR)
     }
     session.add_all(users.values())
+    session.add(Store(id='knowledge-store',name='Knowledge store',code='knowledge-store'))
+    await session.flush()
+    session.add_all([UserStoreScope(user_id=user.id,store_id='knowledge-store') for user in users.values()])
     await session.commit()
     loader = _Loader()
     app = create_app()
@@ -287,7 +290,7 @@ async def test_list_disable_and_current_database_user_state_are_safe(knowledge_a
     context.users["operator"].status = UserStatus.DISABLED
     await context.session.commit()
     disabled_user = await context.client.post(
-        "/knowledge/search", json={"query": "rule"}, headers=_headers(context.tokens["operator"])
+        "/knowledge/search", json={"store_id": "knowledge-store", "query": "rule"}, headers=_headers(context.tokens["operator"])
     )
     assert disabled_user.status_code == 401
     _assert_error(disabled_user, category="authorization_error", code="KNOWLEDGE_AUTHENTICATION_REQUIRED")
@@ -298,7 +301,7 @@ async def test_all_active_read_roles_can_search_and_zero_active_never_loads(know
     context = knowledge_api
     for role in ("admin", "operator", "supervisor"):
         response = await context.client.post(
-            "/knowledge/search", json={"query": "rule"}, headers=_headers(context.tokens[role])
+            "/knowledge/search", json={"store_id": "knowledge-store", "query": "rule"}, headers=_headers(context.tokens[role])
         )
         assert response.status_code == 200
         assert response.json()["status"] == "success"
@@ -312,7 +315,7 @@ async def test_search_returns_canonical_citations_and_maps_dependency_errors(kno
     _, version, chunk = await _seed_active_document(context)
     active = await context.client.post(
         "/knowledge/search",
-        json={"query": "rule", "categories": ["demo"], "top_k": 3},
+        json={"store_id": "knowledge-store", "query": "rule", "categories": ["demo"], "top_k": 3},
         headers=_headers(context.tokens["operator"]),
     )
     assert active.status_code == 200
@@ -328,7 +331,7 @@ async def test_search_returns_canonical_citations_and_maps_dependency_errors(kno
     context.loader.error = KnowledgeDependencyError("KNOWLEDGE_DEPENDENCY_TIMEOUT", retryable=True)
     with caplog.at_level(logging.INFO, logger="backend.knowledge"):
         timeout = await context.client.post(
-            "/knowledge/search", json={"query": "rule"}, headers=_headers(context.tokens["admin"])
+            "/knowledge/search", json={"store_id": "knowledge-store", "query": "rule"}, headers=_headers(context.tokens["admin"])
         )
     assert timeout.status_code == 503
     _assert_error(timeout, category="timeout", code="KNOWLEDGE_DEPENDENCY_TIMEOUT")
@@ -339,7 +342,7 @@ async def test_search_returns_canonical_citations_and_maps_dependency_errors(kno
     context.loader.error = KnowledgeDependencyError("KNOWLEDGE_MILVUS_UNAVAILABLE", retryable=True)
     with caplog.at_level(logging.INFO, logger="backend.knowledge"):
         unavailable = await context.client.post(
-            "/knowledge/search", json={"query": "rule"}, headers=_headers(context.tokens["admin"])
+            "/knowledge/search", json={"store_id": "knowledge-store", "query": "rule"}, headers=_headers(context.tokens["admin"])
         )
     assert unavailable.status_code == 503
     _assert_error(unavailable, category="dependency_error", code="KNOWLEDGE_MILVUS_UNAVAILABLE")
@@ -354,7 +357,7 @@ async def test_search_returns_canonical_citations_and_maps_dependency_errors(kno
         headers=_headers(context.tokens["admin"]),
     )
     zero_hit = await context.client.post(
-        "/knowledge/search", json={"query": "rule"}, headers=_headers(context.tokens["operator"])
+        "/knowledge/search", json={"store_id": "knowledge-store", "query": "rule"}, headers=_headers(context.tokens["operator"])
     )
     assert disabled.status_code == 200
     assert zero_hit.status_code == 200
@@ -368,7 +371,7 @@ async def test_knowledge_validation_envelope_is_safe_and_other_routes_keep_fasta
     invalid_query = "invalid-query-secret-" + ("x" * 500)
     response = await context.client.post(
         "/knowledge/search",
-        json={"query": invalid_query, "top_k": 21},
+        json={"store_id": "knowledge-store", "query": invalid_query, "top_k": 21},
         headers=_headers(context.tokens["admin"]),
     )
     assert response.status_code == 422

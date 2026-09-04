@@ -727,6 +727,8 @@ class KnowledgeVersionHistoryView(BaseModel):
 
 
 class KnowledgeSearchRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    store_id: str = Field(min_length=1, max_length=36)
     query: str = Field(min_length=1, max_length=500)
     categories: list[str] | None = Field(default=None, max_length=20)
     top_k: int = Field(default=10, ge=1, le=20)

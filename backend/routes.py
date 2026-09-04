@@ -1141,6 +1141,7 @@ async def search_knowledge_route(
     started = perf_counter()
     request_id = _request_id()
     try:
+        await require_store_access(request.store_id, user, session)
         outcome = await search_active_knowledge(
             session,
             query=request.query,

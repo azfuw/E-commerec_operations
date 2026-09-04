@@ -331,3 +331,27 @@ export type ApprovalList = {
   page_size: number
   total: number
 }
+
+
+export interface KnowledgeSearchQuery {
+  store_id: string
+  query: string
+  categories?: string[]
+  top_k?: number
+}
+export interface KnowledgeCitation {
+  chunk_id: string
+  document_name: string
+  version_number: number
+  category: string
+  canonical_text: string
+  final_score: number
+}
+export interface KnowledgeEnvelope<T> {
+  request_id: string
+  status: 'accepted' | 'success' | 'error'
+  data: T
+  quality: { status: 'ok' | 'zero_hit' | 'low_confidence' } | null
+  error: { code: string; category: string } | null
+}
+export type KnowledgeSearchResult = KnowledgeEnvelope<{ citations: KnowledgeCitation[] }>

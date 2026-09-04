@@ -278,3 +278,11 @@ export function requestProposalChanges(
     body: JSON.stringify({ revision_id: revisionId, comment }),
   })
 }
+
+
+export function searchKnowledge(query: import('./types').KnowledgeSearchQuery, signal?: AbortSignal): Promise<import('./types').KnowledgeSearchResult> {
+  return apiRequest('/knowledge/search', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(query), ...(signal ? { signal } : {}),
+  })
+}
