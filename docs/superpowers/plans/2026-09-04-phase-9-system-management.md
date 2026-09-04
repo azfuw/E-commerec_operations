@@ -67,7 +67,7 @@ async def test_supervisor_without_scope_has_no_pending_approvals(session: AsyncS
     assert total == 0
 ~~~
 
-Seed the two enabled stores and pending rows directly in each test. Add separate direct tests with each real signature for `list_audit_events(session, actor_id='admin-without-scope', page=1, page_size=20, store_id=None, proposal_id=None, action=None)`, proposal reads, evaluation-run reads, and AgentCall reads; unpack every `(items, total)` result and assert their role-specific total and store IDs. Include disabled-store history only where the relevant endpoint permits history, operator restriction, and unchanged self-approval.
+Seed the two enabled stores and pending rows directly in each test. Add separate direct tests with each real signature for `list_audit_events(session, actor_id='admin-without-scope', filters=AuditEventFilters(page=1, page_size=20, store_id=None, proposal_id=None, action=None))`, proposal reads, evaluation-run reads, and AgentCall reads; unpack every `(items, total)` result and assert their role-specific total and store IDs. Include disabled-store history only where the relevant endpoint permits history, operator restriction, and unchanged self-approval.
 
 - [ ] **Step 2: Run RED**
 
