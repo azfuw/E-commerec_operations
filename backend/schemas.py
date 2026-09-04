@@ -10,6 +10,7 @@ from backend.common import (
     AuditEventType,
     AuditOutcome,
     ComplianceRiskLevel,
+    KnowledgeVersionStatus,
     ProposalRevisionOrigin,
     UserRole,
     WorkflowQuality,
@@ -700,6 +701,29 @@ class KnowledgeEnvelope(BaseModel):
     data: dict[str, object] | None
     quality: dict[str, str] | None
     error: KnowledgeError | None
+
+
+class KnowledgeVersionHistoryItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    version_number: int
+    status: KnowledgeVersionStatus
+    parser_version: str | None
+    chunker_version: str | None
+    embedding_version: str | None
+    error_code: str | None
+    created_at: datetime
+
+
+class KnowledgeVersionHistoryView(BaseModel):
+    document_id: str
+    name: str
+    category: str
+    enabled: bool
+    items: list[KnowledgeVersionHistoryItem]
+    page: int
+    page_size: int
+    total: int
 
 
 class KnowledgeSearchRequest(BaseModel):

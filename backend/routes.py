@@ -85,6 +85,8 @@ from backend.schemas import (
     KnowledgeCitation,
     KnowledgeEnvelope,
     KnowledgeSearchRequest,
+    KnowledgeVersionHistoryItem,
+    KnowledgeVersionHistoryView,
     LoginRequest,
     ManualReviewSummary,
     ManualRevisionAccepted,
@@ -914,6 +916,31 @@ async def list_knowledge_documents(
     )
 
 
+@router.get('/knowledge/documents/{document_id}/versions', response_model=KnowledgeVersionHistoryView)
+async def knowledge_version_history(
+    document_id: Annotated[str, Path(min_length=1, max_length=36)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    user: User = Depends(require_roles(UserRole.ADMIN)),
+    session: AsyncSession = Depends(get_session),
+) -> KnowledgeVersionHistoryView:
+    document = await session.get(KnowledgeDocument, document_id)
+    if document is None:
+        raise _knowledge_http_error(404, 'KNOWLEDGE_DOCUMENT_NOT_FOUND', request_id=_request_id())
+    statement = select(KnowledgeDocumentVersion).where(KnowledgeDocumentVersion.document_id == document_id)
+    total = await session.scalar(select(func.count()).select_from(statement.subquery())) or 0
+    versions = list(await session.scalars(statement.order_by(KnowledgeDocumentVersion.version_number.desc(),
+        KnowledgeDocumentVersion.id.desc()).offset((page - 1) * page_size).limit(page_size)))
+    safe_codes = {'KNOWLEDGE_PARSE_FAILED', 'KNOWLEDGE_MODEL_UNAVAILABLE', 'KNOWLEDGE_MILVUS_UNAVAILABLE',
+        'KNOWLEDGE_PROCESSING_FAILED', 'KNOWLEDGE_ATTEMPTS_EXHAUSTED', 'KNOWLEDGE_VERSION_SUPERSEDED',
+        'KNOWLEDGE_DEPENDENCY_TIMEOUT', 'KNOWLEDGE_FILE_MISSING', 'KNOWLEDGE_EMPTY_CONTENT'}
+    items = [KnowledgeVersionHistoryItem.model_validate(v).model_copy(update={
+        'error_code': v.error_code if v.error_code in safe_codes else ('KNOWLEDGE_PROCESSING_FAILED' if v.error_code else None)
+    }) for v in versions]
+    return KnowledgeVersionHistoryView(document_id=document.id, name=document.name, category=document.category,
+        enabled=document.enabled, items=items, page=page, page_size=page_size, total=total)
+
+
 @router.post(
     "/knowledge/documents/{document_id}/versions",
     response_model=KnowledgeEnvelope,
@@ -1083,7 +1110,7 @@ async def disable_knowledge_document_route(
 ) -> KnowledgeEnvelope:
     started = perf_counter()
     request_id = _request_id()
-    if not await disable_knowledge_document(session, document_id=document_id):
+    if not await disable_knowledge_document(session, document_id=document_id, actor_id=user.id):
         raise _knowledge_http_error(
             status.HTTP_404_NOT_FOUND, "KNOWLEDGE_DOCUMENT_NOT_FOUND", request_id=request_id
         )

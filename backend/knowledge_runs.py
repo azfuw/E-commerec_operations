@@ -6,9 +6,10 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.common import KnowledgeVersionStatus
+from backend.common import KnowledgeVersionStatus, AuditEventType, AuditOutcome
+from backend.audit_events import add_audit_event
 from backend.knowledge_content import ChunkDraft
-from backend.models import KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion
+from backend.models import KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion, User
 
 
 _logger = logging.getLogger("backend.knowledge")
@@ -119,6 +120,7 @@ async def create_document_version(
             return existing_document, existing_version, False
 
     document = await session.get(KnowledgeDocument, document_id)
+    new_document = document is None
     if document is None:
         if name is None or category is None:
             raise ValueError("KNOWLEDGE_DOCUMENT_NOT_FOUND")
@@ -167,6 +169,15 @@ async def create_document_version(
     )
     session.add(version)
     await session.flush()
+    actor = await session.get(User, created_by)
+    add_audit_event(session,
+        event_type=(AuditEventType.KNOWLEDGE_DOCUMENT_CREATED if new_document
+                    else AuditEventType.KNOWLEDGE_VERSION_CREATED),
+        outcome=AuditOutcome.SUCCESS, store_id=None, actor_id=created_by,
+        actor_role=actor.role if actor else None,
+        resource_type='knowledge_document' if new_document else 'knowledge_version',
+        resource_id=document.id if new_document else version.id,
+        details={'document_status': KnowledgeVersionStatus.ACCEPTED.value})
     _log_transition(
         started=started,
         actor_id=created_by,
@@ -509,7 +520,7 @@ async def activate_knowledge_version(
     return False
 
 
-async def disable_knowledge_document(session: AsyncSession, *, document_id: str) -> bool:
+async def disable_knowledge_document(session: AsyncSession, *, document_id: str, actor_id: str | None = None) -> bool:
     started = perf_counter()
     document = await session.scalar(
         select(KnowledgeDocument)
@@ -542,10 +553,15 @@ async def disable_knowledge_document(session: AsyncSession, *, document_id: str)
             lease_expires_at=None,
         )
     )
+    actor = await session.get(User, actor_id or document.created_by)
+    add_audit_event(session, event_type=AuditEventType.KNOWLEDGE_DOCUMENT_DISABLED,
+        outcome=AuditOutcome.SUCCESS, store_id=None, actor_id=actor.id if actor else None,
+        actor_role=actor.role if actor else None, resource_type='knowledge_document',
+        resource_id=document_id, details={'document_status': KnowledgeVersionStatus.DISABLED.value})
     await session.commit()
     _log_transition(
         started=started,
-        actor_id=document.created_by,
+        actor_id=actor_id or document.created_by,
         document_id=document_id,
         version_id=None,
         status=KnowledgeVersionStatus.DISABLED,
