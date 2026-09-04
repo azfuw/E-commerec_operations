@@ -82,6 +82,18 @@ class ApprovalActionType(StrEnum):
     REQUEST_CHANGES = "request_changes"
 
 
+class EvaluationAgentType(StrEnum):
+    ANALYSIS = "analysis"
+    OPTIMIZATION = "optimization"
+    COMPLIANCE = "compliance"
+    KNOWLEDGE_RETRIEVAL = "knowledge_retrieval"
+
+
+class EvaluationRunStatus(StrEnum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class AuditEventType(StrEnum):
     MANUAL_REVISION_CREATED = "manual_revision_created"
     MANUAL_REVIEW_CLAIMED = "manual_review_claimed"
@@ -93,6 +105,13 @@ class AuditEventType(StrEnum):
     PROPOSAL_CHANGES_REQUESTED = "proposal_changes_requested"
     SIMULATED_PUBLISH_COMPLETED = "simulated_publish_completed"
     AUTHORIZATION_DENIED = "authorization_denied"
+    KNOWLEDGE_DOCUMENT_CREATED = "knowledge_document_created"
+    KNOWLEDGE_VERSION_CREATED = "knowledge_version_created"
+    KNOWLEDGE_DOCUMENT_DISABLED = "knowledge_document_disabled"
+    EVALUATION_RUN_PERSISTED = "evaluation_run_persisted"
+    ADMIN_USER_UPDATED = "admin_user_updated"
+    ADMIN_USER_SCOPES_REPLACED = "admin_user_scopes_replaced"
+    ADMIN_STORE_UPDATED = "admin_store_updated"
 
 
 class AuditOutcome(StrEnum):

@@ -160,6 +160,13 @@ def test_stage_five_closed_sets_are_exact() -> None:
         "proposal_changes_requested",
         "simulated_publish_completed",
         "authorization_denied",
+        "knowledge_document_created",
+        "knowledge_version_created",
+        "knowledge_document_disabled",
+        "evaluation_run_persisted",
+        "admin_user_updated",
+        "admin_user_scopes_replaced",
+        "admin_store_updated",
     }
     assert WorkflowType.MANUAL_REVIEW.value == "manual_review"
     assert WorkflowStatus.PENDING_APPROVAL.value == "pending_approval"
@@ -401,6 +408,8 @@ def test_all_stage_five_named_constraints_and_indexes_are_mapped() -> None:
                 "ix_audit_events_proposal_created",
                 "ix_audit_events_workflow_created",
                 "ix_audit_events_actor_created",
+                "ix_audit_events_event_created",
+                "ix_audit_events_outcome_created",
             },
             "foreign_keys": {
                 "fk_audit_events_actor_id",

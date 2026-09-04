@@ -25,6 +25,8 @@ from backend.common import (
     AuditEventType,
     AuditOutcome,
     ComplianceRiskLevel,
+    EvaluationAgentType,
+    EvaluationRunStatus,
     KnowledgeVersionStatus,
     OrderStatus,
     ProposalRevisionOrigin,
@@ -392,6 +394,133 @@ class AgentCall(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     estimated_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
     error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class EvaluationCase(Base):
+    __tablename__ = "evaluation_cases"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_type",
+            "case_key",
+            "case_version",
+            name="uq_evaluation_cases_agent_key_version",
+        ),
+        CheckConstraint("agent_type IN ('analysis', 'optimization', 'compliance', 'knowledge_retrieval')", name="ck_evaluation_cases_agent_type"),
+        CheckConstraint("case_version >= 1", name="ck_evaluation_cases_version"),
+        CheckConstraint("trim(CAST(fixture AS TEXT)) LIKE '{%}' AND replace(CAST(fixture AS TEXT), ' ', '') <> '{}'", name="ck_evaluation_cases_fixture_nonempty"),
+        CheckConstraint("trim(CAST(expected AS TEXT)) LIKE '{%}' AND replace(CAST(expected AS TEXT), ' ', '') <> '{}'", name="ck_evaluation_cases_expected_nonempty"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    agent_type: Mapped[EvaluationAgentType] = mapped_column(
+        Enum(
+            EvaluationAgentType,
+            name="evaluation_agent_type",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=32,
+        ),
+        nullable=False,
+    )
+    case_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    case_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    fixture: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    expected: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=lambda: True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+    __table_args__ = (
+        CheckConstraint("agent_type IN ('analysis', 'optimization', 'compliance', 'knowledge_retrieval')", name="ck_evaluation_runs_agent_type"),
+        CheckConstraint("execution_mode = 'offline_fixture'", name="ck_evaluation_runs_execution_mode"),
+        CheckConstraint("status IN ('completed', 'failed')", name="ck_evaluation_runs_status"),
+        CheckConstraint("completed_at >= started_at", name="ck_evaluation_runs_completed_at"),
+        CheckConstraint(
+            "agent_type = 'knowledge_retrieval' OR store_id IS NOT NULL",
+            name="ck_evaluation_runs_store_requirement",
+        ),
+        Index("ix_evaluation_runs_agent_created", "agent_type", "created_at", "id"),
+        Index("ix_evaluation_runs_store_created", "store_id", "created_at", "id"),
+        Index("ix_evaluation_runs_status_created", "status", "created_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    agent_type: Mapped[EvaluationAgentType] = mapped_column(
+        Enum(
+            EvaluationAgentType,
+            name="evaluation_agent_type",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=32,
+        ),
+        nullable=False,
+    )
+    store_id: Mapped[str | None] = mapped_column(ForeignKey("stores.id"))
+    suite_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    runner_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    execution_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[EvaluationRunStatus] = mapped_column(
+        Enum(
+            EvaluationRunStatus,
+            name="evaluation_run_status",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=16,
+        ),
+        nullable=False,
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    summary: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class EvaluationResult(Base):
+    __tablename__ = "evaluation_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "evaluation_run_id",
+            "evaluation_case_id",
+            "agent_type",
+            name="uq_evaluation_results_run_case_agent",
+        ),
+        CheckConstraint("agent_type IN ('analysis', 'optimization', 'compliance', 'knowledge_retrieval')", name="ck_evaluation_results_agent_type"),
+        CheckConstraint("outcome IN ('passed', 'failed')", name="ck_evaluation_results_outcome"),
+        CheckConstraint("trim(CAST(metrics AS TEXT)) LIKE '{%}' AND replace(CAST(metrics AS TEXT), ' ', '') <> '{}'", name="ck_evaluation_results_metrics_nonempty"),
+        CheckConstraint("result_code IN ('EVALUATION_PASSED', 'EVALUATION_EXPECTATION_MISMATCH', 'EVALUATION_INPUT_INVALID', 'EVALUATION_VALIDATION_FAILED', 'EVALUATION_RUNNER_FAILED')", name="ck_evaluation_results_result_code"),
+        CheckConstraint("latency_ms >= 0 AND latency_ms <= 1.7976931348623157e308", name="ck_evaluation_results_latency_ms"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    evaluation_run_id: Mapped[str] = mapped_column(ForeignKey("evaluation_runs.id"), nullable=False)
+    evaluation_case_id: Mapped[str] = mapped_column(ForeignKey("evaluation_cases.id"), nullable=False)
+    agent_type: Mapped[EvaluationAgentType] = mapped_column(
+        Enum(
+            EvaluationAgentType,
+            name="evaluation_agent_type",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=32,
+        ),
+        nullable=False,
+    )
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    metrics: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    result_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    latency_ms: Mapped[float] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
@@ -778,7 +907,10 @@ class AuditEvent(Base):
             "event_type IN ('manual_revision_created', 'manual_review_claimed', "
             "'manual_review_completed', 'manual_review_failed', 'proposal_submitted', "
             "'proposal_approved', 'proposal_rejected', 'proposal_changes_requested', "
-            "'simulated_publish_completed', 'authorization_denied')",
+            "'simulated_publish_completed', 'authorization_denied', "
+            "'knowledge_document_created', 'knowledge_version_created', "
+            "'knowledge_document_disabled', 'evaluation_run_persisted', "
+            "'admin_user_updated', 'admin_user_scopes_replaced', 'admin_store_updated')",
             name="ck_audit_events_event_type",
         ),
         CheckConstraint(
@@ -789,10 +921,19 @@ class AuditEvent(Base):
             "actor_role IS NULL OR actor_role IN ('operator', 'supervisor', 'admin')",
             name="ck_audit_events_actor_role",
         ),
+        CheckConstraint(
+            "(resource_type IS NULL AND resource_id IS NULL) OR "
+            "(resource_type IS NOT NULL AND resource_id IS NOT NULL "
+            "AND resource_type IN ('user', 'store', 'knowledge_document', 'knowledge_version', 'evaluation_run') "
+            "AND length(resource_id) BETWEEN 1 AND 36)",
+            name="ck_audit_events_resource_pair",
+        ),
         Index("ix_audit_events_store_created", "store_id", "created_at", "id"),
         Index("ix_audit_events_proposal_created", "proposal_id", "created_at", "id"),
         Index("ix_audit_events_workflow_created", "workflow_run_id", "created_at", "id"),
         Index("ix_audit_events_actor_created", "actor_id", "created_at", "id"),
+        Index("ix_audit_events_event_created", "event_type", "created_at", "id"),
+        Index("ix_audit_events_outcome_created", "outcome", "created_at", "id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
@@ -831,9 +972,11 @@ class AuditEvent(Base):
             length=16,
         )
     )
-    store_id: Mapped[str] = mapped_column(
-        ForeignKey("stores.id", name="fk_audit_events_store_id"), nullable=False
+    store_id: Mapped[str | None] = mapped_column(
+        ForeignKey("stores.id", name="fk_audit_events_store_id")
     )
+    resource_type: Mapped[str | None] = mapped_column(String(32))
+    resource_id: Mapped[str | None] = mapped_column(String(36))
     proposal_id: Mapped[str | None] = mapped_column(
         ForeignKey("product_proposals.id", name="fk_audit_events_proposal_id")
     )

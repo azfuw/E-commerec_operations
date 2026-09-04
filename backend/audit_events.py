@@ -12,6 +12,9 @@ from backend.common import (
     AuditEventType,
     AuditOutcome,
     ComplianceRiskLevel,
+    EvaluationAgentType,
+    EvaluationRunStatus,
+    KnowledgeVersionStatus,
     ProposalRevisionOrigin,
     UserRole,
     UserStatus,
@@ -36,11 +39,25 @@ AUDIT_DETAIL_KEYS = frozenset(
         "risk_level",
         "published_from_version",
         "published_to_version",
+        "from_role",
+        "to_role",
+        "from_user_status",
+        "to_user_status",
+        "scope_count",
+        "store_enabled",
+        "document_status",
+        "evaluation_agent_type",
+        "evaluation_status",
+        "case_count",
     }
 )
 
 _EDITABLE_FIELDS = frozenset(
     {"title", "selling_points", "description", "keywords", "attribute_completions"}
+)
+_AUDIT_CHANGED_FIELDS = _EDITABLE_FIELDS | frozenset({"role", "status", "store_scopes", "enabled"})
+_RESOURCE_TYPES = frozenset(
+    {"user", "store", "knowledge_document", "knowledge_version", "evaluation_run"}
 )
 
 
@@ -51,7 +68,7 @@ class AuditEventDomainError(Exception):
 
 
 def _safe_details(details: dict[str, object]) -> None:
-    if not set(details) <= AUDIT_DETAIL_KEYS:
+    if not isinstance(details, dict) or not set(details) <= AUDIT_DETAIL_KEYS:
         raise ValueError("unsafe audit details")
     enum_values = {
         "from_status": {item.value for item in WorkflowStatus},
@@ -60,18 +77,33 @@ def _safe_details(details: dict[str, object]) -> None:
         "workflow_type": {item.value for item in WorkflowType},
         "quality_status": {item.value for item in WorkflowQuality},
         "risk_level": {item.value for item in ComplianceRiskLevel},
+        "from_role": {item.value for item in UserRole},
+        "to_role": {item.value for item in UserRole},
+        "from_user_status": {item.value for item in UserStatus},
+        "to_user_status": {item.value for item in UserStatus},
+        "document_status": {item.value for item in KnowledgeVersionStatus},
+        "evaluation_agent_type": {item.value for item in EvaluationAgentType},
+        "evaluation_status": {item.value for item in EvaluationRunStatus},
     }
     for key, allowed in enum_values.items():
-        if key in details and details[key] not in allowed:
+        if key in details and (not isinstance(details[key], str) or details[key] not in allowed):
             raise ValueError("unsafe audit details")
-    for key in ("revision_number", "published_from_version", "published_to_version"):
+    for key in (
+        "revision_number",
+        "published_from_version",
+        "published_to_version",
+        "scope_count",
+        "case_count",
+    ):
         if key in details and (
             not isinstance(details[key], int)
             or isinstance(details[key], bool)
-            or details[key] < 1
+            or details[key] < (0 if key in {"scope_count", "case_count"} else 1)
         ):
             raise ValueError("unsafe audit details")
     if "review_passed" in details and not isinstance(details["review_passed"], bool):
+        raise ValueError("unsafe audit details")
+    if "store_enabled" in details and not isinstance(details["store_enabled"], bool):
         raise ValueError("unsafe audit details")
     if "current_step" in details and (
         not isinstance(details["current_step"], str)
@@ -83,7 +115,7 @@ def _safe_details(details: dict[str, object]) -> None:
         fields = details["changed_fields"]
         if (
             not isinstance(fields, list)
-            or any(not isinstance(field, str) or field not in _EDITABLE_FIELDS for field in fields)
+            or any(not isinstance(field, str) or field not in _AUDIT_CHANGED_FIELDS for field in fields)
             or len(fields) != len(set(fields))
         ):
             raise ValueError("unsafe audit details")
@@ -101,12 +133,23 @@ def _safe_details(details: dict[str, object]) -> None:
         raise ValueError("unsafe audit details")
 
 
+def _safe_resource(resource_type: str | None, resource_id: str | None) -> None:
+    if (resource_type is None) != (resource_id is None):
+        raise ValueError("unsafe audit resource")
+    if resource_type is not None and (
+        resource_type not in _RESOURCE_TYPES
+        or not isinstance(resource_id, str)
+        or not 1 <= len(resource_id) <= 36
+    ):
+        raise ValueError("unsafe audit resource")
+
+
 def add_audit_event(
     session: AsyncSession,
     *,
     event_type: AuditEventType,
     outcome: AuditOutcome,
-    store_id: str,
+    store_id: str | None,
     actor_id: str | None = None,
     actor_role: UserRole | None = None,
     proposal_id: str | None = None,
@@ -117,9 +160,12 @@ def add_audit_event(
     request_id: str | None = None,
     error_code: str | None = None,
     details: dict[str, object] | None = None,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
 ) -> AuditEvent:
     safe_details = {} if details is None else details
     _safe_details(safe_details)
+    _safe_resource(resource_type, resource_id)
     event = AuditEvent(
         id=str(uuid4()),
         event_type=event_type,
@@ -127,6 +173,8 @@ def add_audit_event(
         actor_id=actor_id,
         actor_role=actor_role,
         store_id=store_id,
+        resource_type=resource_type,
+        resource_id=resource_id,
         proposal_id=proposal_id,
         proposal_revision_id=proposal_revision_id,
         workflow_run_id=workflow_run_id,
