@@ -1,24 +1,27 @@
 # Phase 9 Audit Log Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Extend append-only audit reads with safe indexed filters and an authorized responsive audit-log console.
+**Goal:** Add safe indexed audit filters and an authorized responsive audit-log console while preserving append-only history.
 
-**Architecture:** Plan 1 supplies resource-compatible AuditEvent schema, event values, and safe details validation. This plan adds one bounded query, its GET route, and a Vue list/detail page. It never changes an audit row, permits no details JSON/text search, and keeps admin global visibility distinct from supervisor store scope.
+**Architecture:** Plan 1 supplies the resource-compatible `AuditEvent` schema and `AUDIT_DETAIL_KEYS`. This plan puts all filter validation and scoped/global query logic in `backend/audit_events.py`, adds one read-only FastAPI route, then renders the safe view in Vue. No audit event is changed or queried by free text/details content.
 
-**Tech Stack:** FastAPI, SQLAlchemy async, pytest, Vue 3, TypeScript, Element Plus, Vitest, Playwright.
+**Tech Stack:** FastAPI, SQLAlchemy async, pytest, PostgreSQL, Vue 3, TypeScript, Element Plus, Vitest, Playwright.
 
-**Spec:** docs/superpowers/specs/2026-09-04-phase-9-management-console-design.md
+**Spec:** `docs/superpowers/specs/2026-09-04-phase-9-management-console-design.md`
 
 ## Global Constraints
 
-- Reuse Plan 1 migration 0006 and AUDIT_DETAIL_KEYS exactly; create no migration, table, writer, or event type.
-- Audit is append-only. This work reads events and validates stored safe detail JSON only; no update, delete, replay, or repair route exists.
-- Supervisor sees only current UserStoreScope records, including disabled-store history, and no global event. Admin sees every store-scoped and global event without a scope row. Operator gets 403.
-- Only page/page_size, store_id, proposal_id, action, workflow_run_id, event_type, actor_id, outcome, created_from, and created_to are legal filters. IDs are 1..36; page>=1; page_size 1..100; UTC time range is at most 31 days and start<=end.
-- Sort is created_at DESC then id DESC. Never add full-text search, arbitrary sort, error text, details query, raw payload, or chart dependency.
-- Safe responses/UI contain only relationship IDs, enums, allowlisted details, short error code, request ID, and timestamps. Never expose credentials, hashes, prompts/raw output, exceptions, document body/path/vector, workflow state, lease/checkpoint, or publish snapshot.
-- Mobile hides audit navigation and renders the device restriction before audit requests. Phase 10 owns true browser E2E and reports.
+- The current 电商项目开发窗口 executes this plan sequentially with `superpowers:executing-plans`; do not dispatch subagents.
+- Reuse Plan 1 `0006`, `AuditEvent`, event types, resource fields, and `AUDIT_DETAIL_KEYS`; create no migration, table, or audit writer.
+- Audit facts are append-only. This plan has no update/delete/replay/repair event action.
+- Legal filters are `page`, `page_size`, `store_id`, `proposal_id`, `action`, `workflow_run_id`, `event_type`, `actor_id`, `outcome`, `created_from`, `created_to`. IDs are 1..36, page>=1, page_size 1..100, UTC range is at most 31 days and start<=end.
+- Order is `created_at DESC, id DESC`. Do not add full-text search, arbitrary sort, details JSON filter, error text search, raw payload, or chart library.
+- `supervisor` sees current scoped records, including disabled-store history, and no global records. `admin` sees all global/store history without scope. `operator` gets 403.
+- Response/UI exclude secrets, hashes, prompts/raw output, exception, document data, workflow internals, lease/checkpoint, or publish snapshot. Phase 10 retains true browser E2E and reports.
+- Before every ordinary offline gate, execute `Remove-Item Env:RUN_POSTGRES_INTEGRATION -ErrorAction SilentlyContinue; Remove-Item Env:RUN_KNOWLEDGE_INTEGRATION -ErrorAction SilentlyContinue; Remove-Item Env:RUN_DEEPSEEK_SMOKE -ErrorAction SilentlyContinue; Remove-Item Env:RUN_TASK10_DEEPSEEK_SMOKE -ErrorAction SilentlyContinue; Remove-Item Env:RUN_PHASE9_EVALUATION_WRITE -ErrorAction SilentlyContinue; Remove-Item Env:DEEPSEEK_API_KEY -ErrorAction SilentlyContinue`. PostgreSQL proof alone sets `RUN_POSTGRES_INTEGRATION=1`; immediately after every PostgreSQL command execute `Remove-Item Env:RUN_POSTGRES_INTEGRATION -ErrorAction SilentlyContinue`.
+- Do not read, modify, or stage `docs/business-and-technical-guide.md` or `docs/interview-q-and-a.md`.
+- Do not modify or clean C-drive personal files outside the current Codex worktree; put cache and temporary files on D drive first.
 
 ---
 
@@ -26,46 +29,60 @@
 
 | Path | Responsibility |
 |---|---|
-| backend/audit_events.py | Parsed filter type and sole filtered audit query. |
-| backend/schemas.py | Query bounds and safe list/detail DTOs. |
-| backend/routes.py | GET /audit-events binding and safe domain error conversion. |
-| tests/test_audit_events.py and tests/test_audit_api.py | Service, role/scope, filters, paging, safety, and error evidence. |
-| frontend/src/api.ts, types.ts, router.ts, capabilities.ts, components/AppShell.vue | Typed audit fetch and desktop/tablet route/nav. |
-| frontend/src/pages/AuditEventsPage.vue and frontend/src/pages/AuditEventsPage.test.ts | Field-safe filterable table and details drawer. |
-| frontend/tests/phase9-management.spec.ts | Fixture-only navigation and mobile zero-request proof. |
+| `backend/audit_events.py` | `AuditEventFilters` and the sole filtered query. |
+| `backend/schemas.py`, `backend/routes.py` | Bounded query/response DTOs and `GET /audit-events`. |
+| `tests/test_audit_events.py`, `tests/test_audit_api.py`, `tests/test_phase9_postgres.py` | Service, RBAC, safe shape, paging, and local PostgreSQL tests. |
+| `frontend/src/api.ts`, `frontend/src/types.ts`, `frontend/src/router.ts`, `frontend/src/capabilities.ts`, `frontend/src/components/AppShell.vue`, `frontend/src/pages/AuditEventsPage.vue` | Typed audit list and desktop/tablet route. |
+| `frontend/src/pages/AuditEventsPage.test.ts`, `frontend/tests/phase9-management.spec.ts` | Component/device and fixture-browser evidence. |
 
-### Task 1: Define and prove the safe audit query
+### Task 1: Implement safe audit filtering and PostgreSQL scope proof
 
 **Files:**
-- Modify: backend/audit_events.py, backend/schemas.py
-- Create: tests/test_audit_events.py
+- Modify: `backend/audit_events.py`, `backend/schemas.py`, `tests/test_phase9_postgres.py`
+- Create: `tests/test_audit_events.py`
 
 **Interfaces:**
-- Consumes: AuditEvent, ApprovalAction, Store, User, UserStoreScope, AuditEventType, AuditOutcome, and AUDIT_DETAIL_KEYS.
-- Produces: AuditEventFilters and list_audit_events(session, actor_id, filters) -> tuple[list[AuditEvent], int].
+- Consumes: `AuditEvent`, `ApprovalAction`, `Store`, `User`, `UserStoreScope`, `AuditEventType`, `AuditOutcome`, and `AUDIT_DETAIL_KEYS`.
+- Produces: `AuditEventFilters` and `list_audit_events(session: AsyncSession, *, actor_id: str, filters: AuditEventFilters) -> tuple[list[AuditEvent], int]`.
 
-- [ ] **Step 1: Write failing filter and scope tests**
+- [ ] **Step 1: Write failing offline and real-PostgreSQL tests**
 
 ~~~python
-async def test_admin_reads_global_and_disabled_store_history_without_scope(session) -> None:
-    items, total = await list_audit_events(session, actor_id='admin-1', filters=AuditEventFilters())
-    assert {event.store_id for event in items} == {None, 'disabled-store', 'enabled-store'}
-    assert total == 3
-
-def test_rejects_time_range_over_31_days() -> None:
+def test_filter_rejects_range_longer_than_31_days() -> None:
     with pytest.raises(AuditEventDomainError, match='AUDIT_FILTER_INVALID'):
-        AuditEventFilters(created_from=utc('2026-01-01'), created_to=utc('2026-02-02'))
+        AuditEventFilters(
+            created_from=datetime(2026, 1, 1, tzinfo=UTC),
+            created_to=datetime(2026, 2, 2, tzinfo=UTC),
+        )
 ~~~
 
-Cover active supervisor scope, global exclusion, disabled-store history with retained scope, operator 403, invalid ID/enum/timestamp, every filter, deterministic ties, and unsafe persisted details mapped to a stable 503 without JSON/error internals.
+In `tests/test_phase9_postgres.py`, open separate existing session-factory sessions and seed direct rows:
 
-- [ ] **Step 2: Run focused RED**
+~~~python
+async with async_session_factory() as writer, async_session_factory() as reader:
+    writer.add(AuditEvent(
+        id='global-admin-event', event_type=AuditEventType.ADMIN_USER_UPDATED,
+        outcome=AuditOutcome.SUCCESS, store_id=None, actor_id='admin-1',
+        actor_role=UserRole.ADMIN, resource_type='user', resource_id='user-2', details={},
+    ))
+    await writer.commit()
+    events, _ = await list_audit_events(reader, actor_id='admin-1', filters=AuditEventFilters())
+    assert 'global-admin-event' in {event.id for event in events}
+~~~
 
-Run: D:\E-commerce_operations_env\python.exe -m pytest tests/test_audit_events.py -v
+Add direct offline cases for supervisor scoped/disabled-store history, supervisor global exclusion, admin global visibility, operator 403, every legal filter, stable ties, unsafe persisted details -> closed 503, and no mutation. Add PostgreSQL checks for the same visibility and descending paging.
 
-Expected: FAIL because the current query has three filters, ascending order, and a mandatory scope join.
+- [ ] **Step 2: Run RED**
 
-- [ ] **Step 3: Implement the bounded existing-module query**
+Run: `D:\E-commerce_operations_env\python.exe -m pytest tests/test_audit_events.py -v`
+
+Expected: FAIL because current query only accepts three filters, sorts ascending, and forces an admin scope join.
+
+Run: `$env:RUN_POSTGRES_INTEGRATION='1'; D:\E-commerce_operations_env\python.exe -m pytest tests/test_phase9_postgres.py -v`
+
+Expected: FAIL until global/admin and scoped/supervisor paths are distinct; clear the opt-in.
+
+- [ ] **Step 3: Implement the bounded query in the existing module**
 
 ~~~python
 statement = select(AuditEvent)
@@ -78,70 +95,93 @@ elif actor.role is not UserRole.ADMIN:
     raise AuditEventDomainError('AUDIT_FORBIDDEN', 403)
 ~~~
 
-Validate filter values before SQL. Use indexed equality/timestamp predicates, order by created_at.desc(), id.desc(), and count the same filtered subquery. Recheck each selected details with _safe_details. Do not add a generic query builder, custom sort, or mutation.
+Validate every filter before SQL, apply indexed equality/timestamp predicates, count the exact filtered subquery, order `AuditEvent.created_at.desc(), AuditEvent.id.desc()`, and call `_safe_details` on every selected row. Do not create a generic query builder or mutate facts.
 
-- [ ] **Step 4: Run service GREEN/regression**
+- [ ] **Step 4: Run GREEN and PostgreSQL audit gates**
 
-Run: D:\E-commerce_operations_env\python.exe -m pytest tests/test_audit_events.py tests/test_approval_api.py -v
+Run: `D:\E-commerce_operations_env\python.exe -m pytest tests/test_audit_events.py tests/test_approval_api.py -v`
 
-Expected: PASS offline; original store/proposal/action semantics stay compatible.
+Expected: PASS offline.
 
-- [ ] **Step 5: Commit the query contract**
+Run: `$env:RUN_POSTGRES_INTEGRATION='1'; D:\E-commerce_operations_env\python.exe -m pytest tests/test_phase9_postgres.py -v`
+
+Expected: PASS with append-only history, global admin visibility, scoped supervisor visibility, safe details, and stable paging; clear the opt-in.
+
+- [ ] **Step 5: Commit audit filtering**
 
 ~~~bash
-git add backend/audit_events.py backend/schemas.py tests/test_audit_events.py
+git add backend/audit_events.py backend/schemas.py tests/test_audit_events.py tests/test_phase9_postgres.py
 git diff --cached --check
 git commit -m "feat: add safe audit event filters"
 ~~~
 
-### Task 2: Expose the expanded audit GET route
+### Task 2: Expose expanded `GET /audit-events`
 
 **Files:**
-- Modify: backend/routes.py, backend/schemas.py
-- Create: tests/test_audit_api.py
+- Modify: `backend/routes.py`, `backend/schemas.py`
+- Create: `tests/test_audit_api.py`
 
 **Interfaces:**
-- Consumes: AuditEventFilters and list_audit_events from Task 1.
-- Produces: GET /audit-events with all approved filters and AuditEventListView containing items, page, page_size, and total.
+- Consumes: `AuditEventFilters` and `list_audit_events`.
+- Produces: `GET /audit-events` with all legal filters and `AuditEventListView(items: list[AuditEventView], page: int, page_size: int, total: int)`.
 
-- [ ] **Step 1: Write failing route/RBAC/response tests**
+- [ ] **Step 1: Write failing route and safe-response tests**
 
 ~~~python
-async def test_audit_route_uses_descending_page_and_safe_details(client, admin_headers) -> None:
-    response = await client.get('/audit-events?event_type=admin_user_updated&page=1&page_size=1',
-                                headers=admin_headers)
+async def test_route_returns_descending_safe_page(client, admin_headers) -> None:
+    response = await client.get(
+        '/audit-events?event_type=admin_user_updated&page=1&page_size=1',
+        headers=admin_headers,
+    )
     assert response.status_code == 200
     assert response.json()['total'] == 2
     assert 'request_hash' not in response.text
 ~~~
 
-Cover 401, operator 403, supervisor global/cross-scope absence, admin global/disabled-store presence, all 422 bounds, AUDIT_FILTER_INVALID code, and no database exception leak.
+Cover 401, operator 403, supervisor global/cross-store absence, admin global/disabled-store presence, all validation 422, stable filter-error code, and no exception detail response.
 
 - [ ] **Step 2: Run route RED**
 
-Run: D:\E-commerce_operations_env\python.exe -m pytest tests/test_audit_api.py -v
+Run: `D:\E-commerce_operations_env\python.exe -m pytest tests/test_audit_api.py -v`
 
-Expected: FAIL because the route cannot parse or return the expanded safe contract.
+Expected: FAIL because route inputs and response DTO cannot represent the expanded contract.
 
-- [ ] **Step 3: Add typed query binding and error conversion**
+- [ ] **Step 3: Bind every typed filter and convert domain errors**
 
 ~~~python
 @router.get('/audit-events', response_model=AuditEventListView)
 async def list_audit_events_route(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    store_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    proposal_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    action: ApprovalActionType | None = None,
+    workflow_run_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
     event_type: AuditEventType | None = None,
+    actor_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
     outcome: AuditOutcome | None = None,
-    ...
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> AuditEventListView:
-    ...
+    filters = AuditEventFilters(
+        page=page, page_size=page_size, store_id=store_id, proposal_id=proposal_id,
+        action=action, workflow_run_id=workflow_run_id, event_type=event_type,
+        actor_id=actor_id, outcome=outcome, created_from=created_from, created_to=created_to,
+    )
+    events, total = await list_audit_events(session, actor_id=user.id, filters=filters)
+    return AuditEventListView(
+        items=[AuditEventView.model_validate(event) for event in events],
+        page=page, page_size=page_size, total=total,
+    )
 ~~~
 
-Bind every specified filter with exact types/lengths, create one AuditEventFilters instance, pass it to the service, and map AuditEventDomainError to the established safe detail code. Do not return the raw service tuple.
+Wrap the service call with the existing `AuditEventDomainError` to safe `HTTPException` conversion. Do not expose a raw ORM model.
 
-- [ ] **Step 4: Run route GREEN/regression**
+- [ ] **Step 4: Run route GREEN**
 
-Run: D:\E-commerce_operations_env\python.exe -m pytest tests/test_audit_api.py tests/test_approval_api.py tests/test_optimization_api.py -v
+Run: `D:\E-commerce_operations_env\python.exe -m pytest tests/test_audit_api.py tests/test_approval_api.py tests/test_optimization_api.py -v`
 
 Expected: PASS offline.
 
@@ -153,111 +193,56 @@ git diff --cached --check
 git commit -m "feat: expose filtered audit events"
 ~~~
 
-### Task 3: Build the responsive audit-log page
+### Task 3: Build Audit Events with `canViewAuditEvents`
 
 **Files:**
-- Modify: frontend/src/api.ts, frontend/src/types.ts, frontend/src/router.ts, frontend/src/capabilities.ts, frontend/src/components/AppShell.vue
-- Create: frontend/src/pages/AuditEventsPage.vue, frontend/src/pages/AuditEventsPage.test.ts, frontend/tests/phase9-management.spec.ts
+- Modify: `frontend/src/api.ts`, `frontend/src/types.ts`, `frontend/src/router.ts`, `frontend/src/capabilities.ts`, `frontend/src/components/AppShell.vue`
+- Create: `frontend/src/pages/AuditEventsPage.vue`, `frontend/src/pages/AuditEventsPage.test.ts`
+- Modify: `frontend/tests/phase9-management.spec.ts`
 
 **Interfaces:**
-- Consumes: GET /audit-events and ApiError.
-- Produces: route /app/audit-events, listAuditEvents(query, signal), AuditEventList type, and a zero-request mobile branch.
+- Consumes: `GET /audit-events` and `ApiError`.
+- Produces: `canViewAuditEvents(role: UserRole, isMobile: boolean): boolean`, route `/app/audit-events`, and `listAuditEvents(query: AuditEventQuery, signal?: AbortSignal): Promise<AuditEventList>`.
 
-- [ ] **Step 1: Write failing UI/device tests**
+- [ ] **Step 1: Write failing capability/page/browser tests**
 
 ~~~ts
-it('preserves selected filters after an API error', async () => {
-  await wrapper.get('[data-test="audit-event-type"]').setValue('proposal_approved')
-  await flushPromises()
-  expect(wrapper.get('[data-test="audit-event-type"]').element.value).toBe('proposal_approved')
+it('does not request audit data on a phone', async () => {
+  session.user = { id: 'supervisor-1', username: 'supervisor', role: 'supervisor' }
+  setMobile(true)
+  await router.push({ name: 'audit-events' })
+  expect(fetch).not.toHaveBeenCalled()
 })
 ~~~
 
-Cover supervisor/admin nav/data, operator forbidden route, loading/empty/filtered-empty/401/403/404/409/422/unknown states, paging, field-safe details, text-only rendering, and mobile deep link without fetch. Extend deterministic browser fixtures.
+Cover supervisor/admin navigation, operator forbidden view, all list states, filter/paging retention after error, field-safe drawer, text-only detail rendering, and deterministic browser desktop/tablet/mobile paths.
 
 - [ ] **Step 2: Run frontend RED**
 
-Run: npm --prefix frontend test -- AuditEventsPage capabilities
+Run: `npm --prefix frontend test -- AuditEventsPage capabilities`
 
-Expected: FAIL because typed request, route, page, and nav are absent.
+Expected: FAIL because capability, route, typed request, and page are absent.
 
-- [ ] **Step 3: Implement one Element Plus list/detail page**
+- [ ] **Step 3: Implement the safe table and drawer**
 
 ~~~ts
-export function listAuditEvents(query: AuditEventQuery, signal?: AbortSignal) {
-  return apiRequest<AuditEventList>('/audit-events?' + queryString(query), { signal })
+export function canViewAuditEvents(role: UserRole, isMobile: boolean): boolean {
+  return !isMobile && (role === 'supervisor' || role === 'admin')
 }
 ~~~
 
-Use only approved select/date filters, Element Plus pagination/table/drawer, AbortController, visible labels, keyboard controls, and aria-live status. Drawer displays safe individual fields via interpolation rather than raw JSON/HTML. Hide nav on mobile and return restriction before load().
+Use this exact function for nav, route, and mobile zero-request behavior. Add `apiRequest`/`AbortController` request handling, only server-approved filter fields, Element Plus table/pagination/drawer, text interpolation, visible labels, keyboard controls, and aria-live status. The route renders the mobile restriction before load.
 
 - [ ] **Step 4: Run frontend GREEN**
 
-Run: npm --prefix frontend test -- AuditEventsPage capabilities
+Run: `npm --prefix frontend test -- AuditEventsPage capabilities && npm --prefix frontend run typecheck && npm --prefix frontend run build && npm --prefix frontend run test:e2e -- phase9-management`
 
-Expected: PASS.
+Expected: PASS with fixture browser responses.
 
-Run: npm --prefix frontend run typecheck && npm --prefix frontend run build && npm --prefix frontend run test:e2e -- phase9-management
-
-Expected: PASS using fixtures only.
-
-- [ ] **Step 5: Commit the audit console**
+- [ ] **Step 5: Commit audit UI**
 
 ~~~bash
 git add frontend/src/api.ts frontend/src/types.ts frontend/src/router.ts frontend/src/capabilities.ts frontend/src/components/AppShell.vue frontend/src/pages/AuditEventsPage.vue frontend/src/pages/AuditEventsPage.test.ts frontend/tests/phase9-management.spec.ts
 git diff --cached --check
 git commit -m "feat: add audit log console"
-~~~
-
-### Task 4: Prove append-only compatibility and local PostgreSQL behavior
-
-**Files:**
-- Modify: tests/test_phase9_postgres.py, tests/test_audit_events.py, tests/test_audit_api.py
-
-**Interfaces:**
-- Consumes: Plan 1 schema, Tasks 1–3 contracts, and existing manual-review/approval events.
-- Produces: local PostgreSQL proof of append-only compatibility and correct global/scope visibility.
-
-- [ ] **Step 1: Write failing PostgreSQL acceptance test**
-
-~~~python
-async def test_postgres_audit_filters_keep_history_append_only_and_scope_correct(two_connections) -> None:
-    await write_admin_update_and_global_event(two_connections.first)
-    assert await read_supervisor_events(two_connections.second) == {'scoped-store'}
-    assert await read_admin_events(two_connections.second) == {'scoped-store', 'global'}
-~~~
-
-Test old events, new global resource metadata, disabled-store history, unsafe details closed failure, and concurrent reads without mutation.
-
-- [ ] **Step 2: Run PostgreSQL RED**
-
-Run: $env:RUN_POSTGRES_INTEGRATION='1'; D:\E-commerce_operations_env\python.exe -m pytest tests/test_phase9_postgres.py::test_postgres_audit_filters_keep_history_append_only_and_scope_correct -v
-
-Expected: FAIL until admin/global/supervisor paths are distinct.
-
-- [ ] **Step 3: Fix only the demonstrated query compatibility defect**
-
-~~~python
-assert selected_event.created_at <= previous_created_at
-assert set(selected_event.details) <= AUDIT_DETAIL_KEYS
-~~~
-
-Keep Plan 1 migration and every event immutable. Do not add text search, event mutation, or external integration.
-
-- [ ] **Step 4: Run Plan 3 verification**
-
-Run: D:\E-commerce_operations_env\python.exe -m pytest tests/test_audit_events.py tests/test_audit_api.py tests/test_approval_api.py tests/test_optimization_api.py -v
-
-Expected: PASS offline.
-
-Run: $env:RUN_POSTGRES_INTEGRATION='1'; D:\E-commerce_operations_env\python.exe -m pytest tests/test_phase9_postgres.py -v
-
-Expected: PASS against local PostgreSQL; then clear the opt-in.
-
-- [ ] **Step 5: Commit acceptance evidence**
-
-~~~bash
-git add tests/test_phase9_postgres.py tests/test_audit_events.py tests/test_audit_api.py
-git diff --cached --check
-git commit -m "test: verify phase nine audit log"
 ~~~
