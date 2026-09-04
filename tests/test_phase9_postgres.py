@@ -37,6 +37,48 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.asyncio(loop_scope='module')
+async def test_postgres_evaluation_atomic_complete_and_failed_header(monkeypatch):
+    from backend.agent_evaluations import persist_evaluation_run
+    from test_agent_evaluations import arguments
+    suffix = uuid4().hex[:12]
+    ids = {key:f'p9-{key}-{suffix}' for key in ('admin','store','case')}
+    try:
+      async with async_session_factory() as session:
+        session.add_all([User(id=ids['admin'],username=ids['admin'],password_hash='test',role=UserRole.ADMIN), Store(id=ids['store'],code=ids['store'],name='Test')])
+        session.add(EvaluationCase(id=ids['case'],agent_type=EvaluationAgentType.ANALYSIS,case_key=ids['case'],case_version=1,fixture={'ids':['p']},expected={'valid':True}))
+        await session.commit()
+        args = arguments(); args.update(actor_id=ids['admin'],store_id=ids['store'])
+        from backend.agent_evaluations import EvaluationResultInput
+        cases = list(await session.scalars(select(EvaluationCase).where(EvaluationCase.enabled.is_(True),EvaluationCase.agent_type == EvaluationAgentType.ANALYSIS)))
+        args['results'] = [EvaluationResultInput(c.id,'passed',args['results'][0].metrics,'EVALUATION_PASSED',1.0) for c in cases]
+        complete = await persist_evaluation_run(session,**args)
+        assert complete.status is EvaluationRunStatus.COMPLETED
+        assert await session.scalar(select(func.count(EvaluationResult.id)).where(EvaluationResult.evaluation_run_id == complete.id)) == len(cases)
+        original = session.flush
+        failed_once = False
+        async def fail_first(*a,**kw):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise IntegrityError('INSERT',{},Exception('private failure'))
+            await original(*a,**kw)
+        monkeypatch.setattr(session,'flush',fail_first)
+        failed = await persist_evaluation_run(session,**args)
+        assert failed.status is EvaluationRunStatus.FAILED
+        assert await session.scalar(select(func.count(EvaluationResult.id)).where(EvaluationResult.evaluation_run_id == failed.id)) == 0
+        assert await session.scalar(select(func.count(AuditEvent.id)).where(AuditEvent.actor_id == ids['admin'])) == 2
+    finally:
+      async with async_session_factory() as session:
+        await session.execute(delete(AuditEvent).where(AuditEvent.actor_id == ids['admin']))
+        await session.execute(delete(EvaluationResult).where(EvaluationResult.evaluation_run_id.in_(select(EvaluationRun.id).where(EvaluationRun.created_by == ids['admin']))))
+        await session.execute(delete(EvaluationRun).where(EvaluationRun.created_by == ids['admin']))
+        await session.execute(delete(EvaluationCase).where(EvaluationCase.id == ids['case']))
+        await session.execute(delete(Store).where(Store.id == ids['store']))
+        await session.execute(delete(User).where(User.id == ids['admin']))
+        await session.commit()
+
+
 def test_postgres_migration_roundtrip_and_fact_guard() -> None:
     engine = sa.create_engine(get_settings().database_url.replace('+asyncpg', '+psycopg'))
     try:
@@ -88,6 +130,7 @@ def test_postgres_migration_roundtrip_and_fact_guard() -> None:
         engine.dispose()
 
 
+@pytest.mark.asyncio(loop_scope='module')
 async def test_postgres_evaluation_facts_enforce_fk_unique_and_safe_audit() -> None:
     suffix = uuid4().hex[:16]
     ids = {

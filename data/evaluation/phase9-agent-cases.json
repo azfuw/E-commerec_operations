@@ -1,0 +1,702 @@
+[
+  {
+    "id": "p9-analysis-exact-v1",
+    "agent_type": "analysis",
+    "case_key": "exact",
+    "case_version": 1,
+    "fixture": {
+      "candidate_ids": [
+        "p1",
+        "p2"
+      ],
+      "response_ids": [
+        "p2",
+        "p1"
+      ],
+      "ranks": [
+        2,
+        1
+      ]
+    },
+    "expected": {
+      "candidate_set_valid": true,
+      "rank_order_valid": true
+    },
+    "enabled": true
+  },
+  {
+    "id": "p9-analysis-duplicate-v1",
+    "agent_type": "analysis",
+    "case_key": "duplicate",
+    "case_version": 1,
+    "fixture": {
+      "candidate_ids": [
+        "p1",
+        "p2"
+      ],
+      "response_ids": [
+        "p1",
+        "p1"
+      ],
+      "ranks": [
+        1,
+        1
+      ]
+    },
+    "expected": {
+      "candidate_set_valid": false,
+      "rank_order_valid": false
+    },
+    "enabled": true
+  },
+  {
+    "id": "p9-analysis-disabled-v1",
+    "agent_type": "analysis",
+    "case_key": "disabled",
+    "case_version": 1,
+    "fixture": {
+      "candidate_ids": [
+        "p1"
+      ],
+      "response_ids": [
+        "p1"
+      ],
+      "ranks": [
+        1
+      ]
+    },
+    "expected": {
+      "candidate_set_valid": true,
+      "rank_order_valid": true
+    },
+    "enabled": false
+  },
+  {
+    "id": "p9-optimization-valid-v1",
+    "agent_type": "optimization",
+    "case_key": "valid",
+    "case_version": 1,
+    "fixture": {
+      "trusted": {
+        "store_id": "store-1",
+        "product_id": "product-1",
+        "base_product_version": 7,
+        "title": "原商品标题",
+        "category": "家居",
+        "brand": "好物品牌",
+        "selling_points": [
+          "红色家居设计"
+        ],
+        "description": "原始详情",
+        "search_keywords": [
+          "家居"
+        ],
+        "attributes": {
+          "材质": "棉"
+        },
+        "skus": [
+          {
+            "id": "sku-1",
+            "code": "SKU-RED",
+            "spec": {
+              "颜色": "红"
+            },
+            "price": "100.00",
+            "stock": 10
+          }
+        ],
+        "candidate_metrics": {
+          "product_id": "product-1",
+          "product_code": "HOME-001",
+          "impressions": 100,
+          "clicks": 10,
+          "orders": 1,
+          "units": 1,
+          "revenue": "100.00",
+          "refunds": 0,
+          "ctr": "0.1000",
+          "conversion_rate": "0.1000",
+          "refund_rate": "0.0000",
+          "average_order_value": "100.0000"
+        },
+        "candidate_evidence": [
+          "orders=1"
+        ],
+        "rag_quality": "normal",
+        "canonical_rule_citations": [
+          {
+            "document_id": "document-1",
+            "version_id": "version-1",
+            "chunk_id": "rule-chunk-1",
+            "document_name": "通用规则",
+            "version_number": 1,
+            "category": "通用规则",
+            "canonical_text": "商品文案应有依据。",
+            "active": true,
+            "applicable": true
+          }
+        ]
+      },
+      "candidate": {
+        "title": "优选家居商品",
+        "selling_points": [
+          "红色家居设计"
+        ],
+        "description": [
+          {
+            "heading": "商品说明",
+            "body": "适合日常使用",
+            "evidence": [
+              {
+                "kind": "citation",
+                "value": "rule-chunk-1"
+              }
+            ]
+          }
+        ],
+        "keywords": [
+          "家居"
+        ],
+        "attribute_completions": [],
+        "changes": [
+          {
+            "field": "title",
+            "current_value": "原商品标题",
+            "suggested_value": "优选家居商品",
+            "reason": "优化标题表达",
+            "evidence": [
+              {
+                "kind": "fact",
+                "value": "product.title"
+              }
+            ]
+          },
+          {
+            "field": "description",
+            "current_value": "原始详情",
+            "suggested_value": [
+              {
+                "heading": "商品说明",
+                "body": "适合日常使用",
+                "evidence": [
+                  {
+                    "kind": "citation",
+                    "value": "rule-chunk-1"
+                  }
+                ]
+              }
+            ],
+            "reason": "优化详情表达",
+            "evidence": [
+              {
+                "kind": "citation",
+                "value": "rule-chunk-1"
+              }
+            ]
+          }
+        ],
+        "citations": [
+          {
+            "chunk_id": "rule-chunk-1"
+          }
+        ],
+        "price_suggestions": [],
+        "sku_suggestions": []
+      }
+    },
+    "expected": {
+      "output_schema_valid": true,
+      "trusted_fact_valid": true,
+      "citation_valid": true
+    },
+    "enabled": true
+  },
+  {
+    "id": "p9-optimization-mismatch-v1",
+    "agent_type": "optimization",
+    "case_key": "mismatch",
+    "case_version": 1,
+    "fixture": {
+      "trusted": {
+        "store_id": "store-1",
+        "product_id": "product-1",
+        "base_product_version": 7,
+        "title": "原商品标题",
+        "category": "家居",
+        "brand": "好物品牌",
+        "selling_points": [
+          "红色家居设计"
+        ],
+        "description": "原始详情",
+        "search_keywords": [
+          "家居"
+        ],
+        "attributes": {
+          "材质": "棉"
+        },
+        "skus": [
+          {
+            "id": "sku-1",
+            "code": "SKU-RED",
+            "spec": {
+              "颜色": "红"
+            },
+            "price": "100.00",
+            "stock": 10
+          }
+        ],
+        "candidate_metrics": {
+          "product_id": "product-1",
+          "product_code": "HOME-001",
+          "impressions": 100,
+          "clicks": 10,
+          "orders": 1,
+          "units": 1,
+          "revenue": "100.00",
+          "refunds": 0,
+          "ctr": "0.1000",
+          "conversion_rate": "0.1000",
+          "refund_rate": "0.0000",
+          "average_order_value": "100.0000"
+        },
+        "candidate_evidence": [
+          "orders=1"
+        ],
+        "rag_quality": "normal",
+        "canonical_rule_citations": [
+          {
+            "document_id": "document-1",
+            "version_id": "version-1",
+            "chunk_id": "rule-chunk-1",
+            "document_name": "通用规则",
+            "version_number": 1,
+            "category": "通用规则",
+            "canonical_text": "商品文案应有依据。",
+            "active": true,
+            "applicable": true
+          }
+        ]
+      },
+      "candidate": {
+        "title": "优选家居商品",
+        "selling_points": [
+          "红色家居设计"
+        ],
+        "description": [
+          {
+            "heading": "商品说明",
+            "body": "适合日常使用",
+            "evidence": [
+              {
+                "kind": "citation",
+                "value": "rule-chunk-1"
+              }
+            ]
+          }
+        ],
+        "keywords": [
+          "家居"
+        ],
+        "attribute_completions": [],
+        "changes": [
+          {
+            "field": "title",
+            "current_value": "错误当前值",
+            "suggested_value": "优选家居商品",
+            "reason": "优化标题表达",
+            "evidence": [
+              {
+                "kind": "fact",
+                "value": "product.title"
+              }
+            ]
+          },
+          {
+            "field": "description",
+            "current_value": "原始详情",
+            "suggested_value": [
+              {
+                "heading": "商品说明",
+                "body": "适合日常使用",
+                "evidence": [
+                  {
+                    "kind": "citation",
+                    "value": "rule-chunk-1"
+                  }
+                ]
+              }
+            ],
+            "reason": "优化详情表达",
+            "evidence": [
+              {
+                "kind": "citation",
+                "value": "rule-chunk-1"
+              }
+            ]
+          }
+        ],
+        "citations": [
+          {
+            "chunk_id": "rule-chunk-1"
+          }
+        ],
+        "price_suggestions": [],
+        "sku_suggestions": []
+      }
+    },
+    "expected": {
+      "output_schema_valid": true,
+      "trusted_fact_valid": false,
+      "citation_valid": true
+    },
+    "enabled": true
+  },
+  {
+    "id": "p9-compliance-valid-v1",
+    "agent_type": "compliance",
+    "case_key": "valid",
+    "case_version": 1,
+    "fixture": {
+      "trusted": {
+        "store_id": "store-1",
+        "product_id": "product-1",
+        "base_product_version": 7,
+        "title": "原商品标题",
+        "category": "家居",
+        "brand": "好物品牌",
+        "selling_points": [
+          "红色家居设计"
+        ],
+        "description": "原始详情",
+        "search_keywords": [
+          "家居"
+        ],
+        "attributes": {
+          "材质": "棉"
+        },
+        "skus": [
+          {
+            "id": "sku-1",
+            "code": "SKU-RED",
+            "spec": {
+              "颜色": "红"
+            },
+            "price": "100.00",
+            "stock": 10
+          }
+        ],
+        "candidate_metrics": {
+          "product_id": "product-1",
+          "product_code": "HOME-001",
+          "impressions": 100,
+          "clicks": 10,
+          "orders": 1,
+          "units": 1,
+          "revenue": "100.00",
+          "refunds": 0,
+          "ctr": "0.1000",
+          "conversion_rate": "0.1000",
+          "refund_rate": "0.0000",
+          "average_order_value": "100.0000"
+        },
+        "candidate_evidence": [
+          "orders=1"
+        ],
+        "rag_quality": "normal",
+        "canonical_rule_citations": [
+          {
+            "document_id": "document-1",
+            "version_id": "version-1",
+            "chunk_id": "rule-chunk-1",
+            "document_name": "通用规则",
+            "version_number": 1,
+            "category": "通用规则",
+            "canonical_text": "商品文案应有依据。",
+            "active": true,
+            "applicable": true
+          }
+        ]
+      },
+      "candidate": {
+        "title": "优选家居商品",
+        "selling_points": [
+          "红色家居设计"
+        ],
+        "description": [
+          {
+            "heading": "商品说明",
+            "body": "适合日常使用",
+            "evidence": [
+              {
+                "kind": "citation",
+                "value": "rule-chunk-1"
+              }
+            ]
+          }
+        ],
+        "keywords": [
+          "家居"
+        ],
+        "attribute_completions": [],
+        "changes": [
+          {
+            "field": "title",
+            "current_value": "原商品标题",
+            "suggested_value": "优选家居商品",
+            "reason": "优化标题表达",
+            "evidence": [
+              {
+                "kind": "fact",
+                "value": "product.title"
+              }
+            ]
+          },
+          {
+            "field": "description",
+            "current_value": "原始详情",
+            "suggested_value": [
+              {
+                "heading": "商品说明",
+                "body": "适合日常使用",
+                "evidence": [
+                  {
+                    "kind": "citation",
+                    "value": "rule-chunk-1"
+                  }
+                ]
+              }
+            ],
+            "reason": "优化详情表达",
+            "evidence": [
+              {
+                "kind": "citation",
+                "value": "rule-chunk-1"
+              }
+            ]
+          }
+        ],
+        "citations": [
+          {
+            "chunk_id": "rule-chunk-1"
+          }
+        ],
+        "price_suggestions": [],
+        "sku_suggestions": []
+      },
+      "semantic": {
+        "passed": true,
+        "risk_level": "low",
+        "violations": [],
+        "required_changes": [],
+        "citations": [
+          {
+            "chunk_id": "rule-chunk-1"
+          }
+        ],
+        "confidence": "1",
+        "degraded": false
+      }
+    },
+    "expected": {
+      "deterministic_valid": true,
+      "semantic_schema_valid": true,
+      "citation_valid": true
+    },
+    "enabled": true
+  },
+  {
+    "id": "p9-compliance-mismatch-v1",
+    "agent_type": "compliance",
+    "case_key": "mismatch",
+    "case_version": 1,
+    "fixture": {
+      "trusted": {
+        "store_id": "store-1",
+        "product_id": "product-1",
+        "base_product_version": 7,
+        "title": "原商品标题",
+        "category": "家居",
+        "brand": "好物品牌",
+        "selling_points": [
+          "红色家居设计"
+        ],
+        "description": "原始详情",
+        "search_keywords": [
+          "家居"
+        ],
+        "attributes": {
+          "材质": "棉"
+        },
+        "skus": [
+          {
+            "id": "sku-1",
+            "code": "SKU-RED",
+            "spec": {
+              "颜色": "红"
+            },
+            "price": "100.00",
+            "stock": 10
+          }
+        ],
+        "candidate_metrics": {
+          "product_id": "product-1",
+          "product_code": "HOME-001",
+          "impressions": 100,
+          "clicks": 10,
+          "orders": 1,
+          "units": 1,
+          "revenue": "100.00",
+          "refunds": 0,
+          "ctr": "0.1000",
+          "conversion_rate": "0.1000",
+          "refund_rate": "0.0000",
+          "average_order_value": "100.0000"
+        },
+        "candidate_evidence": [
+          "orders=1"
+        ],
+        "rag_quality": "normal",
+        "canonical_rule_citations": [
+          {
+            "document_id": "document-1",
+            "version_id": "version-1",
+            "chunk_id": "rule-chunk-1",
+            "document_name": "通用规则",
+            "version_number": 1,
+            "category": "通用规则",
+            "canonical_text": "商品文案应有依据。",
+            "active": true,
+            "applicable": true
+          }
+        ]
+      },
+      "candidate": {
+        "title": "优选家居商品",
+        "selling_points": [
+          "红色家居设计"
+        ],
+        "description": [
+          {
+            "heading": "商品说明",
+            "body": "适合日常使用",
+            "evidence": [
+              {
+                "kind": "citation",
+                "value": "rule-chunk-1"
+              }
+            ]
+          }
+        ],
+        "keywords": [
+          "家居"
+        ],
+        "attribute_completions": [],
+        "changes": [
+          {
+            "field": "title",
+            "current_value": "错误当前值",
+            "suggested_value": "优选家居商品",
+            "reason": "优化标题表达",
+            "evidence": [
+              {
+                "kind": "fact",
+                "value": "product.title"
+              }
+            ]
+          },
+          {
+            "field": "description",
+            "current_value": "原始详情",
+            "suggested_value": [
+              {
+                "heading": "商品说明",
+                "body": "适合日常使用",
+                "evidence": [
+                  {
+                    "kind": "citation",
+                    "value": "rule-chunk-1"
+                  }
+                ]
+              }
+            ],
+            "reason": "优化详情表达",
+            "evidence": [
+              {
+                "kind": "citation",
+                "value": "rule-chunk-1"
+              }
+            ]
+          }
+        ],
+        "citations": [
+          {
+            "chunk_id": "rule-chunk-1"
+          }
+        ],
+        "price_suggestions": [],
+        "sku_suggestions": []
+      },
+      "semantic": {
+        "passed": true,
+        "risk_level": "low",
+        "violations": [],
+        "required_changes": [],
+        "citations": [
+          {
+            "chunk_id": "rule-chunk-1"
+          }
+        ],
+        "confidence": "1",
+        "degraded": false
+      }
+    },
+    "expected": {
+      "deterministic_valid": false,
+      "semantic_schema_valid": true,
+      "citation_valid": true
+    },
+    "enabled": true
+  },
+  {
+    "id": "p9-knowledge_retrieval-hit-v1",
+    "agent_type": "knowledge_retrieval",
+    "case_key": "hit",
+    "case_version": 1,
+    "fixture": {
+      "document_name": "合成规则",
+      "version_number": 1,
+      "section": "示例",
+      "hits": [
+        {
+          "document_name": "合成规则",
+          "version_number": 1,
+          "section": "示例"
+        }
+      ]
+    },
+    "expected": {
+      "recall_at_10": 1,
+      "mrr": 1,
+      "citation_document_version_accuracy": 1
+    },
+    "enabled": true
+  },
+  {
+    "id": "p9-knowledge_retrieval-empty-v1",
+    "agent_type": "knowledge_retrieval",
+    "case_key": "empty",
+    "case_version": 1,
+    "fixture": {
+      "document_name": "合成规则",
+      "version_number": 1,
+      "section": "示例",
+      "hits": []
+    },
+    "expected": {
+      "recall_at_10": 0,
+      "mrr": 0,
+      "citation_document_version_accuracy": 0
+    },
+    "enabled": true
+  }
+]
