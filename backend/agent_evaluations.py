@@ -194,3 +194,52 @@ async def seed_fixed_cases(session: AsyncSession) -> None:
             continue
         session.add(EvaluationCase(**item))
     await session.commit()
+
+
+def evaluate_fixed_case(case: dict[str, object]) -> EvaluationResultInput:
+    from time import perf_counter
+    from pydantic import ValidationError
+    started = perf_counter()
+    agent_type = EvaluationAgentType(case['agent_type'])
+    fixture = case['fixture']
+    metrics = {key: (0.0 if agent_type == EvaluationAgentType.KNOWLEDGE_RETRIEVAL else False)
+               for key in _METRIC_KEYS[agent_type] - {'latency_ms'}}
+    code = 'EVALUATION_PASSED'
+    try:
+        if agent_type == EvaluationAgentType.ANALYSIS:
+            # Fixed set/rank evidence; no analyst invocation or model explanation is needed.
+            expected_ids, actual_ids, ranks = fixture['candidate_ids'], fixture['response_ids'], fixture['ranks']
+            metrics['candidate_set_valid'] = len(actual_ids) == len(set(actual_ids)) == len(expected_ids) and set(actual_ids) == set(expected_ids)
+            metrics['rank_order_valid'] = sorted(ranks) == list(range(1,len(expected_ids)+1))
+        elif agent_type in (EvaluationAgentType.OPTIMIZATION,EvaluationAgentType.COMPLIANCE):
+            from backend.schemas import TrustedOptimizationInput, OptimizationProposalOutput
+            from backend.optimization_validation import validate_optimization_output
+            trusted = TrustedOptimizationInput.model_validate(fixture['trusted'])
+            output = OptimizationProposalOutput.model_validate(fixture['candidate'])
+            deterministic = validate_optimization_output(trusted,output)
+            citation_codes = {'EVIDENCE_CITATION_INVALID','CITATION_UNKNOWN','CITATION_DUPLICATE','CITATION_EVIDENCE_UNLISTED','ATTRIBUTE_SOURCE_MISSING'}
+            metrics['citation_valid'] = not any(v.code in citation_codes for v in deterministic.violations)
+            if agent_type == EvaluationAgentType.OPTIMIZATION:
+                metrics['output_schema_valid'] = True
+                metrics['trusted_fact_valid'] = not any(v.code not in citation_codes for v in deterministic.violations)
+            else:
+                from backend.compliance_agent import ComplianceAgentResponse, validate_compliance_response, ComplianceAgentSchemaError
+                metrics['deterministic_valid'] = deterministic.passed
+                semantic = ComplianceAgentResponse.model_validate(fixture['semantic'])
+                metrics['semantic_schema_valid'] = True
+                try: validate_compliance_response(trusted,semantic)
+                except ComplianceAgentSchemaError: metrics['citation_valid'] = False
+        else:
+            hits = fixture['hits'][:10]
+            matches = [hit['document_name'] == fixture['document_name'] and hit['version_number'] == fixture['version_number'] and hit['section'] == fixture['section'] for hit in hits]
+            metrics['recall_at_10'] = float(any(matches))
+            metrics['mrr'] = 1.0/(matches.index(True)+1) if any(matches) else 0.0
+            metrics['citation_document_version_accuracy'] = float(bool(hits) and hits[0]['document_name'] == fixture['document_name'] and hits[0]['version_number'] == fixture['version_number'])
+        if metrics != case['expected']: code = 'EVALUATION_EXPECTATION_MISMATCH'
+    except (ValidationError,KeyError,TypeError,ValueError):
+        code = 'EVALUATION_VALIDATION_FAILED'
+    elapsed = (perf_counter()-started)*1000
+    metrics['latency_ms'] = elapsed
+    validate_evaluation_metrics(agent_type,metrics)
+    return EvaluationResultInput(case_id=case['id'],outcome='passed' if code == 'EVALUATION_PASSED' else 'failed',
+                                 metrics=metrics,result_code=code,latency_ms=elapsed)
