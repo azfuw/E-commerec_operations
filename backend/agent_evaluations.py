@@ -42,6 +42,7 @@ RESULT_CODES = frozenset({'EVALUATION_PASSED','EVALUATION_EXPECTATION_MISMATCH',
     'EVALUATION_INPUT_INVALID','EVALUATION_VALIDATION_FAILED','EVALUATION_RUNNER_FAILED'})
 FIXTURE_PATH = Path(__file__).resolve().parents[1] / 'data/evaluation/phase9-agent-cases.json'
 SUITE_VERSION = 'phase9-v1'
+RUNNER_VERSION = 'phase9-v2'
 
 
 def _invalid() -> EvaluationDomainError:
@@ -109,7 +110,7 @@ def _audit(session, run, actor):
 
 async def persist_failed_evaluation_run(session: AsyncSession, *, actor_id: str,
     agent_type: EvaluationAgentType, store_id: str | None, error_code: str,
-    suite_version: str = SUITE_VERSION, runner_version: str = SUITE_VERSION,
+    suite_version: str = SUITE_VERSION, runner_version: str = RUNNER_VERSION,
     dataset_version: str = SUITE_VERSION) -> EvaluationRun:
     from backend.models import EvaluationRun
     from uuid import uuid4
@@ -210,7 +211,13 @@ def evaluate_fixed_case(case: dict[str, object]) -> EvaluationResultInput:
             # Fixed set/rank evidence; no analyst invocation or model explanation is needed.
             expected_ids, actual_ids, ranks = fixture['candidate_ids'], fixture['response_ids'], fixture['ranks']
             metrics['candidate_set_valid'] = len(actual_ids) == len(set(actual_ids)) == len(expected_ids) and set(actual_ids) == set(expected_ids)
-            metrics['rank_order_valid'] = sorted(ranks) == list(range(1,len(expected_ids)+1))
+            metrics['rank_order_valid'] = (
+                metrics['candidate_set_valid']
+                and len(ranks) == len(actual_ids)
+                and all(type(rank) is int for rank in ranks)
+                and sorted(ranks) == list(range(1, len(expected_ids) + 1))
+                and [candidate_id for _, candidate_id in sorted(zip(ranks, actual_ids))] == expected_ids
+            )
         elif agent_type in (EvaluationAgentType.OPTIMIZATION,EvaluationAgentType.COMPLIANCE):
             from backend.schemas import TrustedOptimizationInput, OptimizationProposalOutput
             from backend.optimization_validation import validate_optimization_output
@@ -225,10 +232,22 @@ def evaluate_fixed_case(case: dict[str, object]) -> EvaluationResultInput:
             else:
                 from backend.compliance_agent import ComplianceAgentResponse, validate_compliance_response, ComplianceAgentSchemaError
                 metrics['deterministic_valid'] = deterministic.passed
+                candidate_citations_valid = metrics['citation_valid']
+                metrics['citation_valid'] = False
                 semantic = ComplianceAgentResponse.model_validate(fixture['semantic'])
-                metrics['semantic_schema_valid'] = True
-                try: validate_compliance_response(trusted,semantic)
-                except ComplianceAgentSchemaError: metrics['citation_valid'] = False
+                allowed_ids = {citation.chunk_id for citation in trusted.canonical_rule_citations
+                               if citation.active and citation.applicable}
+                citation_groups = [[citation.chunk_id for citation in semantic.citations],
+                                   *(violation.citation_chunk_ids for violation in semantic.violations),
+                                   *(change.citation_chunk_ids for change in semantic.required_changes)]
+                metrics['citation_valid'] = candidate_citations_valid and all(
+                    len(ids) == len(set(ids)) and set(ids) <= allowed_ids for ids in citation_groups
+                )
+                try:
+                    validate_compliance_response(trusted, semantic)
+                    metrics['semantic_schema_valid'] = True
+                except ComplianceAgentSchemaError:
+                    metrics['semantic_schema_valid'] = False
         else:
             hits = fixture['hits'][:10]
             matches = [hit['document_name'] == fixture['document_name'] and hit['version_number'] == fixture['version_number'] and hit['section'] == fixture['section'] for hit in hits]

@@ -9,7 +9,7 @@ import sys
 if __package__ in (None, ''):
     sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
-from backend.agent_evaluations import evaluate_fixed_case, load_fixed_cases, SUITE_VERSION
+from backend.agent_evaluations import evaluate_fixed_case, load_fixed_cases, SUITE_VERSION, RUNNER_VERSION
 from backend.common import EvaluationAgentType
 
 
@@ -32,7 +32,7 @@ async def _write(agent_type, store_id):
         cases = [case for case in load_fixed_cases() if case['agent_type'] == agent_type.value and case['id'] in enabled]
         results = [evaluate_fixed_case(case) for case in cases]
         return await persist_evaluation_run(session,actor_id=actor_id,agent_type=agent_type,store_id=store_id,
-            suite_version=SUITE_VERSION,runner_version=SUITE_VERSION,dataset_version=SUITE_VERSION,results=results)
+            suite_version=SUITE_VERSION,runner_version=RUNNER_VERSION,dataset_version=SUITE_VERSION,results=results)
     finally:
         await engine.dispose()
 
@@ -51,8 +51,8 @@ def main(argv=None) -> int:
             parser.error('invalid store ID')
         if agent_type == EvaluationAgentType.KNOWLEDGE_RETRIEVAL and args.store_id is not None:
             parser.error('retrieval fixtures are global')
-        if args.write_results and agent_type != EvaluationAgentType.KNOWLEDGE_RETRIEVAL and args.store_id is None:
-            parser.error('store ID is required for persistence')
+        if agent_type != EvaluationAgentType.KNOWLEDGE_RETRIEVAL and args.store_id is None:
+            parser.error('store ID is required for this agent type')
     except SystemExit as error:
         return int(error.code)
     try:

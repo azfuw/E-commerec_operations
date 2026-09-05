@@ -15,7 +15,9 @@ def test_readonly_cli_computes_safe_results_without_settings_or_network(agent,mo
     monkeypatch.setattr(socket.socket,'connect',forbidden)
     monkeypatch.setattr(backend.config.Settings,'__init__',forbidden)
     monkeypatch.setattr(backend.config,'get_settings',forbidden)
-    assert main(['--agent-type',agent]) == 0
+    args = ['--agent-type', agent]
+    if agent != 'knowledge_retrieval': args += ['--store-id', 'fixture-store']
+    assert main(args) == 0
     result = json.loads(capsys.readouterr().out)
     assert result['agent_type'] == agent and result['passed_cases'] == result['total_cases'] == 2
     assert result['run_id'] is None
@@ -27,6 +29,27 @@ def test_cli_invalid_arguments_or_missing_guard(args,monkeypatch,capsys):
     monkeypatch.delenv('RUN_PHASE9_EVALUATION_WRITE',raising=False)
     assert main(args) == 2
     assert 'Traceback' not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('agent', ['analysis', 'optimization', 'compliance'])
+@pytest.mark.parametrize('write', [False, True])
+def test_store_context_required_before_evaluation_in_both_modes(agent, write, monkeypatch, capsys):
+    import scripts.run_agent_evaluation as cli
+    def forbidden(*args, **kwargs): raise AssertionError('evaluation started without context')
+    monkeypatch.setattr(cli, 'load_fixed_cases', forbidden)
+    monkeypatch.setattr(cli, '_write', forbidden)
+    monkeypatch.setenv('RUN_PHASE9_EVALUATION_WRITE', '1')
+    assert main(['--agent-type', agent] + (['--write-results'] if write else [])) == 2
+    output = capsys.readouterr()
+    assert output.out == '' and 'store ID is required' in output.err
+
+
+@pytest.mark.parametrize('write', [False, True])
+def test_global_retrieval_rejects_store_in_both_modes(write, monkeypatch, capsys):
+    monkeypatch.setenv('RUN_PHASE9_EVALUATION_WRITE', '1')
+    assert main(['--agent-type', 'knowledge_retrieval', '--store-id', 'fixture-store']
+                + (['--write-results'] if write else [])) == 2
+    assert capsys.readouterr().out == ''
 
 
 def test_fixture_expectation_change_causes_failed_result():
@@ -55,6 +78,7 @@ async def test_write_creates_new_runs_and_preserves_disabled_case(session,monkey
     await session.commit()
     second = await _write(EvaluationAgentType.ANALYSIS,'cli-store')
     assert first.id != second.id and first.summary['total_cases'] == 2 and second.summary['total_cases'] == 1
+    assert first.runner_version == second.runner_version == 'phase9-v2'
     assert await session.scalar(select(func.count(EvaluationRun.id))) == 2
 
 
