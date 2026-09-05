@@ -3,7 +3,7 @@ import { Checked, House, SwitchButton, TrendCharts } from '@element-plus/icons-v
 import { useRouter } from 'vue-router'
 
 import { clearSession, session } from '../session'
-import { canUseKnowledge, canViewAgentObservability, canViewAuditEvents } from '../capabilities'
+import { canUseKnowledge, canViewAgentObservability, canViewAuditEvents, canManageSystem } from '../capabilities'
 
 const router = useRouter()
 const isMobile =
@@ -21,6 +21,7 @@ function logout(): void {
     <aside class="app-sidebar" aria-label="主导航">
       <div class="app-brand">智营台</div>
       <nav>
+        <router-link v-if="session.user && canManageSystem(session.user.role, isMobile)" class="nav-link" :to="{name:'admin'}">系统管理</router-link>
         <router-link v-if="session.user && canViewAuditEvents(session.user.role, isMobile)" class="nav-link" :to="{name:'audit-events'}">审计日志</router-link>
         <router-link v-if="session.user && canViewAgentObservability(session.user.role, isMobile)" class="nav-link" :to="{name:'agent-evaluations'}">Agent 评测</router-link>
         <router-link v-if="session.user && canUseKnowledge(session.user.role, isMobile)" class="nav-link" :to="{name:'knowledge'}">知识库</router-link>

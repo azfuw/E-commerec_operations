@@ -1,5 +1,9 @@
 import type { UserRole, WorkflowStatus } from './types'
 
+export function canManageSystem(role: UserRole, isMobile: boolean): boolean {
+  return !isMobile && role === 'admin'
+}
+
 export function canUseKnowledge(role: UserRole, isMobile: boolean): boolean {
   return !isMobile && (role === 'operator' || role === 'supervisor' || role === 'admin')
 }

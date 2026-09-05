@@ -1,5 +1,20 @@
 export type UserRole = 'operator' | 'supervisor' | 'admin'
 
+export type UserStatus = 'active' | 'disabled'
+export interface AdminUser {
+  id: string; username: string; role: UserRole; status: UserStatus
+  store_ids: string[]; created_at: string
+}
+export interface AdminStore {
+  id: string; name: string; code: string; enabled: boolean; created_at: string
+}
+export interface AdminUserQuery {
+  page: number; page_size: number; role?: UserRole; status?: UserStatus; store_id?: string
+}
+export interface AdminStoreQuery { page: number; page_size: number; enabled?: boolean }
+export interface AdminUserList { items: AdminUser[]; total: number; page: number; page_size: number }
+export interface AdminStoreList { items: AdminStore[]; total: number; page: number; page_size: number }
+
 export type WorkflowStatus =
   | 'accepted'
   | 'processing'

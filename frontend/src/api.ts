@@ -322,3 +322,21 @@ export function listAuditEvents(query: import('./types').AuditEventQuery, signal
   const params = new URLSearchParams(Object.entries(query).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => [k,String(v)]))
   return apiRequest(`/audit-events?${params}`, signal ? {signal} : {})
 }
+
+export function listAdminUsers(query: import('./types').AdminUserQuery, signal?: AbortSignal): Promise<import('./types').AdminUserList> {
+  const params = new URLSearchParams(Object.entries(query).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => [k,String(v)]))
+  return apiRequest(`/admin/users?${params}`, signal ? { signal } : {})
+}
+export function listAdminStores(query: import('./types').AdminStoreQuery, signal?: AbortSignal): Promise<import('./types').AdminStoreList> {
+  const params = new URLSearchParams(Object.entries(query).filter(([,v]) => v !== undefined).map(([k,v]) => [k,String(v)]))
+  return apiRequest(`/admin/stores?${params}`, signal ? { signal } : {})
+}
+export function updateAdminUser(id: string, body: { role?: import('./types').UserRole; status?: import('./types').UserStatus }, signal?: AbortSignal): Promise<import('./types').AdminUser> {
+  return apiRequest(`/admin/users/${encodeURIComponent(id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), ...(signal ? { signal } : {}) })
+}
+export function replaceAdminUserScopes(id: string, storeIds: string[], signal?: AbortSignal): Promise<import('./types').AdminUser> {
+  return apiRequest(`/admin/users/${encodeURIComponent(id)}/store-scopes`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ store_ids: storeIds }), ...(signal ? { signal } : {}) })
+}
+export function updateAdminStore(id: string, enabled: boolean, signal?: AbortSignal): Promise<import('./types').AdminStore> {
+  return apiRequest(`/admin/stores/${encodeURIComponent(id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }), ...(signal ? { signal } : {}) })
+}
