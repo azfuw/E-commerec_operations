@@ -411,8 +411,8 @@ class EvaluationCase(Base):
         ),
         CheckConstraint("agent_type IN ('analysis', 'optimization', 'compliance', 'knowledge_retrieval')", name="ck_evaluation_cases_agent_type"),
         CheckConstraint("case_version >= 1", name="ck_evaluation_cases_version"),
-        CheckConstraint("trim(CAST(fixture AS TEXT)) LIKE '{%}' AND replace(CAST(fixture AS TEXT), ' ', '') <> '{}'", name="ck_evaluation_cases_fixture_nonempty"),
-        CheckConstraint("trim(CAST(expected AS TEXT)) LIKE '{%}' AND replace(CAST(expected AS TEXT), ' ', '') <> '{}'", name="ck_evaluation_cases_expected_nonempty"),
+        CheckConstraint("trim(CAST(fixture AS TEXT), ' \t\r\n') LIKE '{%}' AND trim(CAST(fixture AS TEXT), '{} \t\r\n') <> ''", name="ck_evaluation_cases_fixture_nonempty"),
+        CheckConstraint("trim(CAST(expected AS TEXT), ' \t\r\n') LIKE '{%}' AND trim(CAST(expected AS TEXT), '{} \t\r\n') <> ''", name="ck_evaluation_cases_expected_nonempty"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
@@ -501,7 +501,7 @@ class EvaluationResult(Base):
         ),
         CheckConstraint("agent_type IN ('analysis', 'optimization', 'compliance', 'knowledge_retrieval')", name="ck_evaluation_results_agent_type"),
         CheckConstraint("outcome IN ('passed', 'failed')", name="ck_evaluation_results_outcome"),
-        CheckConstraint("trim(CAST(metrics AS TEXT)) LIKE '{%}' AND replace(CAST(metrics AS TEXT), ' ', '') <> '{}'", name="ck_evaluation_results_metrics_nonempty"),
+        CheckConstraint("trim(CAST(metrics AS TEXT), ' \t\r\n') LIKE '{%}' AND trim(CAST(metrics AS TEXT), '{} \t\r\n') <> ''", name="ck_evaluation_results_metrics_nonempty"),
         CheckConstraint("result_code IN ('EVALUATION_PASSED', 'EVALUATION_EXPECTATION_MISMATCH', 'EVALUATION_INPUT_INVALID', 'EVALUATION_VALIDATION_FAILED', 'EVALUATION_RUNNER_FAILED')", name="ck_evaluation_results_result_code"),
         CheckConstraint("latency_ms >= 0 AND latency_ms <= 1.7976931348623157e308", name="ck_evaluation_results_latency_ms"),
     )

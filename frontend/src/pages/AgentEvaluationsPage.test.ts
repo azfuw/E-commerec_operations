@@ -21,7 +21,7 @@ it('renders empty evidence with no evaluation start control',async()=>{
   const w=mount(AgentEvaluationsPage,{global:{plugins:[ElementPlus]}});await flushPromises()
   expect(w.text()).toContain('暂无评测记录');expect(w.text()).not.toContain('开始评测');w.unmount()
 })
-it.each([401,403,404,422,503])('safe load failure %s',async status=>{
+it.each([401,403,404,409,422,503])('safe load failure %s',async status=>{
   setCurrentUser({id:'a',username:'a',role:'admin'})
   vi.stubGlobal('fetch',async()=>new Response(JSON.stringify({detail:'sensitive'}),{status}))
   const w=mount(AgentEvaluationsPage,{global:{plugins:[ElementPlus]}});await flushPromises()

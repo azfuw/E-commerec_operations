@@ -19,7 +19,7 @@ async function load():Promise<void>{
     const query:AuditEventQuery={...filters,page:page.value,page_size:20,...(from.value&&to.value?{created_from:new Date(from.value).toISOString(),created_to:new Date(to.value).toISOString()}: {})}
     const response=await listAuditEvents(query,current.signal)
     if(!current.signal.aborted){items.value=response.items;total.value=response.total}
-  }catch(caught){if(!current.signal.aborted){const messages:Record<number,string>={401:'登录已失效，请重新登录',403:'没有访问权限',404:'记录不存在或不可访问',422:'筛选无效，请检查起止时间与 31 天范围'};error.value=caught instanceof ApiError?messages[caught.status]??'审计加载失败，请重试':'审计加载失败，请重试'}}
+  }catch(caught){if(!current.signal.aborted){const messages:Record<number,string>={401:'登录已失效，请重新登录',403:'没有访问权限',404:'记录不存在或不可访问',409:'状态冲突，请刷新后重试',422:'筛选无效，请检查起止时间与 31 天范围'};error.value=caught instanceof ApiError?messages[caught.status]??'审计加载失败，请重试':'审计加载失败，请重试'}}
   finally{if(!current.signal.aborted)loading.value=false}
 }
 onMounted(()=>void load());onBeforeUnmount(()=>controller?.abort())
@@ -38,7 +38,7 @@ onMounted(()=>void load());onBeforeUnmount(()=>controller?.abort())
       </form>
       <p aria-live="polite">{{loading?'正在加载…':`共 ${total} 项`}}</p><el-skeleton v-if="loading" :rows="5" animated/>
       <el-empty v-else-if="!items.length&&!error" :description="Object.values(filters).some(Boolean)||from||to?'没有符合筛选条件的记录':'暂无审计记录'"/>
-      <el-table v-else :data="items"><el-table-column prop="created_at" label="时间"/><el-table-column prop="event_type" label="事件"/><el-table-column prop="actor_id" label="操作人"/><el-table-column prop="store_id" label="店铺（空为全局）"/><el-table-column prop="outcome" label="结果"/><el-table-column prop="resource_type" label="资源类型"/><el-table-column prop="error_code" label="错误码"/><el-table-column label="详情"><template #default="{row}"><el-button text @click="selected=row;drawer=true">查看详情</el-button></template></el-table-column></el-table>
+      <el-table v-else :data="items"><el-table-column min-width="140" prop="created_at" label="时间"/><el-table-column min-width="140" prop="event_type" label="事件"/><el-table-column min-width="140" prop="actor_id" label="操作人"/><el-table-column min-width="140" prop="store_id" label="店铺（空为全局）"/><el-table-column min-width="140" prop="outcome" label="结果"/><el-table-column min-width="140" prop="resource_type" label="资源类型"/><el-table-column min-width="140" prop="error_code" label="错误码"/><el-table-column min-width="140" label="详情"><template #default="{row}"><el-button text @click="selected=row;drawer=true">查看详情</el-button></template></el-table-column></el-table>
       <el-pagination v-model:current-page="page" :page-size="20" :total="total" layout="prev, pager, next" @current-change="load"/>
       <el-drawer v-model="drawer" title="审计详情" size="55%"><template v-if="selected"><p>{{selected.event_type}} · {{selected.outcome}}</p><dl><template v-for="key in (['id','actor_id','actor_role','store_id','proposal_id','proposal_revision_id','workflow_run_id','approval_action_id','publish_record_id','resource_type','resource_id','request_id','created_at','error_code'] as const)" :key="key"><dt>{{key}}</dt><dd>{{selected[key]??'—'}}</dd></template></dl><h3>操作详情</h3><dl><template v-for="(value,key) in selected.details" :key="key"><dt>{{key}}</dt><dd>{{value}}</dd></template></dl></template></el-drawer>
     </template>

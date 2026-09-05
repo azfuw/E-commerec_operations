@@ -209,6 +209,9 @@ def test_postgres_migration_roundtrip_and_fact_guard() -> None:
                     with pytest.raises(IntegrityError):
                       with connection.begin_nested():
                         connection.execute(sa.text(f"INSERT INTO audit_events (id,event_type,outcome,details,resource_type,resource_id,created_at) VALUES ('bad','admin_user_updated','success','{{}}',{values},now())"))
+                with pytest.raises(IntegrityError):
+                  with connection.begin_nested():
+                    connection.execute(sa.text("INSERT INTO evaluation_cases (id,agent_type,case_key,case_version,fixture,expected,enabled,created_at,updated_at) VALUES ('empty','analysis','empty',1,:fixture,:expected,true,now(),now())"), {'fixture':'{ \n\t\r }', 'expected':'{"valid":true}'})
                 with connection.begin_nested() as savepoint:
                     connection.execute(sa.text("INSERT INTO evaluation_cases (id,agent_type,case_key,case_version,fixture,expected,enabled,created_at,updated_at) VALUES ('case','analysis','case',1,:fixture,:expected,true,now(),now())"), {'fixture':'{"synthetic":true}', 'expected':'{"valid":true}'})
                     with pytest.raises(RuntimeError, match='cannot downgrade phase-nine management console with facts'):

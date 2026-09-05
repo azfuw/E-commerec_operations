@@ -116,8 +116,8 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(f"agent_type IN ({_AGENT_TYPES})", name="ck_evaluation_cases_agent_type"),
         sa.CheckConstraint("case_version >= 1", name="ck_evaluation_cases_version"),
-        sa.CheckConstraint("trim(CAST(fixture AS TEXT)) LIKE '{%}' AND replace(CAST(fixture AS TEXT), ' ', '') <> '{}'", name="ck_evaluation_cases_fixture_nonempty"),
-        sa.CheckConstraint("trim(CAST(expected AS TEXT)) LIKE '{%}' AND replace(CAST(expected AS TEXT), ' ', '') <> '{}'", name="ck_evaluation_cases_expected_nonempty"),
+        sa.CheckConstraint("trim(CAST(fixture AS TEXT), ' \t\r\n') LIKE '{%}' AND trim(CAST(fixture AS TEXT), '{} \t\r\n') <> ''", name="ck_evaluation_cases_fixture_nonempty"),
+        sa.CheckConstraint("trim(CAST(expected AS TEXT), ' \t\r\n') LIKE '{%}' AND trim(CAST(expected AS TEXT), '{} \t\r\n') <> ''", name="ck_evaluation_cases_expected_nonempty"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
             "agent_type",
@@ -176,7 +176,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(f"agent_type IN ({_AGENT_TYPES})", name="ck_evaluation_results_agent_type"),
         sa.CheckConstraint("outcome IN ('passed', 'failed')", name="ck_evaluation_results_outcome"),
-        sa.CheckConstraint("trim(CAST(metrics AS TEXT)) LIKE '{%}' AND replace(CAST(metrics AS TEXT), ' ', '') <> '{}'", name="ck_evaluation_results_metrics_nonempty"),
+        sa.CheckConstraint("trim(CAST(metrics AS TEXT), ' \t\r\n') LIKE '{%}' AND trim(CAST(metrics AS TEXT), '{} \t\r\n') <> ''", name="ck_evaluation_results_metrics_nonempty"),
         sa.CheckConstraint("result_code IN ('EVALUATION_PASSED', 'EVALUATION_EXPECTATION_MISMATCH', 'EVALUATION_INPUT_INVALID', 'EVALUATION_VALIDATION_FAILED', 'EVALUATION_RUNNER_FAILED')", name="ck_evaluation_results_result_code"),
         sa.CheckConstraint("latency_ms >= 0 AND latency_ms <= 1.7976931348623157e308", name="ck_evaluation_results_latency_ms"),
         sa.ForeignKeyConstraint(

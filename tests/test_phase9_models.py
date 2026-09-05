@@ -111,3 +111,10 @@ async def test_evaluation_case_requires_nonempty_json_object(session, value) -> 
 def test_result_has_closed_code_nonempty_metrics_and_finite_latency() -> None:
     constraints = _constraint_names(EvaluationResult)
     assert {'ck_evaluation_results_result_code', 'ck_evaluation_results_metrics_nonempty'} <= constraints
+
+
+async def test_empty_object_with_json_whitespace_cannot_bypass_constraint(session):
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+    with pytest.raises(IntegrityError):
+        await session.execute(text("INSERT INTO evaluation_cases (id,agent_type,case_key,case_version,fixture,expected,enabled,created_at,updated_at) VALUES ('empty','analysis','empty',1,:fixture,:expected,true,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"), {'fixture': '{ \n\t\r }', 'expected': '{"valid":true}'})
