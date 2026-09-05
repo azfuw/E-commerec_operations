@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import SQLAlchemyError
 from backend.agent_evaluations import EvaluationDomainError, list_evaluation_runs, get_evaluation_run_for_actor, list_safe_agent_calls
 from backend.schemas import EvaluationRunQuery, EvaluationRunListView, EvaluationRunDetailView, AgentCallQuery, AgentCallListView
+from backend.admin_management import AdminDomainError, list_admin_users, list_admin_stores, update_admin_user, replace_user_store_scopes, update_admin_store, admin_user_views
+from backend.schemas import AdminUserQuery, AdminStoreQuery, AdminUserPatch, AdminStorePatch, AdminScopeReplacement, AdminUserView, AdminStoreView, AdminUserListView, AdminStoreListView
 
 from backend.analysis_runs import (
     create_analysis_run,
@@ -118,6 +120,57 @@ from backend.workbench import (
 
 router = APIRouter()
 _logger = logging.getLogger("backend.knowledge")
+
+
+def _admin_http_error(error):
+    return HTTPException(status_code=error.status_code if isinstance(error,AdminDomainError) else 409,
+        detail={'code':error.code if isinstance(error,AdminDomainError) else 'ADMIN_CONFLICT','request_id':str(uuid4())})
+
+
+@router.get('/admin/users',response_model=AdminUserListView)
+async def admin_users_route(query:Annotated[AdminUserQuery,Query()],user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
+    try:
+        users,total=await list_admin_users(session,actor_id=user.id,**query.model_dump())
+        return AdminUserListView(items=await admin_user_views(session,users),total=total,page=query.page,page_size=query.page_size)
+    except (AdminDomainError,SQLAlchemyError) as error:
+        await session.rollback();raise _admin_http_error(error) from None
+
+
+@router.patch('/admin/users/{user_id}',response_model=AdminUserView)
+async def admin_user_update_route(user_id:Annotated[str,Path(min_length=1,max_length=36)],patch:AdminUserPatch,
+    user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
+    try:
+        target=await update_admin_user(session,actor_id=user.id,user_id=user_id,patch=patch)
+        return (await admin_user_views(session,[target]))[0]
+    except (AdminDomainError,SQLAlchemyError) as error:
+        await session.rollback();raise _admin_http_error(error) from None
+
+
+@router.put('/admin/users/{user_id}/store-scopes',response_model=AdminUserView)
+async def admin_user_scopes_route(user_id:Annotated[str,Path(min_length=1,max_length=36)],request:AdminScopeReplacement,
+    user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
+    try:
+        target=await replace_user_store_scopes(session,actor_id=user.id,user_id=user_id,store_ids=request.store_ids)
+        return (await admin_user_views(session,[target]))[0]
+    except (AdminDomainError,SQLAlchemyError) as error:
+        await session.rollback();raise _admin_http_error(error) from None
+
+
+@router.get('/admin/stores',response_model=AdminStoreListView)
+async def admin_stores_route(query:Annotated[AdminStoreQuery,Query()],user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
+    try:
+        stores,total=await list_admin_stores(session,actor_id=user.id,**query.model_dump())
+        return AdminStoreListView(items=[AdminStoreView.model_validate(store) for store in stores],total=total,page=query.page,page_size=query.page_size)
+    except (AdminDomainError,SQLAlchemyError) as error:
+        await session.rollback();raise _admin_http_error(error) from None
+
+
+@router.patch('/admin/stores/{store_id}',response_model=AdminStoreView)
+async def admin_store_update_route(store_id:Annotated[str,Path(min_length=1,max_length=36)],patch:AdminStorePatch,
+    user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
+    try:return AdminStoreView.model_validate(await update_admin_store(session,actor_id=user.id,store_id=store_id,patch=patch))
+    except (AdminDomainError,SQLAlchemyError) as error:
+        await session.rollback();raise _admin_http_error(error) from None
 
 
 @router.get('/agent-evaluations/runs',response_model=EvaluationRunListView)

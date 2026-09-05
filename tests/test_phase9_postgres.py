@@ -1,10 +1,12 @@
 import os
+import asyncio
 import importlib.util
 from pathlib import Path
 from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+import pytest_asyncio
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -30,6 +32,71 @@ from backend.models import (
     User,
     UserStoreScope,
 )
+
+
+@pytest_asyncio.fixture(loop_scope='module')
+async def pg_admin_factory():
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from backend.database import Base, engine
+    schema = 'phase9_admin_' + uuid4().hex
+    async with engine.begin() as connection:
+        await connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+    isolated = create_async_engine(engine.url, connect_args={'server_settings': {'search_path': schema}})
+    try:
+        async with isolated.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(isolated, expire_on_commit=False)
+        from test_admin_management import seed
+        async with factory() as session:
+            await seed(session)
+        yield factory
+    finally:
+        await isolated.dispose()
+        async with engine.begin() as connection:
+            await connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+
+
+@pytest.mark.asyncio(loop_scope='module')
+@pytest.mark.parametrize('patch', [{'role': 'supervisor'}, {'status': 'disabled'}])
+async def test_postgres_cross_admin_updates_preserve_last_admin(pg_admin_factory, patch):
+    from backend.admin_management import update_admin_user, AdminDomainError
+    from backend.schemas import AdminUserPatch
+    from backend.common import UserStatus
+    async with pg_admin_factory() as first, pg_admin_factory() as second:
+        results = await asyncio.wait_for(asyncio.gather(
+            update_admin_user(first, actor_id='a', user_id='b', patch=AdminUserPatch(**patch)),
+            update_admin_user(second, actor_id='b', user_id='a', patch=AdminUserPatch(**patch)),
+            return_exceptions=True,
+        ), timeout=5)
+    assert sum(isinstance(item, User) for item in results) == 1
+    failures = [item for item in results if isinstance(item, AdminDomainError)]
+    assert len(failures) == 1 and failures[0].code in {'ADMIN_GUARD_VIOLATION', 'ADMIN_CONFLICT'}
+    async with pg_admin_factory() as check:
+        assert await check.scalar(select(func.count(User.id)).where(
+            User.role == UserRole.ADMIN, User.status == UserStatus.ACTIVE)) == 1
+        assert await check.scalar(select(func.count(AuditEvent.id))) == 1
+
+
+@pytest.mark.asyncio(loop_scope='module')
+async def test_postgres_concurrent_scopes_replace_atomically_and_failure_rolls_back(pg_admin_factory, monkeypatch):
+    from backend.admin_management import replace_user_store_scopes, AdminDomainError
+    async with pg_admin_factory() as first, pg_admin_factory() as second:
+        await asyncio.wait_for(asyncio.gather(
+            replace_user_store_scopes(first, actor_id='a', user_id='operator', store_ids=['s1']),
+            replace_user_store_scopes(second, actor_id='b', user_id='operator', store_ids=['s2']),
+        ), timeout=5)
+    async with pg_admin_factory() as check:
+        before = list(await check.scalars(select(UserStoreScope.store_id).where(UserStoreScope.user_id == 'operator')))
+        assert before in (['s1'], ['s2'])
+        assert await check.scalar(select(func.count(AuditEvent.id))) == 2
+        async def fail_commit():
+            await check.flush()
+            raise IntegrityError('INSERT', {}, Exception('private failure'))
+        monkeypatch.setattr(check, 'commit', fail_commit)
+        with pytest.raises(AdminDomainError, match='ADMIN_CONFLICT'):
+            await replace_user_store_scopes(check, actor_id='a', user_id='operator', store_ids=['s1', 's2'])
+        assert list(await check.scalars(select(UserStoreScope.store_id).where(UserStoreScope.user_id == 'operator'))) == before
+        assert await check.scalar(select(func.count(AuditEvent.id))) == 2
 
 
 @pytest.mark.asyncio(loop_scope='module')

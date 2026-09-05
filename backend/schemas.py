@@ -16,6 +16,7 @@ from backend.common import (
     AgentCallType,
     ProposalRevisionOrigin,
     UserRole,
+    UserStatus,
     WorkflowQuality,
     WorkflowStatus,
     WorkflowType,
@@ -842,6 +843,82 @@ class AgentCallView(BaseModel):
 
 class AgentCallListView(BaseModel):
     items: list[AgentCallView]
+    total: int
+    page: int
+    page_size: int
+
+
+class AdminUserPatch(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    role: UserRole | None = None
+    status: UserStatus | None = None
+
+    @model_validator(mode='after')
+    def validate_patch(self):
+        if not self.model_fields_set or any(getattr(self,key) is None for key in self.model_fields_set):
+            raise ValueError('role or status required')
+        return self
+
+
+class AdminStorePatch(BaseModel):
+    model_config = ConfigDict(extra='forbid',strict=True)
+    enabled: bool
+
+
+class AdminScopeReplacement(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    store_ids: list[Annotated[str,Field(min_length=1,max_length=36)]] = Field(max_length=100)
+
+    @field_validator('store_ids')
+    @classmethod
+    def unique_ids(cls,values):
+        if len(values)!=len(set(values)): raise ValueError('duplicate store IDs')
+        return values
+
+
+class AdminUserQuery(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    page: int = Field(default=1,ge=1)
+    page_size: int = Field(default=20,ge=1,le=100)
+    role: UserRole | None = None
+    status: UserStatus | None = None
+    store_id: str | None = Field(default=None,min_length=1,max_length=36)
+
+
+class AdminStoreQuery(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    page: int = Field(default=1,ge=1)
+    page_size: int = Field(default=20,ge=1,le=100)
+    enabled: bool | None = None
+
+
+class AdminUserView(BaseModel):
+    id: str
+    username: str
+    role: UserRole
+    status: UserStatus
+    created_at: datetime
+    store_ids: list[str]
+
+
+class AdminStoreView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+    code: str
+    enabled: bool
+    created_at: datetime
+
+
+class AdminUserListView(BaseModel):
+    items: list[AdminUserView]
+    total: int
+    page: int
+    page_size: int
+
+
+class AdminStoreListView(BaseModel):
+    items: list[AdminStoreView]
     total: int
     page: int
     page_size: int
