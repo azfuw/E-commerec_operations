@@ -28,3 +28,19 @@ test('mobile knowledge deep link performs zero management requests',async ({page
   await expect(page.getByRole('heading',{name:'请使用桌面或平板访问管理模块'})).toBeVisible()
   expect(requests).toBe(0)
 })
+
+test('tablet supervisor reads evaluation detail and call summary',async ({page})=>{
+  await page.setViewportSize({width:1024,height:768})
+  await page.addInitScript(()=>sessionStorage.setItem('access_token','fixture'))
+  await page.route('**/auth/me',route=>route.fulfill({json:{id:'s',username:'supervisor',role:'supervisor'}}))
+  const run={id:'run',agent_type:'analysis',store_id:'store',status:'completed',summary:{total_cases:1,passed_cases:1,failed_cases:0,average_latency_ms:1},suite_version:'v1',runner_version:'v1',dataset_version:'v1',started_at:'2026-09-05T00:00:00Z',completed_at:'2026-09-05T00:00:01Z'}
+  await page.route('**/agent-evaluations/runs?*',route=>route.fulfill({json:{items:[run],total:1}}))
+  await page.route('**/agent-evaluations/runs/run',route=>route.fulfill({json:{...run,results:[{case_key:'exact',case_version:1,outcome:'passed',result_code:'EVALUATION_PASSED',latency_ms:1,metrics:{candidate_set_valid:true}}]}}))
+  await page.route('**/agent-calls?*',route=>route.fulfill({json:{items:[],total:0}}))
+  await page.goto('/app/agent-evaluations')
+  await page.getByRole('button',{name:'查看结果'}).click()
+  await expect(page.getByText('EVALUATION_PASSED',{exact:true})).toBeVisible()
+  await page.getByRole('button',{name:'Close this dialog'}).click()
+  await page.getByRole('tab',{name:'Agent 调用'}).click()
+  await expect(page.getByText('暂无调用记录')).toBeVisible()
+})

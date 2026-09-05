@@ -4,6 +4,10 @@ export function canUseKnowledge(role: UserRole, isMobile: boolean): boolean {
   return !isMobile && (role === 'operator' || role === 'supervisor' || role === 'admin')
 }
 
+export function canViewAgentObservability(role: UserRole, isMobile: boolean): boolean {
+  return !isMobile && (role === 'supervisor' || role === 'admin')
+}
+
 export function canStartAnalysis(role: UserRole, isMobile: boolean): boolean {
   return role === 'operator' && !isMobile
 }

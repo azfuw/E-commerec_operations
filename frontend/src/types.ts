@@ -390,3 +390,41 @@ export interface KnowledgeVersionHistory {
   page_size: number
   total: number
 }
+
+export type EvaluationAgentType = 'analysis' | 'optimization' | 'compliance' | 'knowledge_retrieval'
+export interface EvaluationRun {
+  id: string
+  agent_type: EvaluationAgentType
+  store_id: string | null
+  suite_version: string
+  runner_version: string
+  dataset_version: string
+  execution_mode: 'offline_fixture'
+  status: 'completed' | 'failed'
+  started_at: string
+  completed_at: string
+  created_at: string
+  summary: Record<string, number>
+  error_code: string | null
+}
+export interface EvaluationResult {
+  case_key: string
+  case_version: number
+  agent_type: EvaluationAgentType
+  outcome: 'passed' | 'failed'
+  metrics: Record<string, boolean | number>
+  result_code: string
+  latency_ms: number
+}
+export interface EvaluationRunDetail extends EvaluationRun { results: EvaluationResult[] }
+export interface EvaluationRunList { items: EvaluationRun[]; total: number; page: number; page_size: number }
+export interface AgentCall {
+  id: string; workflow_run_id: string; store_id: string; workflow_type: string
+  node_name: string; call_type: string; iteration: number; attempt: number
+  model: string; prompt_version: string; status: 'succeeded' | 'failed'
+  prompt_tokens: number; completion_tokens: number; total_tokens: number
+  duration_ms: number; estimated_cost: string | null; error_code: string | null; created_at: string
+}
+export interface AgentCallList { items: AgentCall[]; total: number; page: number; page_size: number }
+export interface EvaluationQuery { page: number; page_size: number; agent_type?: EvaluationAgentType; status?: 'completed' | 'failed'; store_id?: string }
+export interface AgentCallQuery { page: number; page_size: number; store_id?: string; workflow_type?: string; node_name?: string; status?: 'succeeded' | 'failed'; error_code?: string }

@@ -305,3 +305,15 @@ export function uploadKnowledgeDocument(body: FormData, documentId?: string, sig
 export function disableKnowledgeDocument(id: string, signal?: AbortSignal): Promise<import('./types').KnowledgeEnvelope<{ document_id: string; enabled: boolean }>> {
   return apiRequest(`/knowledge/documents/${encodeURIComponent(id)}/disable`, { method: 'POST', ...(signal ? { signal } : {}) })
 }
+
+export function listAgentEvaluationRuns(query: import('./types').EvaluationQuery, signal?: AbortSignal): Promise<import('./types').EvaluationRunList> {
+  const params = new URLSearchParams(Object.entries(query).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => [k,String(v)]))
+  return apiRequest(`/agent-evaluations/runs?${params}`, signal ? {signal} : {})
+}
+export function getAgentEvaluationRun(id: string, signal?: AbortSignal): Promise<import('./types').EvaluationRunDetail> {
+  return apiRequest(`/agent-evaluations/runs/${encodeURIComponent(id)}`, signal ? {signal} : {})
+}
+export function listAgentCalls(query: import('./types').AgentCallQuery, signal?: AbortSignal): Promise<import('./types').AgentCallList> {
+  const params = new URLSearchParams(Object.entries(query).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => [k,String(v)]))
+  return apiRequest(`/agent-calls?${params}`, signal ? {signal} : {})
+}

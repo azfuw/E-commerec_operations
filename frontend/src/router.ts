@@ -1,7 +1,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { h } from 'vue'
-import { canUseKnowledge } from './capabilities'
+import { canUseKnowledge, canViewAgentObservability } from './capabilities'
 import KnowledgePage from './pages/KnowledgePage.vue'
+import AgentEvaluationsPage from './pages/AgentEvaluationsPage.vue'
 
 import AppShell from './components/AppShell.vue'
 import ForbiddenPage from './pages/ForbiddenPage.vue'
@@ -28,6 +29,7 @@ export function createAppRouter() {
           { path: '', redirect: { name: 'workbench' } },
           { path: 'workbench', name: 'workbench', component: WorkbenchPage },
           { path: 'knowledge', name: 'knowledge', component: KnowledgePage },
+          { path: 'agent-evaluations', name: 'agent-evaluations', component: AgentEvaluationsPage },
           { path: 'analysis', name: 'analysis', component: AnalysisPage },
           { path: 'analysis/:runId', name: 'analysis-run', component: AnalysisRunPage },
           { path: 'proposals', name: 'proposals', component: WorkbenchPage },
@@ -49,6 +51,9 @@ export function createAppRouter() {
     if (to.meta.requiresAuth && !session.user) return { name: 'login' }
     const mobile = typeof matchMedia === 'function' && matchMedia('(max-width: 767px)').matches
     if (to.name === 'knowledge' && session.user && !canUseKnowledge(session.user.role, mobile)) {
+      return { name: mobile ? 'desktop-required' : 'forbidden' }
+    }
+    if (to.name === 'agent-evaluations' && session.user && !canViewAgentObservability(session.user.role, mobile)) {
       return { name: mobile ? 'desktop-required' : 'forbidden' }
     }
     if (
