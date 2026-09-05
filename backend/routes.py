@@ -83,6 +83,7 @@ from backend.schemas import (
     ApprovalListView,
     AuditEventListView,
     AuditEventView,
+    AuditEventQuery,
     ComplianceReviewView,
     CurrentUserView,
     KnowledgeCitation,
@@ -471,11 +472,7 @@ async def list_approvals_route(
 
 @router.get("/audit-events", response_model=AuditEventListView)
 async def list_audit_events_route(
-    page: Annotated[int, Query(ge=1)] = 1,
-    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
-    store_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
-    proposal_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
-    action: ApprovalActionType | None = None,
+    query: Annotated[AuditEventQuery,Query()],
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> AuditEventListView:
@@ -483,14 +480,14 @@ async def list_audit_events_route(
         events, total = await list_audit_events(
             session,
             actor_id=user.id,
-            filters=AuditEventFilters(page=page,page_size=page_size,store_id=store_id,proposal_id=proposal_id,action=action),
+            filters=AuditEventFilters(**query.model_dump()),
         )
     except AuditEventDomainError as error:
         raise HTTPException(status_code=error.status_code, detail={"code": error.code}) from None
     return AuditEventListView(
         items=[AuditEventView.model_validate(event) for event in events],
-        page=page,
-        page_size=page_size,
+        page=query.page,
+        page_size=query.page_size,
         total=total,
     )
 

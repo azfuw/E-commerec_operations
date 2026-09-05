@@ -92,6 +92,8 @@ def create_app(frontend_dist: Path | None = None) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def knowledge_validation_exception(request: Request, exception: RequestValidationError):
+        if request.url.path.startswith(('/admin/','/agent-evaluations/')) or request.url.path in {'/agent-calls','/audit-events'}:
+            return JSONResponse(status_code=422,content={'detail':{'code': 'AUDIT_FILTER_INVALID' if request.url.path == '/audit-events' else 'MANAGEMENT_REQUEST_INVALID','request_id':str(uuid4())}})
         if not request.url.path.startswith("/knowledge/"):
             return await request_validation_exception_handler(request, exception)
         return _knowledge_error_response(

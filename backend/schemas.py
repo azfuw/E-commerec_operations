@@ -380,6 +380,21 @@ class AuditEventListView(BaseModel):
     total: int
 
 
+class AuditEventQuery(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    page: int = Field(default=1,ge=1)
+    page_size: int = Field(default=20,ge=1,le=100)
+    store_id: str | None = Field(default=None,min_length=1,max_length=36)
+    proposal_id: str | None = Field(default=None,min_length=1,max_length=36)
+    action: ApprovalActionType | None = None
+    workflow_run_id: str | None = Field(default=None,min_length=1,max_length=36)
+    event_type: AuditEventType | None = None
+    actor_id: str | None = Field(default=None,min_length=1,max_length=36)
+    outcome: AuditOutcome | None = None
+    created_from: datetime | None = None
+    created_to: datetime | None = None
+
+
 class ValidatedRequiredChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
