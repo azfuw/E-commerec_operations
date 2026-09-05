@@ -1193,7 +1193,14 @@ async def disable_knowledge_document_route(
 ) -> KnowledgeEnvelope:
     started = perf_counter()
     request_id = _request_id()
-    if not await disable_knowledge_document(session, document_id=document_id, actor_id=user.id):
+    try:
+        disabled = await disable_knowledge_document(session, document_id=document_id, actor_id=user.id)
+    except SQLAlchemyError:
+        await session.rollback()
+        raise _knowledge_http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE, 'KNOWLEDGE_WRITE_FAILED', request_id=request_id
+        ) from None
+    if not disabled:
         raise _knowledge_http_error(
             status.HTTP_404_NOT_FOUND, "KNOWLEDGE_DOCUMENT_NOT_FOUND", request_id=request_id
         )

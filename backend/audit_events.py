@@ -8,7 +8,6 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.auth import store_visibility_predicate
 from backend.common import (
     ApprovalActionType,
     AuditEventType,
@@ -226,6 +225,7 @@ async def list_audit_events(
     actor_id: str,
     filters: AuditEventFilters,
 ) -> tuple[list[AuditEvent], int]:
+    from backend.auth import store_visibility_predicate
     try:
         actor = await session.scalar(
             select(User)

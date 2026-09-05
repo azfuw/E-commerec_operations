@@ -456,3 +456,22 @@ async def test_knowledge_api_audit_logs_only_safe_fields(knowledge_api, caplog) 
     assert secret_upload_text.decode() not in messages
     assert str(context.settings.knowledge_upload_dir) not in messages
     assert "Authorization" not in messages and "vector" not in messages
+
+
+async def test_disable_commit_failure_keeps_document_versions_and_no_success_audit(knowledge_api, monkeypatch):
+    from backend.models import AuditEvent
+    from sqlalchemy.exc import SQLAlchemyError
+    c = knowledge_api
+    document, version, _ = await _seed_active_document(c)
+    document_id, version_id = document.id, version.id
+    before = await c.session.scalar(select(func.count(AuditEvent.id)))
+    async def fail_commit():
+        await c.session.flush()
+        raise SQLAlchemyError('private disable diagnostic')
+    monkeypatch.setattr(c.session, 'commit', fail_commit)
+    response = await c.client.post(f'/knowledge/documents/{document_id}/disable', headers=_headers(c.tokens['admin']))
+    assert response.status_code == 503 and 'private disable diagnostic' not in response.text
+    assert response.json()['error']['code'] == 'KNOWLEDGE_WRITE_FAILED'
+    assert (await c.session.get(KnowledgeDocument, document_id)).enabled
+    assert (await c.session.get(KnowledgeDocumentVersion, version_id)).status == KnowledgeVersionStatus.ACTIVE
+    assert await c.session.scalar(select(func.count(AuditEvent.id))) == before

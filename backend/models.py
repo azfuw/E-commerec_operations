@@ -17,7 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from backend.common import (
     AgentCallType,
@@ -38,7 +38,10 @@ from backend.common import (
     WorkflowType,
     utc_now,
 )
-from backend.database import Base
+
+
+class Base(DeclarativeBase):
+    pass
 
 
 class User(Base):

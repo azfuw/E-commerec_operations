@@ -15,10 +15,14 @@ from backend.common import EvaluationAgentType
 
 async def _write(agent_type, store_id):
     from sqlalchemy import select
-    from backend.database import async_session_factory, engine
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from backend.config import Settings
     from backend.models import User, EvaluationCase
     from backend.common import UserRole, UserStatus
     from backend.agent_evaluations import seed_fixed_cases, persist_evaluation_run
+    # Only database configuration is needed; never load .env.local or API settings.
+    engine = create_async_engine(os.environ.get('DATABASE_URL') or Settings.model_fields['database_url'].default)
+    async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
       async with async_session_factory() as session:
         actor_id = await session.scalar(select(User.id).where(User.role == UserRole.ADMIN,User.status == UserStatus.ACTIVE).order_by(User.id).limit(1))
