@@ -1,6 +1,7 @@
 import json
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import and_, func, select
@@ -65,6 +66,36 @@ _RESOURCE_TYPES = frozenset(
 class AuditEventDomainError(Exception):
     code: str
     status_code: int
+
+
+@dataclass(frozen=True)
+class AuditEventFilters:
+    page: int = 1
+    page_size: int = 20
+    store_id: str | None = None
+    proposal_id: str | None = None
+    action: ApprovalActionType | None = None
+    workflow_run_id: str | None = None
+    event_type: AuditEventType | None = None
+    actor_id: str | None = None
+    outcome: AuditOutcome | None = None
+    created_from: datetime | None = None
+    created_to: datetime | None = None
+
+    def __post_init__(self):
+        valid = type(self.page) is int and self.page >= 1 and type(self.page_size) is int and 1 <= self.page_size <= 100
+        for name in ('store_id','proposal_id','workflow_run_id','actor_id'):
+            value = getattr(self,name)
+            valid = valid and (value is None or isinstance(value,str) and 1 <= len(value) <= 36)
+        for name,kind in (('action',ApprovalActionType),('event_type',AuditEventType),('outcome',AuditOutcome)):
+            value = getattr(self,name)
+            valid = valid and (value is None or isinstance(value,str) and value in {item.value for item in kind})
+        for value in (self.created_from,self.created_to):
+            valid = valid and (value is None or isinstance(value,datetime) and value.utcoffset() == timedelta(0))
+        if (self.created_from is None) != (self.created_to is None): valid = False
+        if valid and self.created_from is not None:
+            valid = timedelta(0) <= self.created_to - self.created_from <= timedelta(days=31)
+        if not valid: raise AuditEventDomainError('AUDIT_FILTER_INVALID',422)
 
 
 def _safe_details(details: dict[str, object]) -> None:
@@ -192,11 +223,7 @@ async def list_audit_events(
     session: AsyncSession,
     *,
     actor_id: str,
-    page: int,
-    page_size: int,
-    store_id: str | None,
-    proposal_id: str | None,
-    action: ApprovalActionType | None,
+    filters: AuditEventFilters,
 ) -> tuple[list[AuditEvent], int]:
     try:
         actor = await session.scalar(
@@ -211,47 +238,41 @@ async def list_audit_events(
         ):
             raise AuditEventDomainError("PROPOSAL_ACTION_FORBIDDEN", 403)
 
-        statement = (
-            select(AuditEvent)
-            .join(Store, Store.id == AuditEvent.store_id)
-            .join(
-                UserStoreScope,
-                and_(
-                    UserStoreScope.user_id == actor.id,
-                    UserStoreScope.store_id == AuditEvent.store_id,
-                ),
-            )
-            .where(Store.enabled.is_(True))
-        )
-        if store_id is not None:
-            statement = statement.where(AuditEvent.store_id == store_id)
-        if proposal_id is not None:
-            statement = statement.where(AuditEvent.proposal_id == proposal_id)
-        if action is not None:
+        statement = select(AuditEvent)
+        if actor.role != UserRole.ADMIN:
+            statement = statement.where(AuditEvent.store_id.in_(
+                select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id)))
+        for name in ('store_id','proposal_id','workflow_run_id','event_type','actor_id','outcome'):
+            value = getattr(filters,name)
+            if value is not None: statement = statement.where(getattr(AuditEvent,name) == value)
+        if filters.created_from is not None:
+            statement = statement.where(AuditEvent.created_at >= filters.created_from,AuditEvent.created_at <= filters.created_to)
+        if filters.action is not None:
             statement = statement.join(
                 ApprovalAction,
                 and_(
                     ApprovalAction.id == AuditEvent.approval_action_id,
                     ApprovalAction.store_id == AuditEvent.store_id,
                 ),
-            ).where(ApprovalAction.action == action)
+            ).where(ApprovalAction.action == filters.action)
 
         total = int(
             await session.scalar(select(func.count()).select_from(statement.subquery())) or 0
         )
         events = list(
             await session.scalars(
-                statement.order_by(AuditEvent.created_at, AuditEvent.id)
-                .offset((page - 1) * page_size)
-                .limit(page_size)
+                statement.order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
+                .offset((filters.page - 1) * filters.page_size)
+                .limit(filters.page_size)
             )
         )
         for event in events:
             _safe_details(event.details)
+            _safe_resource(event.resource_type,event.resource_id)
         return events, total
     except AuditEventDomainError:
         await session.rollback()
         raise
-    except (SQLAlchemyError, ValueError):
+    except (SQLAlchemyError, ValueError, TypeError):
         await session.rollback()
         raise AuditEventDomainError("PROPOSAL_DATA_INCONSISTENT", 503) from None

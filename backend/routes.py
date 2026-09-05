@@ -24,7 +24,7 @@ from backend.approvals import (
     request_proposal_changes,
     submit_proposal,
 )
-from backend.audit_events import AuditEventDomainError, list_audit_events
+from backend.audit_events import AuditEventDomainError, AuditEventFilters, list_audit_events
 from backend.auth import (
     create_access_token,
     get_current_user,
@@ -483,11 +483,7 @@ async def list_audit_events_route(
         events, total = await list_audit_events(
             session,
             actor_id=user.id,
-            page=page,
-            page_size=page_size,
-            store_id=store_id,
-            proposal_id=proposal_id,
-            action=action,
+            filters=AuditEventFilters(page=page,page_size=page_size,store_id=store_id,proposal_id=proposal_id,action=action),
         )
     except AuditEventDomainError as error:
         raise HTTPException(status_code=error.status_code, detail={"code": error.code}) from None

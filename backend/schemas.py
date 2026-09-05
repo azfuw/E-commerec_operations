@@ -355,7 +355,9 @@ class AuditEventView(BaseModel):
     outcome: AuditOutcome
     actor_id: str | None
     actor_role: UserRole | None
-    store_id: str
+    store_id: str | None
+    resource_type: Literal['user','store','knowledge_document','knowledge_version','evaluation_run'] | None
+    resource_id: str | None
     proposal_id: str | None
     proposal_revision_id: str | None
     workflow_run_id: str | None

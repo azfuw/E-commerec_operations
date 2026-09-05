@@ -28,7 +28,36 @@ from backend.models import (
     EvaluationRun,
     Store,
     User,
+    UserStoreScope,
 )
+
+
+@pytest.mark.asyncio(loop_scope='module')
+async def test_postgres_audit_admin_global_and_scoped_disabled_history():
+    from backend.audit_events import list_audit_events,AuditEventFilters
+    suffix=uuid4().hex[:12]
+    admin,supervisor,store=[f'p9-{kind}-{suffix}' for kind in ('a','s','st')]
+    try:
+      async with async_session_factory() as writer:
+        writer.add_all([User(id=admin,username=admin,password_hash='test',role=UserRole.ADMIN),
+            User(id=supervisor,username=supervisor,password_hash='test',role=UserRole.SUPERVISOR),Store(id=store,name='History',code=store,enabled=False)])
+        await writer.flush();writer.add(UserStoreScope(user_id=supervisor,store_id=store))
+        for value in (None,store):
+            add_audit_event(writer,event_type=AuditEventType.ADMIN_STORE_UPDATED,outcome=AuditOutcome.SUCCESS,
+                store_id=value,actor_id=admin,resource_type='store',resource_id=store,details={'store_enabled':False})
+        await writer.commit()
+      async with async_session_factory() as reader:
+        rows,total=await list_audit_events(reader,actor_id=admin,filters=AuditEventFilters(actor_id=admin))
+        assert total==2 and {r.store_id for r in rows}=={None,store}
+        rows,total=await list_audit_events(reader,actor_id=supervisor,filters=AuditEventFilters(actor_id=admin))
+        assert total==1 and rows[0].store_id==store
+    finally:
+      async with async_session_factory() as cleanup:
+        await cleanup.execute(delete(AuditEvent).where(AuditEvent.actor_id==admin))
+        await cleanup.execute(delete(UserStoreScope).where(UserStoreScope.user_id==supervisor))
+        await cleanup.execute(delete(Store).where(Store.id==store))
+        await cleanup.execute(delete(User).where(User.id.in_([admin,supervisor])))
+        await cleanup.commit()
 
 
 pytestmark = pytest.mark.skipif(
