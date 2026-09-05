@@ -44,3 +44,13 @@ test('tablet supervisor reads evaluation detail and call summary',async ({page})
   await page.getByRole('tab',{name:'Agent 调用'}).click()
   await expect(page.getByText('暂无调用记录')).toBeVisible()
 })
+
+test('desktop admin can filter audit and inspect safe detail',async({page})=>{
+  await page.addInitScript(()=>sessionStorage.setItem('access_token','fixture'))
+  await page.route('**/auth/me',route=>route.fulfill({json:{id:'a',username:'admin',role:'admin'}}))
+  await page.route('**/audit-events?*',route=>route.fulfill({json:{items:[{id:'audit',event_type:'admin_store_updated',outcome:'success',store_id:'store',details:{store_enabled:false},created_at:'2026-09-05T00:00:00Z'}],total:1}}))
+  await page.goto('/app/audit-events')
+  await page.getByRole('button',{name:'查看详情'}).click()
+  await expect(page.getByRole('heading',{name:'操作详情'})).toBeVisible()
+  await expect(page.getByText('store_enabled',{exact:true})).toBeVisible()
+})

@@ -10,12 +10,18 @@ const apiProxy = {
   '/workbench': proxyTarget,
   '/proposals': proxyTarget,
   '/approvals': proxyTarget,
+  '/knowledge': proxyTarget,
+  '/agent-evaluations': proxyTarget,
+  '/agent-calls': proxyTarget,
+  '/audit-events': proxyTarget,
+  '/admin': proxyTarget,
 }
 
 export default defineConfig({
   base: '/app/',
   plugins: [vue()],
   test: {
+    include: ['src/**/*.test.ts'],
     environment: 'jsdom',
     setupFiles: ['./src/test/setup.ts'],
     restoreMocks: true,

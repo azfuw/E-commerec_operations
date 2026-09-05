@@ -1,8 +1,9 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { h } from 'vue'
-import { canUseKnowledge, canViewAgentObservability } from './capabilities'
+import { canUseKnowledge, canViewAgentObservability, canViewAuditEvents } from './capabilities'
 import KnowledgePage from './pages/KnowledgePage.vue'
 import AgentEvaluationsPage from './pages/AgentEvaluationsPage.vue'
+import AuditEventsPage from './pages/AuditEventsPage.vue'
 
 import AppShell from './components/AppShell.vue'
 import ForbiddenPage from './pages/ForbiddenPage.vue'
@@ -30,6 +31,7 @@ export function createAppRouter() {
           { path: 'workbench', name: 'workbench', component: WorkbenchPage },
           { path: 'knowledge', name: 'knowledge', component: KnowledgePage },
           { path: 'agent-evaluations', name: 'agent-evaluations', component: AgentEvaluationsPage },
+          { path: 'audit-events', name: 'audit-events', component: AuditEventsPage },
           { path: 'analysis', name: 'analysis', component: AnalysisPage },
           { path: 'analysis/:runId', name: 'analysis-run', component: AnalysisRunPage },
           { path: 'proposals', name: 'proposals', component: WorkbenchPage },
@@ -54,6 +56,9 @@ export function createAppRouter() {
       return { name: mobile ? 'desktop-required' : 'forbidden' }
     }
     if (to.name === 'agent-evaluations' && session.user && !canViewAgentObservability(session.user.role, mobile)) {
+      return { name: mobile ? 'desktop-required' : 'forbidden' }
+    }
+    if (to.name === 'audit-events' && session.user && !canViewAuditEvents(session.user.role, mobile)) {
       return { name: mobile ? 'desktop-required' : 'forbidden' }
     }
     if (

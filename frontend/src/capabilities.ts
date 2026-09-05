@@ -8,6 +8,10 @@ export function canViewAgentObservability(role: UserRole, isMobile: boolean): bo
   return !isMobile && (role === 'supervisor' || role === 'admin')
 }
 
+export function canViewAuditEvents(role: UserRole, isMobile: boolean): boolean {
+  return !isMobile && (role === 'supervisor' || role === 'admin')
+}
+
 export function canStartAnalysis(role: UserRole, isMobile: boolean): boolean {
   return role === 'operator' && !isMobile
 }

@@ -317,3 +317,8 @@ export function listAgentCalls(query: import('./types').AgentCallQuery, signal?:
   const params = new URLSearchParams(Object.entries(query).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => [k,String(v)]))
   return apiRequest(`/agent-calls?${params}`, signal ? {signal} : {})
 }
+
+export function listAuditEvents(query: import('./types').AuditEventQuery, signal?: AbortSignal): Promise<import('./types').AuditEventList> {
+  const params = new URLSearchParams(Object.entries(query).filter(([,v]) => v !== undefined && v !== '').map(([k,v]) => [k,String(v)]))
+  return apiRequest(`/audit-events?${params}`, signal ? {signal} : {})
+}

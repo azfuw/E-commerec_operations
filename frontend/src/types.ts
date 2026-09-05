@@ -428,3 +428,16 @@ export interface AgentCall {
 export interface AgentCallList { items: AgentCall[]; total: number; page: number; page_size: number }
 export interface EvaluationQuery { page: number; page_size: number; agent_type?: EvaluationAgentType; status?: 'completed' | 'failed'; store_id?: string }
 export interface AgentCallQuery { page: number; page_size: number; store_id?: string; workflow_type?: string; node_name?: string; status?: 'succeeded' | 'failed'; error_code?: string }
+
+export interface AuditEvent {
+  id: string; event_type: string; outcome: string; actor_id: string | null; actor_role: UserRole | null
+  store_id: string | null; proposal_id: string | null; proposal_revision_id: string | null
+  workflow_run_id: string | null; approval_action_id: string | null; publish_record_id: string | null
+  resource_type: string | null; resource_id: string | null; request_id: string | null
+  error_code: string | null; details: Record<string, string | boolean | number | string[]>; created_at: string
+}
+export interface AuditEventQuery {
+  page: number; page_size: number; store_id?: string; proposal_id?: string; workflow_run_id?: string
+  action?: string; event_type?: string; actor_id?: string; outcome?: string; created_from?: string; created_to?: string
+}
+export interface AuditEventList { items: AuditEvent[]; total: number; page: number; page_size: number }
