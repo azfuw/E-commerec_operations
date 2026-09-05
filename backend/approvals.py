@@ -9,6 +9,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import store_visibility_predicate
 from backend.audit_events import add_audit_event
 from backend.common import (
     ApprovalActionType,
@@ -124,13 +125,7 @@ async def list_pending_approvals(
                 WorkflowRun.id == ProductProposal.optimization_run_id,
             )
             .join(Store, Store.id == ProductProposal.store_id)
-            .join(
-                UserStoreScope,
-                and_(
-                    UserStoreScope.user_id == actor.id,
-                    UserStoreScope.store_id == ProductProposal.store_id,
-                ),
-            )
+            .where(store_visibility_predicate(actor,ProductProposal.store_id))
             .join(
                 Product,
                 and_(

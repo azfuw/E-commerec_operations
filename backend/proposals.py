@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import store_visibility_predicate
 from backend.common import (
     ApprovalActionType,
     ProposalRevisionOrigin,
@@ -286,7 +287,7 @@ async def get_proposal_for_actor(
 
         proposal = await session.scalar(
             select(ProductProposal)
-            .where(ProductProposal.id == proposal_id)
+            .where(ProductProposal.id == proposal_id, store_visibility_predicate(user,ProductProposal.store_id))
             .execution_options(populate_existing=True)
         )
         if proposal is None:
@@ -298,14 +299,6 @@ async def get_proposal_for_actor(
         )
         if store is None or not store.enabled:
             raise ProposalDomainError("PROPOSAL_NOT_FOUND", 404)
-        scope = await session.scalar(
-            select(UserStoreScope)
-            .where(UserStoreScope.user_id == actor_id, UserStoreScope.store_id == store.id)
-            .execution_options(populate_existing=True)
-        )
-        if scope is None:
-            raise ProposalDomainError("PROPOSAL_NOT_FOUND", 404)
-
         optimization_run = await _optimization_for_proposal(
             session,
             proposal,

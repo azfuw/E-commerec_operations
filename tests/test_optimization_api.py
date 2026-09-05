@@ -610,8 +610,9 @@ async def test_proposal_read_requires_exact_scope_for_all_allowed_roles_and_retu
     cross_store = await client.get(
         f"/proposals/{proposal_id}", headers=_headers(other_token)
     )
-    assert no_scope.status_code == unknown.status_code == cross_store.status_code == 404
-    assert no_scope.json() == unknown.json() == cross_store.json() == {
+    assert no_scope.status_code == 200
+    assert unknown.status_code == cross_store.status_code == 404
+    assert unknown.json() == cross_store.json() == {
         "detail": {"code": "PROPOSAL_NOT_FOUND"}
     }
 

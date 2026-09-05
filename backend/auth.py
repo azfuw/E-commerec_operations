@@ -4,7 +4,7 @@ import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
-from sqlalchemy import select
+from sqlalchemy import select, true, ColumnElement
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.common import UserRole, UserStatus, utc_now
@@ -69,10 +69,16 @@ async def get_current_user(
     if not isinstance(user_id, str):
         raise credentials_exception()
 
-    user = await session.get(User, user_id)
+    user = await session.get(User, user_id, populate_existing=True)
     if user is None or user.status is not UserStatus.ACTIVE:
         raise credentials_exception()
     return user
+
+
+def store_visibility_predicate(actor: User, store_id_column: ColumnElement[str]) -> ColumnElement[bool]:
+    if actor.role is UserRole.ADMIN:
+        return true()
+    return store_id_column.in_(select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id))
 
 
 def require_roles(*roles: UserRole):

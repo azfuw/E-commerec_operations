@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from backend.auth import store_visibility_predicate
 from backend.common import (
     UserRole,
     UserStatus,
@@ -118,13 +119,7 @@ async def list_workbench_tasks(
             (
                 await session.scalars(
                     select(Store.id)
-                    .join(
-                        UserStoreScope,
-                        and_(
-                            UserStoreScope.user_id == actor.id,
-                            UserStoreScope.store_id == Store.id,
-                        ),
-                    )
+                    .where(store_visibility_predicate(actor,Store.id))
                     .where(Store.enabled.is_(True))
                 )
             ).all()

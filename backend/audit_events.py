@@ -8,6 +8,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import store_visibility_predicate
 from backend.common import (
     ApprovalActionType,
     AuditEventType,
@@ -239,9 +240,7 @@ async def list_audit_events(
             raise AuditEventDomainError("PROPOSAL_ACTION_FORBIDDEN", 403)
 
         statement = select(AuditEvent)
-        if actor.role != UserRole.ADMIN:
-            statement = statement.where(AuditEvent.store_id.in_(
-                select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id)))
+        statement = statement.where(store_visibility_predicate(actor,AuditEvent.store_id))
         for name in ('store_id','proposal_id','workflow_run_id','event_type','actor_id','outcome'):
             value = getattr(filters,name)
             if value is not None: statement = statement.where(getattr(AuditEvent,name) == value)

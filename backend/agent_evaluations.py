@@ -262,11 +262,11 @@ def _run_view(run):
 
 
 async def list_evaluation_runs(session, *, actor_id, query):
+    from backend.auth import store_visibility_predicate
     from backend.models import EvaluationRun,UserStoreScope
     actor = await _reader(session,actor_id)
     statement = select(EvaluationRun)
-    if actor.role != UserRole.ADMIN:
-        statement = statement.where(EvaluationRun.store_id.in_(select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id)))
+    statement = statement.where(store_visibility_predicate(actor,EvaluationRun.store_id))
     for name in ('agent_type','status','store_id'):
         value = getattr(query,name)
         if value is not None: statement = statement.where(getattr(EvaluationRun,name) == value)
@@ -276,12 +276,12 @@ async def list_evaluation_runs(session, *, actor_id, query):
 
 
 async def get_evaluation_run_for_actor(session, *, actor_id, run_id):
+    from backend.auth import store_visibility_predicate
     from backend.models import EvaluationRun,EvaluationResult,EvaluationCase,UserStoreScope
     from backend.schemas import EvaluationRunDetailView,EvaluationResultView
     actor = await _reader(session,actor_id)
     statement = select(EvaluationRun).where(EvaluationRun.id == run_id)
-    if actor.role != UserRole.ADMIN:
-        statement = statement.where(EvaluationRun.store_id.in_(select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id)))
+    statement = statement.where(store_visibility_predicate(actor,EvaluationRun.store_id))
     run = await session.scalar(statement)
     if run is None: raise EvaluationDomainError('EVALUATION_RUN_NOT_FOUND',404)
     view = _run_view(run)
@@ -298,13 +298,13 @@ async def get_evaluation_run_for_actor(session, *, actor_id, run_id):
 
 
 async def list_safe_agent_calls(session, *, actor_id, query):
+    from backend.auth import store_visibility_predicate
     from backend.models import AgentCall,WorkflowRun,Store,UserStoreScope
     from backend.schemas import AgentCallView
     actor = await _reader(session,actor_id)
     names = set(AgentCallView.model_fields)-{'store_id','workflow_type'}
     statement = select(*(getattr(AgentCall,name) for name in sorted(names)),WorkflowRun.store_id,WorkflowRun.workflow_type).join(WorkflowRun,WorkflowRun.id == AgentCall.workflow_run_id).join(Store,Store.id == WorkflowRun.store_id)
-    if actor.role != UserRole.ADMIN:
-        statement = statement.where(WorkflowRun.store_id.in_(select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id)))
+    statement = statement.where(store_visibility_predicate(actor,WorkflowRun.store_id))
     for name in ('store_id','workflow_type','node_name','status','error_code'):
         value = getattr(query,name)
         model = WorkflowRun if name in ('store_id','workflow_type') else AgentCall

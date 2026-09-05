@@ -90,6 +90,40 @@ async def client(session) -> AsyncIterator[AsyncClient]:
     app.dependency_overrides.clear()
 
 
+async def test_admin_without_scopes_reads_both_workbench_stores(session,auth_data):
+    from datetime import date
+    from backend.models import WorkflowRun
+    from backend.common import WorkflowType,WorkflowStatus,WorkflowQuality
+    from backend.workbench import list_workbench_tasks
+    for store_id in ('flagship','other-store'):
+        session.add(WorkflowRun(id='run-'+store_id,store_id=store_id,created_by='admin-user',workflow_type=WorkflowType.ANALYSIS,
+            status=WorkflowStatus.COMPLETED,quality_status=WorkflowQuality.NORMAL,start_date=date(2026,9,1),end_date=date(2026,9,2)))
+    await session.commit()
+    rows,total=await list_workbench_tasks(session,actor_id='admin-user',page=1,page_size=20,store_id=None,kind=None,status=None)
+    assert total==2 and {row.store_id for row in rows}=={'flagship','other-store'}
+    rows,total=await list_workbench_tasks(session,actor_id='operator-user',page=1,page_size=20,store_id=None,kind=None,status=None)
+    assert total==1 and rows[0].store_id=='flagship'
+
+
+from tests.test_manual_review_api import manual_route_data
+
+
+async def test_admin_scope_free_proposal_and_approval_reads(session,manual_route_data):
+    from sqlalchemy import delete
+    from backend.proposals import get_proposal_for_actor
+    from backend.approvals import list_pending_approvals,submit_proposal
+    from backend.schemas import ProposalActionRequest
+    await submit_proposal(session,actor_id='supervisor-1',proposal_id='proposal-1',request=ProposalActionRequest(revision_id='revision-1'),idempotency_key='scope-free',request_id='scope-free')
+    await session.execute(delete(UserStoreScope).where(UserStoreScope.user_id=='admin-1'));await session.commit()
+    proposal=await get_proposal_for_actor(session,'admin-1','proposal-1')
+    assert proposal.proposal.id=='proposal-1'
+    rows,total=await list_pending_approvals(session,actor_id='admin-1',page=1,page_size=20)
+    assert total==1 and rows[0].store_id=='store-1'
+    await session.execute(delete(UserStoreScope).where(UserStoreScope.user_id=='supervisor-1'));await session.commit()
+    rows,total=await list_pending_approvals(session,actor_id='supervisor-1',page=1,page_size=20)
+    assert rows==[] and total==0
+
+
 @pytest_asyncio.fixture
 async def operator_token(auth_data) -> str:
     return create_access_token(auth_data["operator"], get_settings())

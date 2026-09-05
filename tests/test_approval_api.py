@@ -654,8 +654,8 @@ async def test_submit_hides_invisible_or_inconsistently_owned_resources(
         headers=_headers(actor),
     )
 
-    assert response.status_code == 404
-    assert response.json() == {"detail": {"code": "PROPOSAL_NOT_FOUND"}}
+    assert response.status_code == (401 if case == "disabled-actor" else 404)
+    assert response.json() == ({"detail": "Invalid credentials"} if case == "disabled-actor" else {"detail": {"code": "PROPOSAL_NOT_FOUND"}})
     assert await _action_counts(session) == (0, 0)
 
 
@@ -1279,8 +1279,8 @@ async def test_exact_replay_rechecks_fresh_authorization_and_ownership(
         headers=headers,
     )
 
-    assert replay.status_code == 404
-    assert replay.json() == {"detail": {"code": "PROPOSAL_NOT_FOUND"}}
+    assert replay.status_code == (401 if ownership_break == "actor" else 404)
+    assert replay.json() == ({"detail": "Invalid credentials"} if ownership_break == "actor" else {"detail": {"code": "PROPOSAL_NOT_FOUND"}})
     assert await _action_counts(session) == before
 
 
@@ -1771,7 +1771,7 @@ async def test_approval_list_enforces_scope_stable_pagination_total_and_safe_out
             headers=_headers(manual_route_data[actor_name], None),
         )
         assert first_page.status_code == second_page.status_code == 200
-        assert first_page.json()["total"] == second_page.json()["total"] == 2
+        assert first_page.json()["total"] == second_page.json()["total"] == (3 if actor_name == "admin" else 2)
         assert first_page.json()["page"] == 1
         assert second_page.json()["page"] == 2
         assert first_page.json()["page_size"] == second_page.json()["page_size"] == 1
@@ -1819,8 +1819,8 @@ async def test_approval_list_enforces_scope_stable_pagination_total_and_safe_out
         "/approvals", headers=_headers(manual_route_data["admin"], None)
     )
     assert refreshed.status_code == 200
-    assert refreshed.json()["items"] == []
-    assert refreshed.json()["total"] == 0
+    assert {row["store_id"] for row in refreshed.json()["items"]} == {"store-1", "store-2"}
+    assert refreshed.json()["total"] == 3
 
 
 @pytest.mark.parametrize("path", ["/approvals", "/audit-events"])
