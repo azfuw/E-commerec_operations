@@ -960,7 +960,7 @@ async def test_manual_revision_route_rejects_invalid_path_and_body_resource_boun
 @pytest.mark.parametrize(
     ("case", "expected_status"),
     [
-        ("disabled-actor", 404),
+        ("disabled-actor", 401),
         ("disabled-store", 404),
         ("missing-scope", 404),
         ("cross-store", 404),
@@ -1010,7 +1010,10 @@ async def test_manual_revision_route_freshly_enforces_actor_store_scope_and_owne
     )
 
     assert response.status_code == expected_status
-    assert response.json() == {"detail": {"code": "PROPOSAL_NOT_FOUND"}}
+    assert response.json() == (
+        {"detail": "Invalid credentials"} if case == "disabled-actor"
+        else {"detail": {"code": "PROPOSAL_NOT_FOUND"}}
+    )
     assert await _model_count(session, ProposalRevision) == 1
     assert await _model_count(session, ManualReviewRun) == 0
     assert await _model_count(session, AuditEvent) == 0
@@ -1382,6 +1385,16 @@ def test_audit_event_helper_rejects_unknown_unsafe_and_oversized_details_before_
             "risk_level",
             "published_from_version",
             "published_to_version",
+            "from_role",
+            "to_role",
+            "from_user_status",
+            "to_user_status",
+            "scope_count",
+            "store_enabled",
+            "document_status",
+            "evaluation_agent_type",
+            "evaluation_status",
+            "case_count",
         }
     )
     invalid = [
