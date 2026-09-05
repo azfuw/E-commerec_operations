@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 from typing import Literal, TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.exc import SQLAlchemyError
 from backend.common import EvaluationAgentType, EvaluationRunStatus, UserRole, UserStatus
 
@@ -243,3 +243,72 @@ def evaluate_fixed_case(case: dict[str, object]) -> EvaluationResultInput:
     validate_evaluation_metrics(agent_type,metrics)
     return EvaluationResultInput(case_id=case['id'],outcome='passed' if code == 'EVALUATION_PASSED' else 'failed',
                                  metrics=metrics,result_code=code,latency_ms=elapsed)
+
+
+async def _reader(session,actor_id):
+    from backend.models import User
+    actor = await session.scalar(select(User).where(User.id == actor_id).execution_options(populate_existing=True))
+    if actor is None or actor.status != UserStatus.ACTIVE:
+        raise EvaluationDomainError('EVALUATION_AUTHENTICATION_REQUIRED',401)
+    if actor.role not in (UserRole.ADMIN,UserRole.SUPERVISOR):
+        raise EvaluationDomainError('EVALUATION_FORBIDDEN',403)
+    return actor
+
+
+def _run_view(run):
+    from backend.schemas import EvaluationRunView
+    validate_evaluation_summary(run.agent_type,run.summary)
+    return EvaluationRunView.model_validate(run)
+
+
+async def list_evaluation_runs(session, *, actor_id, query):
+    from backend.models import EvaluationRun,UserStoreScope
+    actor = await _reader(session,actor_id)
+    statement = select(EvaluationRun)
+    if actor.role != UserRole.ADMIN:
+        statement = statement.where(EvaluationRun.store_id.in_(select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id)))
+    for name in ('agent_type','status','store_id'):
+        value = getattr(query,name)
+        if value is not None: statement = statement.where(getattr(EvaluationRun,name) == value)
+    total = await session.scalar(select(func.count()).select_from(statement.subquery())) or 0
+    runs = list(await session.scalars(statement.order_by(EvaluationRun.created_at.desc(),EvaluationRun.id.desc()).offset((query.page-1)*query.page_size).limit(query.page_size)))
+    return [_run_view(run) for run in runs],total
+
+
+async def get_evaluation_run_for_actor(session, *, actor_id, run_id):
+    from backend.models import EvaluationRun,EvaluationResult,EvaluationCase,UserStoreScope
+    from backend.schemas import EvaluationRunDetailView,EvaluationResultView
+    actor = await _reader(session,actor_id)
+    statement = select(EvaluationRun).where(EvaluationRun.id == run_id)
+    if actor.role != UserRole.ADMIN:
+        statement = statement.where(EvaluationRun.store_id.in_(select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id)))
+    run = await session.scalar(statement)
+    if run is None: raise EvaluationDomainError('EVALUATION_RUN_NOT_FOUND',404)
+    view = _run_view(run)
+    rows = (await session.execute(select(EvaluationResult,EvaluationCase.case_key,EvaluationCase.case_version,EvaluationCase.agent_type)
+        .join(EvaluationCase,EvaluationCase.id == EvaluationResult.evaluation_case_id)
+        .where(EvaluationResult.evaluation_run_id == run_id).order_by(EvaluationCase.case_key,EvaluationCase.case_version,EvaluationResult.id))).all()
+    results = []
+    for result,key,version,case_type in rows:
+        if result.agent_type != run.agent_type or case_type != run.agent_type: raise _invalid()
+        validate_evaluation_metrics(run.agent_type,result.metrics)
+        results.append(EvaluationResultView(case_key=key,case_version=version,agent_type=result.agent_type,
+            outcome=result.outcome,metrics=result.metrics,result_code=result.result_code,latency_ms=result.latency_ms))
+    return EvaluationRunDetailView(**view.model_dump(),results=results)
+
+
+async def list_safe_agent_calls(session, *, actor_id, query):
+    from backend.models import AgentCall,WorkflowRun,Store,UserStoreScope
+    from backend.schemas import AgentCallView
+    actor = await _reader(session,actor_id)
+    names = set(AgentCallView.model_fields)-{'store_id','workflow_type'}
+    statement = select(*(getattr(AgentCall,name) for name in sorted(names)),WorkflowRun.store_id,WorkflowRun.workflow_type).join(WorkflowRun,WorkflowRun.id == AgentCall.workflow_run_id).join(Store,Store.id == WorkflowRun.store_id)
+    if actor.role != UserRole.ADMIN:
+        statement = statement.where(WorkflowRun.store_id.in_(select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id)))
+    for name in ('store_id','workflow_type','node_name','status','error_code'):
+        value = getattr(query,name)
+        model = WorkflowRun if name in ('store_id','workflow_type') else AgentCall
+        if value is not None: statement = statement.where(getattr(model,name) == value)
+    total = await session.scalar(select(func.count()).select_from(statement.subquery())) or 0
+    rows = (await session.execute(statement.order_by(AgentCall.created_at.desc(),AgentCall.id.desc()).offset((query.page-1)*query.page_size).limit(query.page_size))).mappings().all()
+    return [AgentCallView.model_validate(row) for row in rows],total

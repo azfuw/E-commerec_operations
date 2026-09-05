@@ -7,6 +7,9 @@ from fastapi import APIRouter, Body, Depends, Form, Header, HTTPException, Path,
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import SQLAlchemyError
+from backend.agent_evaluations import EvaluationDomainError, list_evaluation_runs, get_evaluation_run_for_actor, list_safe_agent_calls
+from backend.schemas import EvaluationRunQuery, EvaluationRunListView, EvaluationRunDetailView, AgentCallQuery, AgentCallListView
 
 from backend.analysis_runs import (
     create_analysis_run,
@@ -114,6 +117,40 @@ from backend.workbench import (
 
 router = APIRouter()
 _logger = logging.getLogger("backend.knowledge")
+
+
+@router.get('/agent-evaluations/runs',response_model=EvaluationRunListView)
+async def evaluation_runs_route(query: Annotated[EvaluationRunQuery,Query()],
+    user: User = Depends(require_roles(UserRole.SUPERVISOR,UserRole.ADMIN)),session: AsyncSession = Depends(get_session)):
+    try:
+        items,total = await list_evaluation_runs(session,actor_id=user.id,query=query)
+        return EvaluationRunListView(items=items,total=total,page=query.page,page_size=query.page_size)
+    except (EvaluationDomainError,SQLAlchemyError,ValidationError,ValueError) as error:
+        await session.rollback()
+        raise HTTPException(status_code=error.status_code if isinstance(error,EvaluationDomainError) and error.status_code in (401,403,404) else 503,
+            detail={'code':error.code if isinstance(error,EvaluationDomainError) and error.status_code in (401,403,404) else 'EVALUATION_DATA_INVALID','request_id':str(uuid4())}) from None
+
+
+@router.get('/agent-evaluations/runs/{run_id}',response_model=EvaluationRunDetailView)
+async def evaluation_run_route(run_id: Annotated[str,Path(min_length=1,max_length=36)],
+    user: User = Depends(require_roles(UserRole.SUPERVISOR,UserRole.ADMIN)),session: AsyncSession = Depends(get_session)):
+    try: return await get_evaluation_run_for_actor(session,actor_id=user.id,run_id=run_id)
+    except (EvaluationDomainError,SQLAlchemyError,ValidationError,ValueError) as error:
+        await session.rollback()
+        raise HTTPException(status_code=error.status_code if isinstance(error,EvaluationDomainError) and error.status_code in (401,403,404) else 503,
+            detail={'code':error.code if isinstance(error,EvaluationDomainError) and error.status_code in (401,403,404) else 'EVALUATION_DATA_INVALID','request_id':str(uuid4())}) from None
+
+
+@router.get('/agent-calls',response_model=AgentCallListView)
+async def agent_calls_route(query: Annotated[AgentCallQuery,Query()],
+    user: User = Depends(require_roles(UserRole.SUPERVISOR,UserRole.ADMIN)),session: AsyncSession = Depends(get_session)):
+    try:
+        items,total = await list_safe_agent_calls(session,actor_id=user.id,query=query)
+        return AgentCallListView(items=items,total=total,page=query.page,page_size=query.page_size)
+    except (EvaluationDomainError,SQLAlchemyError,ValidationError,ValueError) as error:
+        await session.rollback()
+        raise HTTPException(status_code=error.status_code if isinstance(error,EvaluationDomainError) and error.status_code in (401,403,404) else 503,
+            detail={'code':error.code if isinstance(error,EvaluationDomainError) and error.status_code in (401,403,404) else 'AGENT_CALL_DATA_INVALID','request_id':str(uuid4())}) from None
 
 
 def _request_id() -> str:

@@ -11,6 +11,9 @@ from backend.common import (
     AuditOutcome,
     ComplianceRiskLevel,
     KnowledgeVersionStatus,
+    EvaluationAgentType,
+    EvaluationRunStatus,
+    AgentCallType,
     ProposalRevisionOrigin,
     UserRole,
     WorkflowQuality,
@@ -732,6 +735,99 @@ class KnowledgeSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     categories: list[str] | None = Field(default=None, max_length=20)
     top_k: int = Field(default=10, ge=1, le=20)
+
+
+class EvaluationRunQuery(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    page: int = Field(default=1,ge=1)
+    page_size: int = Field(default=20,ge=1,le=100)
+    agent_type: EvaluationAgentType | None = None
+    status: EvaluationRunStatus | None = None
+    store_id: str | None = Field(default=None,min_length=1,max_length=36)
+
+
+class EvaluationRunView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    agent_type: EvaluationAgentType
+    store_id: str | None
+    suite_version: str = Field(pattern=r'^[\w.-]{1,64}$')
+    runner_version: str = Field(pattern=r'^[\w.-]{1,64}$')
+    dataset_version: str = Field(pattern=r'^[\w.-]{1,64}$')
+    execution_mode: Literal['offline_fixture']
+    status: EvaluationRunStatus
+    started_at: datetime
+    completed_at: datetime
+    created_at: datetime
+    summary: dict[str, object]
+    error_code: Literal['EVALUATION_INPUT_INVALID','EVALUATION_EXPECTATION_MISMATCH','EVALUATION_VALIDATION_FAILED','EVALUATION_RUNNER_FAILED'] | None
+
+
+class EvaluationResultView(BaseModel):
+    case_key: str
+    case_version: int
+    agent_type: EvaluationAgentType
+    outcome: Literal['passed','failed']
+    metrics: dict[str, object]
+    result_code: Literal['EVALUATION_PASSED','EVALUATION_INPUT_INVALID','EVALUATION_EXPECTATION_MISMATCH','EVALUATION_VALIDATION_FAILED','EVALUATION_RUNNER_FAILED']
+    latency_ms: float = Field(ge=0,allow_inf_nan=False)
+
+
+class EvaluationRunDetailView(EvaluationRunView):
+    results: list[EvaluationResultView]
+
+
+class EvaluationRunListView(BaseModel):
+    items: list[EvaluationRunView]
+    total: int
+    page: int
+    page_size: int
+
+
+AgentNodeName = Literal['call_analysis_agent','validate_and_reconcile','call_product_optimization_agent',
+    'repair_product_optimization_schema','call_product_compliance_agent','repair_product_compliance_schema']
+AgentErrorCode = Literal['DEEPSEEK_KEY_MISSING','LEASE_LOST','DEEPSEEK_TIMEOUT','DEEPSEEK_TRANSPORT',
+    'DEEPSEEK_RATE_LIMIT','DEEPSEEK_SERVER_ERROR','DEEPSEEK_UNAUTHORIZED','DEEPSEEK_FORBIDDEN',
+    'DEEPSEEK_SCHEMA_INVALID','DEEPSEEK_HTTP_ERROR']
+
+
+class AgentCallQuery(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    page: int = Field(default=1,ge=1)
+    page_size: int = Field(default=20,ge=1,le=100)
+    store_id: str | None = Field(default=None,min_length=1,max_length=36)
+    workflow_type: WorkflowType | None = None
+    node_name: AgentNodeName | None = None
+    status: Literal['succeeded','failed'] | None = None
+    error_code: AgentErrorCode | None = None
+
+
+class AgentCallView(BaseModel):
+    id: str
+    workflow_run_id: str
+    store_id: str
+    workflow_type: WorkflowType
+    node_name: AgentNodeName
+    call_type: AgentCallType
+    iteration: int
+    attempt: int
+    model: str = Field(pattern=r'^[A-Za-z0-9_.-]{1,128}$')
+    prompt_version: str = Field(pattern=r'^[A-Za-z0-9_.-]{1,64}$')
+    status: Literal['succeeded','failed']
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    duration_ms: int
+    estimated_cost: Decimal | None
+    error_code: AgentErrorCode | None
+    created_at: datetime
+
+
+class AgentCallListView(BaseModel):
+    items: list[AgentCallView]
+    total: int
+    page: int
+    page_size: int
 
 
 class KnowledgeCitation(BaseModel):
