@@ -39,7 +39,12 @@ class _SimulatorListingPatch(BaseModel):
         return self
 
 
-def create_platform_simulator(*, fault: str | None = None) -> FastAPI:
+def create_platform_simulator(
+    *,
+    fault: str | None = None,
+    client_id: str = "client-id",
+    client_secret: str = "client-secret",
+) -> FastAPI:
     app = FastAPI()
     app.state.fault = fault or os.getenv("PLATFORM_SIMULATOR_FAULT")
     app.state.token_requests = 0
@@ -48,8 +53,8 @@ def create_platform_simulator(*, fault: str | None = None) -> FastAPI:
     app.state.operations = {}
     app.state.disconnect_used = False
     app.state.issued_tokens = set()
-    expected_client_id = os.getenv("PLATFORM_CLIENT_ID", "client-id")
-    expected_client_secret = os.getenv("PLATFORM_CLIENT_SECRET", "client-secret")
+    expected_client_id = client_id
+    expected_client_secret = client_secret
 
     @app.get("/health/live")
     async def health() -> dict[str, str]:
@@ -186,4 +191,7 @@ def create_platform_simulator(*, fault: str | None = None) -> FastAPI:
     return app
 
 
-app = create_platform_simulator()
+app = create_platform_simulator(
+    client_id=os.getenv("PLATFORM_SIMULATOR_CLIENT_ID", "client-id"),
+    client_secret=os.getenv("PLATFORM_SIMULATOR_CLIENT_SECRET", "client-secret"),
+)

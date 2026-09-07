@@ -128,6 +128,42 @@ async def test_simulator_independently_rejects_bad_oauth_and_unissued_tokens() -
     assert null_field.status_code == 422
 
 
+@pytest.mark.parametrize(
+    ("simulator_kwargs", "client_id", "client_secret"),
+    [
+        ({}, "client-id", "client-secret"),
+        (
+            {"client_id": "simulator-id", "client_secret": "simulator-secret"},
+            "simulator-id",
+            "simulator-secret",
+        ),
+    ],
+)
+async def test_simulator_credentials_ignore_ambient_platform_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    simulator_kwargs: dict[str, str],
+    client_id: str,
+    client_secret: str,
+) -> None:
+    monkeypatch.setenv("PLATFORM_CLIENT_ID", "production-id")
+    monkeypatch.setenv("PLATFORM_CLIENT_SECRET", "production-secret")
+    app = create_platform_simulator(**simulator_kwargs)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://platform.test"
+    ) as client:
+        response = await client.post(
+            "/oauth/token",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "client_credentials",
+            },
+        )
+
+    assert response.status_code == 200
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
