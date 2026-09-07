@@ -28,6 +28,7 @@ from backend.models import (
     Product,
     ProductProposal,
     ProductSku,
+    PlatformDelivery,
     ProposalRevision,
     PublishRecord,
     WorkflowRun,
@@ -83,6 +84,31 @@ def _assert_safe(value: object, *, secrets: tuple[str, ...] = ()) -> None:
     serialized = json.dumps(value, ensure_ascii=False, default=str).lower()
     for secret in (*secrets, "mock-key", "authorization", "raw_response"):
         assert secret.lower() not in serialized
+
+
+def _assert_safe_audits(audits, *, delivery_id: str, secrets: tuple[str, ...]) -> None:
+    enqueue = next(
+        audit
+        for audit in audits
+        if audit.event_type is AuditEventType.PLATFORM_DELIVERY_ENQUEUED
+    )
+    assert (enqueue.resource_type, enqueue.resource_id, enqueue.details) == (
+        "platform_delivery",
+        delivery_id,
+        {
+            "provider": "contract_simulator",
+            "platform_delivery_status": "pending",
+            "attempt_count": 0,
+        },
+    )
+    _assert_safe(
+        [
+            audit.details
+            for audit in audits
+            if audit.event_type is not AuditEventType.PLATFORM_DELIVERY_ENQUEUED
+        ],
+        secrets=secrets,
+    )
 
 
 def _manual_payload(
@@ -318,6 +344,8 @@ async def test_pending_manual_public_flow_self_approves_and_publishes_allowed_li
     assert immutable_sku == (sku.code, dict(sku.spec), sku.price, sku.current_stock)
     assert immutable_inventory == (inventory.on_hand, inventory.inbound)
     assert int(await session.scalar(select(func.count()).select_from(PublishRecord)) or 0) == 1
+    deliveries = list(await session.scalars(select(PlatformDelivery)))
+    assert len(deliveries) == 1
     actions = list(await session.scalars(select(ApprovalAction)))
     assert [action.action for action in actions] == [
         ApprovalActionType.SUBMIT,
@@ -327,7 +355,7 @@ async def test_pending_manual_public_flow_self_approves_and_publishes_allowed_li
     audits = await _audits(session)
     audit_keys = [(audit.created_at, audit.id) for audit in audits]
     assert audit_keys == sorted(audit_keys)
-    assert len(audits) == 6
+    assert len(audits) == 7
     assert [audit.event_type for audit in audits[:4]] == [
         AuditEventType.MANUAL_REVISION_CREATED,
         AuditEventType.MANUAL_REVIEW_CLAIMED,
@@ -335,11 +363,16 @@ async def test_pending_manual_public_flow_self_approves_and_publishes_allowed_li
         AuditEventType.PROPOSAL_SUBMITTED,
     ]
     assert {audit.event_type for audit in audits[4:]} == {
+        AuditEventType.PLATFORM_DELIVERY_ENQUEUED,
         AuditEventType.PROPOSAL_APPROVED,
         AuditEventType.SIMULATED_PUBLISH_COMPLETED,
     }
     assert all(audit.outcome is AuditOutcome.SUCCESS and audit.error_code is None for audit in audits)
-    _assert_safe([audit.details for audit in audits], secrets=(manual_key, submit_key, approve_key))
+    _assert_safe_audits(
+        audits,
+        delivery_id=deliveries[0].id,
+        secrets=(manual_key, submit_key, approve_key),
+    )
     _assert_safe(responses, secrets=(manual_key, submit_key, approve_key))
 
 
@@ -615,10 +648,12 @@ async def test_request_changes_public_flow_creates_a_fresh_review_and_preserves_
     assert immutable_sku == (sku.code, dict(sku.spec), sku.price, sku.current_stock)
     assert immutable_inventory == (inventory.on_hand, inventory.inbound)
     assert int(await session.scalar(select(func.count()).select_from(PublishRecord)) or 0) == 1
+    deliveries = list(await session.scalars(select(PlatformDelivery)))
+    assert len(deliveries) == 1
     audits = await _audits(session)
     audit_keys = [(audit.created_at, audit.id) for audit in audits]
     assert audit_keys == sorted(audit_keys)
-    assert len(audits) == 11
+    assert len(audits) == 12
     assert [audit.event_type for audit in audits[:9]] == [
         AuditEventType.MANUAL_REVISION_CREATED,
         AuditEventType.MANUAL_REVIEW_CLAIMED,
@@ -631,6 +666,7 @@ async def test_request_changes_public_flow_creates_a_fresh_review_and_preserves_
         AuditEventType.PROPOSAL_SUBMITTED,
     ]
     assert {audit.event_type for audit in audits[9:]} == {
+        AuditEventType.PLATFORM_DELIVERY_ENQUEUED,
         AuditEventType.PROPOSAL_APPROVED,
         AuditEventType.SIMULATED_PUBLISH_COMPLETED,
     }
@@ -643,7 +679,11 @@ async def test_request_changes_public_flow_creates_a_fresh_review_and_preserves_
         second_submit_key,
         approve_key,
     )
-    _assert_safe([audit.details for audit in audits], secrets=secrets)
+    _assert_safe_audits(
+        audits,
+        delivery_id=deliveries[0].id,
+        secrets=secrets,
+    )
     _assert_safe(responses, secrets=secrets)
 
 

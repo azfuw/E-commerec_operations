@@ -984,6 +984,7 @@ async def test_proposal_read_returns_safe_submitted_action_and_publish_summaries
         "base_product_version": 7,
         "published_product_version": 8,
         "published_at": "2026-08-31T15:01:00Z",
+        "platform_delivery": None,
     }
     _assert_safe_proposal_read(response, caplog)
 

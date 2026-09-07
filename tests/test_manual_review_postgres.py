@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import json
 import os
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -16,6 +17,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from sqlalchemy import and_, delete, func, not_, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+import backend.approvals as approval_service
 import backend.manual_review_runs as manual_runs
 import backend.manual_review_worker as manual_worker
 from backend.approvals import (
@@ -2726,9 +2728,12 @@ async def test_postgres_concurrent_approve_replays_once_and_preserves_nonlisting
         await _cleanup(owned)
 
 
+@pytest.mark.parametrize("winner", ["approve", "terminal"])
 @pytest.mark.parametrize("terminal_action", ["reject", "request_changes"])
 async def test_postgres_approve_conflicts_with_other_terminal_writers(
     terminal_action: str,
+    winner: str,
+    monkeypatch,
 ) -> None:
     owned = _OwnedIds()
     try:
@@ -2776,11 +2781,32 @@ async def test_postgres_approve_conflicts_with_other_terminal_writers(
             except ApprovalDomainError as error:
                 return error
 
-        outcomes = await asyncio.gather(approve(), terminal())
-        assert sum(not isinstance(value, ApprovalDomainError) for value in outcomes) == 1
-        errors = [value for value in outcomes if isinstance(value, ApprovalDomainError)]
-        assert len(errors) == 1
-        assert (errors[0].code, errors[0].status_code) == (
+        winner_ready = asyncio.Event()
+        release_winner = asyncio.Event()
+        if winner == "approve":
+            original = approval_service._first_publish
+            target = "_first_publish"
+            winner_call, loser_call = approve, terminal
+        else:
+            original = approval_service._first_write
+            target = "_first_write"
+            winner_call, loser_call = terminal, approve
+
+        async def pause_winner(*args, **kwargs):
+            winner_ready.set()
+            await release_winner.wait()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(approval_service, target, pause_winner)
+
+        winner_task = asyncio.create_task(winner_call())
+        await asyncio.wait_for(winner_ready.wait(), timeout=10)
+        loser_task = asyncio.create_task(loser_call())
+        release_winner.set()
+        winner_result, loser_result = await asyncio.gather(winner_task, loser_task)
+        assert not isinstance(winner_result, ApprovalDomainError)
+        assert isinstance(loser_result, ApprovalDomainError)
+        assert (loser_result.code, loser_result.status_code) == (
             "APPROVAL_ACTION_CONFLICT",
             409,
         )
@@ -2810,13 +2836,39 @@ async def test_postgres_approve_conflicts_with_other_terminal_writers(
                 )
                 or 0
             )
+            delivery_count = int(
+                await session.scalar(
+                    select(func.count(PlatformDelivery.id))
+                    .join(
+                        PublishRecord,
+                        PlatformDelivery.publish_record_id == PublishRecord.id,
+                    )
+                    .where(PublishRecord.proposal_id == ids["proposal"])
+                )
+                or 0
+            )
             run = await session.get(WorkflowRun, ids["optimization"])
         assert terminal_count == 1 and run is not None
         assert after[6:] == before[6:]
-        if publish_count == 1:
+        previous_audits = {audit[0] for audit in chain_before["audits"]}
+        new_audit_types = Counter(
+            audit[1]
+            for audit in chain_after["audits"]
+            if audit[0] not in previous_audits
+        )
+        if winner == "approve":
+            assert (publish_count, delivery_count) == (1, 1)
+            assert winner_result.platform_delivery is not None
             assert after[5] == 8 and run.status is WorkflowStatus.COMPLETED
-            assert len(chain_after["audits"]) - len(chain_before["audits"]) == 2
+            assert new_audit_types == Counter(
+                {
+                    AuditEventType.PLATFORM_DELIVERY_ENQUEUED: 1,
+                    AuditEventType.PROPOSAL_APPROVED: 1,
+                    AuditEventType.SIMULATED_PUBLISH_COMPLETED: 1,
+                }
+            )
         else:
+            assert (publish_count, delivery_count) == (0, 0)
             assert after == before
             expected = (
                 WorkflowStatus.REJECTED
@@ -2824,7 +2876,15 @@ async def test_postgres_approve_conflicts_with_other_terminal_writers(
                 else WorkflowStatus.PENDING_MANUAL
             )
             assert run.status is expected
-            assert len(chain_after["audits"]) - len(chain_before["audits"]) == 1
+            assert new_audit_types == Counter(
+                {
+                    (
+                        AuditEventType.PROPOSAL_REJECTED
+                        if terminal_action == "reject"
+                        else AuditEventType.PROPOSAL_CHANGES_REQUESTED
+                    ): 1
+                }
+            )
         await _record_children(owned)
     finally:
         await _cleanup(owned)
