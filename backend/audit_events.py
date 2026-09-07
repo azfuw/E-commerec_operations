@@ -16,6 +16,7 @@ from backend.common import (
     EvaluationAgentType,
     EvaluationRunStatus,
     KnowledgeVersionStatus,
+    PlatformDeliveryStatus,
     ProposalRevisionOrigin,
     UserRole,
     UserStatus,
@@ -50,6 +51,9 @@ AUDIT_DETAIL_KEYS = frozenset(
         "evaluation_agent_type",
         "evaluation_status",
         "case_count",
+        "platform_delivery_status",
+        "attempt_count",
+        "provider",
     }
 )
 
@@ -58,7 +62,7 @@ _EDITABLE_FIELDS = frozenset(
 )
 _AUDIT_CHANGED_FIELDS = _EDITABLE_FIELDS | frozenset({"role", "status", "store_scopes", "enabled"})
 _RESOURCE_TYPES = frozenset(
-    {"user", "store", "knowledge_document", "knowledge_version", "evaluation_run"}
+    {"user", "store", "knowledge_document", "knowledge_version", "evaluation_run", "platform_delivery"}
 )
 
 
@@ -115,6 +119,8 @@ def _safe_details(details: dict[str, object]) -> None:
         "document_status": {item.value for item in KnowledgeVersionStatus},
         "evaluation_agent_type": {item.value for item in EvaluationAgentType},
         "evaluation_status": {item.value for item in EvaluationRunStatus},
+        "platform_delivery_status": {item.value for item in PlatformDeliveryStatus},
+        "provider": {"contract_simulator"},
     }
     for key, allowed in enum_values.items():
         if key in details and (not isinstance(details[key], str) or details[key] not in allowed):
@@ -125,11 +131,12 @@ def _safe_details(details: dict[str, object]) -> None:
         "published_to_version",
         "scope_count",
         "case_count",
+        "attempt_count",
     ):
         if key in details and (
             not isinstance(details[key], int)
             or isinstance(details[key], bool)
-            or details[key] < (0 if key in {"scope_count", "case_count"} else 1)
+            or details[key] < (0 if key in {"scope_count", "case_count", "attempt_count"} else 1)
         ):
             raise ValueError("unsafe audit details")
     if "review_passed" in details and not isinstance(details["review_passed"], bool):

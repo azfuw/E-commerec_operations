@@ -14,6 +14,7 @@ from backend.common import (
     EvaluationAgentType,
     EvaluationRunStatus,
     AgentCallType,
+    PlatformDeliveryStatus,
     ProposalRevisionOrigin,
     UserRole,
     UserStatus,
@@ -305,6 +306,16 @@ class ApprovalActionView(BaseModel):
         return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
+class PlatformDeliveryView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    status: PlatformDeliveryStatus
+    attempt_count: int
+    external_operation_id: str | None
+    error_code: str | None
+    completed_at: datetime | None
+
+
 class PublishRecordView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -320,6 +331,7 @@ class PublishRecordView(BaseModel):
     base_product_version: int
     published_product_version: int
     published_at: datetime
+    platform_delivery: PlatformDeliveryView | None = None
 
     @field_serializer("published_at", when_used="json")
     def serialize_published_at(self, value: datetime) -> datetime:
@@ -357,7 +369,7 @@ class AuditEventView(BaseModel):
     actor_id: str | None
     actor_role: UserRole | None
     store_id: str | None
-    resource_type: Literal['user','store','knowledge_document','knowledge_version','evaluation_run'] | None
+    resource_type: Literal['user','store','knowledge_document','knowledge_version','evaluation_run','platform_delivery'] | None
     resource_id: str | None
     proposal_id: str | None
     proposal_revision_id: str | None

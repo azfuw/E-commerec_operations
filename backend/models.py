@@ -29,6 +29,7 @@ from backend.common import (
     EvaluationRunStatus,
     KnowledgeVersionStatus,
     OrderStatus,
+    PlatformDeliveryStatus,
     ProposalRevisionOrigin,
     RefundStatus,
     UserRole,
@@ -903,6 +904,85 @@ class PublishRecord(Base):
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class PlatformDelivery(Base):
+    __tablename__ = "platform_deliveries"
+    __table_args__ = (
+        UniqueConstraint("publish_record_id", name="uq_platform_deliveries_publish_record_id"),
+        CheckConstraint("status IN ('pending', 'processing', 'succeeded', 'failed')", name="ck_platform_deliveries_status"),
+        CheckConstraint("provider = 'contract_simulator'", name="ck_platform_deliveries_provider"),
+        CheckConstraint("attempt_count BETWEEN 0 AND 3", name="ck_platform_deliveries_attempt_count"),
+        CheckConstraint(
+            "(status = 'processing' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL) OR "
+            "(status != 'processing' AND lease_owner IS NULL AND lease_expires_at IS NULL)",
+            name="ck_platform_deliveries_lease",
+        ),
+        CheckConstraint(
+            "(status = 'succeeded' AND external_operation_id IS NOT NULL AND completed_at IS NOT NULL AND error_code IS NULL) OR "
+            "(status = 'failed' AND external_operation_id IS NULL AND completed_at IS NOT NULL AND error_code IS NOT NULL) OR "
+            "(status IN ('pending', 'processing') AND external_operation_id IS NULL AND completed_at IS NULL)",
+            name="ck_platform_deliveries_terminal",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ('PLATFORM_AUTH_FAILED', 'PLATFORM_FORBIDDEN', "
+            "'PLATFORM_IDEMPOTENCY_CONFLICT', 'PLATFORM_RATE_LIMITED', 'PLATFORM_TIMEOUT', "
+            "'PLATFORM_CONNECTION_FAILED', 'PLATFORM_SERVER_ERROR', 'PLATFORM_REQUEST_REJECTED', "
+            "'PLATFORM_REQUEST_INVALID', 'PLATFORM_RESPONSE_INVALID', 'PLATFORM_SIGNATURE_INVALID', "
+            "'PLATFORM_DELIVERY_FAILED')",
+            name="ck_platform_deliveries_error_code",
+        ),
+        Index("ix_platform_deliveries_claim", "status", "next_attempt_at", "lease_expires_at", "created_at", "id"),
+        Index("ix_platform_deliveries_store_created", "store_id", "created_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    publish_record_id: Mapped[str] = mapped_column(
+        ForeignKey("publish_records.id", name="fk_platform_deliveries_publish_record_id"), nullable=False
+    )
+    store_id: Mapped[str] = mapped_column(
+        ForeignKey("stores.id", name="fk_platform_deliveries_store_id"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(32), default="contract_simulator", nullable=False)
+    status: Mapped[PlatformDeliveryStatus] = mapped_column(
+        Enum(
+            PlatformDeliveryStatus,
+            name="platform_delivery_status",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+            length=16,
+        ),
+        default=PlatformDeliveryStatus.PENDING,
+        nullable=False,
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    external_operation_id: Mapped[str | None] = mapped_column(String(128))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PlatformWebhookReceipt(Base):
+    __tablename__ = "platform_webhook_receipts"
+    __table_args__ = (
+        UniqueConstraint("event_id", name="uq_platform_webhook_receipts_event_id"),
+        CheckConstraint("event_type = 'publish.confirmed'", name="ck_platform_webhook_receipts_event_type"),
+        CheckConstraint("payload_digest ~ '^[0-9a-f]{64}$'", name="ck_platform_webhook_receipts_payload_digest"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    platform_delivery_id: Mapped[str] = mapped_column(
+        ForeignKey("platform_deliveries.id", name="fk_platform_webhook_receipts_platform_delivery_id"), nullable=False
+    )
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
@@ -913,7 +993,9 @@ class AuditEvent(Base):
             "'simulated_publish_completed', 'authorization_denied', "
             "'knowledge_document_created', 'knowledge_version_created', "
             "'knowledge_document_disabled', 'evaluation_run_persisted', "
-            "'admin_user_updated', 'admin_user_scopes_replaced', 'admin_store_updated')",
+            "'admin_user_updated', 'admin_user_scopes_replaced', 'admin_store_updated', "
+            "'platform_delivery_enqueued', 'platform_delivery_completed', "
+            "'platform_delivery_failed', 'platform_webhook_received')",
             name="ck_audit_events_event_type",
         ),
         CheckConstraint(
@@ -927,7 +1009,8 @@ class AuditEvent(Base):
         CheckConstraint(
             "(resource_type IS NULL AND resource_id IS NULL) OR "
             "(resource_type IS NOT NULL AND resource_id IS NOT NULL "
-            "AND resource_type IN ('user', 'store', 'knowledge_document', 'knowledge_version', 'evaluation_run') "
+            "AND resource_type IN ('user', 'store', 'knowledge_document', 'knowledge_version', "
+            "'evaluation_run', 'platform_delivery') "
             "AND length(resource_id) BETWEEN 1 AND 36)",
             name="ck_audit_events_resource_pair",
         ),

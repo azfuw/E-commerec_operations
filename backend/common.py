@@ -94,6 +94,13 @@ class EvaluationRunStatus(StrEnum):
     FAILED = "failed"
 
 
+class PlatformDeliveryStatus(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class AuditEventType(StrEnum):
     MANUAL_REVISION_CREATED = "manual_revision_created"
     MANUAL_REVIEW_CLAIMED = "manual_review_claimed"
@@ -112,6 +119,10 @@ class AuditEventType(StrEnum):
     ADMIN_USER_UPDATED = "admin_user_updated"
     ADMIN_USER_SCOPES_REPLACED = "admin_user_scopes_replaced"
     ADMIN_STORE_UPDATED = "admin_store_updated"
+    PLATFORM_DELIVERY_ENQUEUED = "platform_delivery_enqueued"
+    PLATFORM_DELIVERY_COMPLETED = "platform_delivery_completed"
+    PLATFORM_DELIVERY_FAILED = "platform_delivery_failed"
+    PLATFORM_WEBHOOK_RECEIVED = "platform_webhook_received"
 
 
 class AuditOutcome(StrEnum):
