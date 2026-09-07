@@ -630,8 +630,9 @@ git commit -m "feat: deliver approved listings with leased worker"
 - [ ] **Step 1: Write failing signature and replay tests**
 
 ```python
-def sign(secret: bytes, timestamp: str, body: bytes) -> str:
-    return hmac.new(secret, timestamp.encode() + b"." + body, hashlib.sha256).hexdigest()
+def sign(secret: bytes, timestamp: str, event_id: str, body: bytes) -> str:
+    signed = timestamp.encode() + b"." + event_id.encode() + b"." + body
+    return hmac.new(secret, signed, hashlib.sha256).hexdigest()
 
 
 async def test_valid_webhook_is_recorded_once_and_duplicate_is_idempotent(
@@ -644,6 +645,21 @@ async def test_valid_webhook_is_recorded_once_and_duplicate_is_idempotent(
     assert await count_audits(
         webhook_session, AuditEventType.PLATFORM_WEBHOOK_RECEIVED
     ) == 1
+
+
+
+async def test_signature_authenticates_event_id(webhook_client, webhook_session):
+    timestamp = str(int(datetime.now(UTC).timestamp()))
+    body = valid_webhook_body()
+    signature = sign(TEST_WEBHOOK_SECRET, timestamp, "event-1", body)
+    first = await post_signed(
+        event_id="event-1", timestamp=timestamp, body=body, signature=signature
+    )
+    changed_event = await post_signed(
+        event_id="event-2", timestamp=timestamp, body=body, signature=signature
+    )
+    assert first.status_code == 201 and changed_event.status_code == 401
+    assert await count_rows(webhook_session, PlatformWebhookReceipt) == 1
 
 
 @pytest.mark.parametrize("fault", ["bad_signature", "stale_timestamp", "changed_duplicate"])
@@ -675,14 +691,14 @@ Verify before JSON parsing:
 ```python
 expected = hmac.new(
     secret.encode("utf-8"),
-    timestamp.encode("ascii") + b"." + body,
+    timestamp.encode("ascii") + b"." + event_id.encode("ascii") + b"." + body,
     hashlib.sha256,
 ).hexdigest()
 if not hmac.compare_digest(expected, signature):
     raise PlatformWebhookError("PLATFORM_WEBHOOK_SIGNATURE_INVALID", 401)
 ```
 
-Require an integer Unix timestamp within plus/minus five minutes of UTC database/application time, event ID length `1..128`, lowercase 64-character hex signature, content type JSON, exact schema and matching delivery/external operation ID. Persist only the body SHA-256 digest. Resolve unique-event races by rollback and exact digest/identity comparison; an exact replay returns `created=False`, while a changed replay returns 409.
+Require an integer Unix timestamp within plus/minus five minutes of UTC database/application time, event ID length `1..128` using the safe ASCII segment grammar `[A-Za-z0-9_-]+`, lowercase 64-character hex signature, content type JSON, exact schema and matching delivery/external operation ID. The signed representation is the exact bytes `timestamp + b"." + event_id + b"." + raw_body`; changing only the event ID invalidates the signature and writes nothing. Persist only the body SHA-256 digest. Resolve unique-event races by rollback and exact digest/identity comparison; an exact replay returns `created=False`, while a changed replay returns 409.
 
 The accepted audit uses `resource_type='platform_delivery'`, the delivery ID and safe closed details. Bad signatures and unknown operations do not create audits because no trusted store context exists.
 

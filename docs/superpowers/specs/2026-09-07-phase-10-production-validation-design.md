@@ -113,7 +113,7 @@ Worker 使用数据库时间、`FOR UPDATE SKIP LOCKED` 和现有租约风格领
 - `Idempotency-Key`：相同 key 与相同请求返回同一操作 ID；相同 key 与不同请求返回冲突。
 - 确定性分页响应，用于验证商品、订单和库存的只读契约。
 - 可控的 `401`、`429 + Retry-After`、超时、`5xx`、响应 schema 错误和“远端提交后连接断开”。
-- HMAC-SHA256 Webhook，包含时间戳、事件 ID 和固定重放窗口。
+- HMAC-SHA256 Webhook，使用 `X-Webhook-Timestamp`、`X-Event-ID`、`X-Webhook-Signature`，签名输入固定为 `timestamp + b"." + event_id + b"." + 原始请求正文`，并使用固定重放窗口。事件 ID 采用无点号的安全 ASCII 段语法，使签名表示无歧义；只替换事件 ID 必须验签失败且零写入。
 
 Webhook API 只接受 `publish.confirmed`。服务端验证时间戳和签名，在 `platform_webhook_receipts` 中保存唯一事件 ID、关联投递 ID、事件类型、payload digest 和接收时间；不保存原始 payload。重复事件返回幂等成功，不产生第二次业务写入或审计。Webhook 仅提供确认与证据，不改变已成功的平台投递结果。
 

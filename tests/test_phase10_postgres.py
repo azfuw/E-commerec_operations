@@ -203,7 +203,9 @@ async def test_webhook_exact_duplicate_unique_race_writes_once() -> None:
         separators=(",", ":"),
     ).encode()
     signature = hmac.new(
-        secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256
+        secret.encode(),
+        timestamp.encode() + b".event-race." + body,
+        hashlib.sha256,
     ).hexdigest()
 
     try:

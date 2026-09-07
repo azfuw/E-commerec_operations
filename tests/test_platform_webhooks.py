@@ -37,9 +37,11 @@ def _timestamp() -> str:
     return str(int(datetime.now(UTC).timestamp()))
 
 
-def _signature(timestamp: str, body: bytes) -> str:
+def _signature(timestamp: str, event_id: str, body: bytes) -> str:
     return hmac.new(
-        SECRET.encode(), timestamp.encode() + b"." + body, hashlib.sha256
+        SECRET.encode(),
+        timestamp.encode() + b"." + event_id.encode() + b"." + body,
+        hashlib.sha256,
     ).hexdigest()
 
 
@@ -58,7 +60,9 @@ async def _receive(
         body=raw,
         event_id=event_id,
         timestamp=sent_at,
-        signature=_signature(sent_at, raw) if signature is None else signature,
+        signature=(
+            _signature(sent_at, event_id, raw) if signature is None else signature
+        ),
         secret=SECRET,
     )
 
@@ -124,7 +128,7 @@ async def _post_webhook(
         "Content-Type": content_type,
     }
     if include_signature:
-        headers["X-Webhook-Signature"] = _signature(timestamp, raw)
+        headers["X-Webhook-Signature"] = _signature(timestamp, event_id, raw)
     return await client.post(
         "/integrations/platform/webhooks", content=raw, headers=headers
     )
@@ -155,6 +159,36 @@ async def test_valid_webhook_is_recorded_once_and_duplicate_is_idempotent(
         "platform_delivery_status": PlatformDeliveryStatus.SUCCEEDED.value,
         "attempt_count": 1,
     }
+
+
+async def test_signature_rejects_event_id_substitution_without_a_second_write(
+    webhook_session: AsyncSession,
+) -> None:
+    body = _body()
+    timestamp = _timestamp()
+    signature = _signature(timestamp, "event-1", body)
+    assert await _receive(
+        webhook_session,
+        body=body,
+        event_id="event-1",
+        timestamp=timestamp,
+        signature=signature,
+    ) is True
+
+    with pytest.raises(PlatformWebhookError) as raised:
+        await _receive(
+            webhook_session,
+            body=body,
+            event_id="event-2",
+            timestamp=timestamp,
+            signature=signature,
+        )
+    assert (raised.value.code, raised.value.status_code) == (
+        "PLATFORM_WEBHOOK_SIGNATURE_INVALID",
+        401,
+    )
+    assert await _count(webhook_session, PlatformWebhookReceipt) == 1
+    assert await _count(webhook_session, AuditEvent) == 1
 
 
 async def test_webhook_route_returns_created_then_idempotent_status(
@@ -270,6 +304,7 @@ async def test_changed_duplicate_conflicts_without_a_second_write(
     [
         ({"event_id": ""}, "PLATFORM_WEBHOOK_EVENT_INVALID", 422),
         ({"event_id": "e" * 129}, "PLATFORM_WEBHOOK_EVENT_INVALID", 422),
+        ({"event_id": "event.1"}, "PLATFORM_WEBHOOK_EVENT_INVALID", 422),
         ({"timestamp": "9" * 64}, "PLATFORM_WEBHOOK_TIMESTAMP_INVALID", 401),
         ({"signature": "A" * 64}, "PLATFORM_WEBHOOK_SIGNATURE_INVALID", 401),
         ({"body": b"x" * 4097}, "PLATFORM_WEBHOOK_TOO_LARGE", 413),

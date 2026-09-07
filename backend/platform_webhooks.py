@@ -33,7 +33,12 @@ def _validated_envelope(
 ) -> tuple[PlatformWebhookPayload, str]:
     if not isinstance(body, bytes) or len(body) > MAX_WEBHOOK_BODY_BYTES:
         raise _fail("PLATFORM_WEBHOOK_TOO_LARGE", 413)
-    if not isinstance(event_id, str) or not 1 <= len(event_id) <= 128:
+    if (
+        not isinstance(event_id, str)
+        or not 1 <= len(event_id) <= 128
+        or not event_id.isascii()
+        or any(not (char.isalnum() or char in "_-") for char in event_id)
+    ):
         raise _fail("PLATFORM_WEBHOOK_EVENT_INVALID", 422)
     if (
         not isinstance(timestamp, str)
@@ -52,7 +57,9 @@ def _validated_envelope(
         raise _fail("PLATFORM_WEBHOOK_UNAVAILABLE", 503)
 
     expected = hmac.new(
-        secret.encode("utf-8"), timestamp.encode("ascii") + b"." + body, hashlib.sha256
+        secret.encode("utf-8"),
+        timestamp.encode("ascii") + b"." + event_id.encode("ascii") + b"." + body,
+        hashlib.sha256,
     ).hexdigest()
     if not hmac.compare_digest(expected, signature):
         raise _fail("PLATFORM_WEBHOOK_SIGNATURE_INVALID", 401)
