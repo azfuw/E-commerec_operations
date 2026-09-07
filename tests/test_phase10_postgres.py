@@ -17,6 +17,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from backend.database import engine
+from backend.platform_delivery_runs import (
+    claim_next_platform_delivery,
+    complete_platform_delivery,
+)
 from backend.platform_webhooks import receive_platform_webhook
 
 
@@ -330,3 +334,181 @@ async def test_webhook_exact_duplicate_unique_race_writes_once() -> None:
     finally:
         async with engine.begin() as connection:
             await connection.execute(sa.text(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"))
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.postgres_integration
+async def test_platform_delivery_claim_skip_locked_reclaim_and_stale_owner_guard() -> None:
+    schema = f"phase10_delivery_{uuid4().hex}"
+    quoted_schema = f'"{schema}"'
+    ids = {
+        name: f"{name}-{uuid4().hex[:12]}"
+        for name in (
+            "user",
+            "store",
+            "product",
+            "analysis",
+            "optimization",
+            "candidate",
+            "proposal",
+            "revision",
+            "action",
+            "publish",
+            "delivery",
+        )
+    }
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(sa.text(f"CREATE SCHEMA {quoted_schema}"))
+            await connection.execute(sa.text(f"SET LOCAL search_path TO {quoted_schema}"))
+
+            def run_migration(sync, action):
+                with Operations.context(MigrationContext.configure(sync)):
+                    action()
+
+            for migration in _migrations():
+                await connection.run_sync(run_migration, migration.upgrade)
+
+        scoped_engine = create_async_engine(
+            engine.url,
+            poolclass=NullPool,
+            connect_args={"server_settings": {"search_path": schema}},
+        )
+        factory = async_sessionmaker(scoped_engine, expire_on_commit=False)
+        try:
+            async with factory() as session:
+                statements = [
+                    (
+                        "INSERT INTO users (id,username,password_hash,role,status,created_at) "
+                        "VALUES (:user,:user,'test','supervisor','active',now())",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO stores (id,name,code,enabled,created_at) "
+                        "VALUES (:store,'Delivery',:store,true,now())",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO products (id,store_id,code,title,category,brand,selling_points,"
+                        "description,search_keywords,attributes,current_version,enabled) VALUES "
+                        "(:product,:store,:product,'Delivery','test','', '[]','', '[]','{}',2,true)",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO workflow_runs (id,workflow_type,store_id,created_by,start_date,end_date,"
+                        "status,quality_status,attempt_count,input,output,quality,created_at,updated_at) VALUES "
+                        "(:analysis,'analysis',:store,:user,CURRENT_DATE,CURRENT_DATE,'completed','normal',0,"
+                        "'{}','{}','{}',now(),now()), "
+                        "(:optimization,'optimization',:store,:user,NULL,NULL,'completed','normal',0,"
+                        "'{}','{}','{}',now(),now())",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO analysis_candidates (id,workflow_run_id,product_id,rank,product_code,"
+                        "anomaly_types,metrics,business_impact,evidence,impact_explanation,reason,"
+                        "recommended_action,confidence,created_at,updated_at) VALUES "
+                        "(:candidate,:analysis,:product,1,:product,'[]','{}',0,'[]','test','test','test',1,now(),now())",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO product_proposals (id,analysis_run_id,analysis_candidate_id,optimization_run_id,"
+                        "store_id,product_id,base_product_version,selection_idempotency_hash,created_at,updated_at) "
+                        "VALUES (:proposal,:analysis,:candidate,:optimization,:store,:product,1,:hash,now(),now())",
+                        {**ids, "hash": "a" * 64},
+                    ),
+                    (
+                        "INSERT INTO proposal_revisions (id,proposal_id,iteration,revision_number,origin,created_by,"
+                        "base_product_version,trusted_fact_hash,proposal_output,citations,created_at) VALUES "
+                        "(:revision,:proposal,0,1,'agent',:user,1,:hash,'{}','[]',now())",
+                        {**ids, "hash": "b" * 64},
+                    ),
+                    (
+                        "INSERT INTO approval_actions (id,proposal_id,proposal_revision_id,store_id,actor_id,actor_role,"
+                        "action,comment,idempotency_key_hash,request_hash,created_at) VALUES "
+                        "(:action,:proposal,:revision,:store,:user,'supervisor','approve',NULL,:key_hash,:request_hash,now())",
+                        {**ids, "key_hash": "c" * 64, "request_hash": "d" * 64},
+                    ),
+                    (
+                        "INSERT INTO publish_records (id,proposal_id,proposal_revision_id,product_id,store_id,approved_by,"
+                        "approval_action_id,publish_idempotency_hash,before_snapshot,after_snapshot,base_product_version,"
+                        "published_product_version,published_at) VALUES "
+                        "(:publish,:proposal,:revision,:product,:store,:user,:action,:hash,'{}','{}',1,2,now())",
+                        {**ids, "hash": "e" * 64},
+                    ),
+                    (
+                        "INSERT INTO platform_deliveries (id,publish_record_id,store_id,provider,status,attempt_count,"
+                        "created_at,updated_at) VALUES "
+                        "(:delivery,:publish,:store,'contract_simulator','pending',0,now(),now())",
+                        ids,
+                    ),
+                ]
+                for statement, parameters in statements:
+                    await session.execute(sa.text(statement), parameters)
+                await session.commit()
+
+            barrier = asyncio.Barrier(2)
+
+            async def claim(owner: str):
+                async with factory() as session:
+                    await barrier.wait()
+                    return await claim_next_platform_delivery(
+                        session, lease_owner=owner, lease_seconds=60
+                    )
+
+            claims = await asyncio.gather(claim("worker-a"), claim("worker-b"))
+            claimed = [delivery for delivery in claims if delivery is not None]
+            assert len(claimed) == 1
+            first_owner = claimed[0].lease_owner
+            assert first_owner in {"worker-a", "worker-b"}
+
+            async with factory() as session:
+                await session.execute(
+                    sa.text(
+                        "UPDATE platform_deliveries SET lease_expires_at=now()-interval '1 second' "
+                        "WHERE id=:delivery"
+                    ),
+                    ids,
+                )
+                await session.commit()
+            async with factory() as session:
+                reclaimed = await claim_next_platform_delivery(
+                    session, lease_owner="worker-reclaimed", lease_seconds=60
+                )
+                assert reclaimed is not None and reclaimed.id == ids["delivery"]
+            async with factory() as session:
+                assert not await complete_platform_delivery(
+                    session,
+                    delivery_id=ids["delivery"],
+                    lease_owner=first_owner,
+                    external_operation_id="operation-stale",
+                )
+            async with factory() as session:
+                assert await complete_platform_delivery(
+                    session,
+                    delivery_id=ids["delivery"],
+                    lease_owner="worker-reclaimed",
+                    external_operation_id="operation-current",
+                )
+            async with factory() as session:
+                row = (
+                    await session.execute(
+                        sa.text(
+                            "SELECT status,attempt_count,lease_owner,external_operation_id "
+                            "FROM platform_deliveries WHERE id=:delivery"
+                        ),
+                        ids,
+                    )
+                ).one()
+                assert tuple(row) == (
+                    "succeeded",
+                    2,
+                    None,
+                    "operation-current",
+                )
+        finally:
+            await scoped_engine.dispose()
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(
+                sa.text(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+            )
