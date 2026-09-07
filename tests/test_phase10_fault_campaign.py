@@ -10,7 +10,7 @@ from backend.common import PlatformDeliveryStatus, WorkflowStatus
 from backend.config import Settings
 from backend.database import Base
 from backend.deepseek_runtime import DeepSeekJsonRuntime
-from backend.knowledge_index import KnowledgeDependencyError
+from backend.knowledge_index import KnowledgeDependencyError, MilvusKnowledgeIndex
 from backend.knowledge_search import search_active_knowledge
 from backend.models import AuditEvent, PlatformWebhookReceipt
 from backend.platform_client import CommercePlatformClient
@@ -153,23 +153,33 @@ async def _deepseek_invalid_json(factory) -> tuple[str, int, object]:
     return run.error_code, len(requests), evidence
 
 
-async def _knowledge_fault(fault: str, session: AsyncSession) -> tuple[str, int, object]:
+async def _knowledge_fault(
+    fault: str, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> tuple[str, int, object]:
     await _seed(session)
-    models = _Models(
-        error=(
-            KnowledgeDependencyError("KNOWLEDGE_DEPENDENCY_TIMEOUT", retryable=True)
-            if fault == "milvus_timeout"
-            else None
+    models = _Models()
+    search_calls: list[tuple[str, str]] = []
+    if fault == "milvus_timeout":
+        class TimeoutClient:
+            def search(self, **kwargs: object) -> list[object]:
+                search_calls.append(
+                    (str(kwargs["collection_name"]), str(kwargs["anns_field"]))
+                )
+                raise TimeoutError
+
+        monkeypatch.setattr("pymilvus.MilvusClient", lambda **_kwargs: TimeoutClient())
+        index = MilvusKnowledgeIndex(
+            uri="http://unused", collection="knowledge_chunks", timeout_seconds=1
         )
-    )
-    index = _Index(dense=[], sparse=[])
+    else:
+        index = _Index(dense=[], sparse=[])
     try:
         outcome = await search_active_knowledge(
             session,
             query="合成规则",
             categories=None,
             top_k=3,
-            retrieval_path="hybrid",
+            retrieval_path="dense" if fault == "milvus_timeout" else "hybrid",
             load_dependencies=lambda: (
                 models,
                 index,
@@ -179,7 +189,7 @@ async def _knowledge_fault(fault: str, session: AsyncSession) -> tuple[str, int,
     except KnowledgeDependencyError as error:
         assert fault == "milvus_timeout"
         assert len(models.embed_queries) == 1
-        assert index.dense_calls == index.sparse_calls == []
+        assert search_calls == [("knowledge_chunks", "dense_vector")]
         return error.code, 0, await _persisted_values(session)
 
     assert fault == "milvus_zero_hit"
@@ -284,13 +294,14 @@ async def test_phase10_fault_campaign(
     delivery_settings: Settings,
     webhook_session: AsyncSession,
     manual_worker_factory,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if fault in {"deepseek_timeout", "deepseek_rate_limit"}:
         actual = await _deepseek_fault(fault)
     elif fault == "deepseek_invalid_json":
         actual = await _deepseek_invalid_json(manual_worker_factory)
     elif fault in {"milvus_timeout", "milvus_zero_hit"}:
-        actual = await _knowledge_fault(fault, session)
+        actual = await _knowledge_fault(fault, session, monkeypatch)
     elif fault in {"platform_accepted_disconnect", "platform_three_5xx"}:
         actual = await _platform_fault(fault, platform_delivery_factory, delivery_settings)
     elif fault == "worker_stale_owner":
