@@ -66,6 +66,8 @@ from backend.models import (
     Product,
     ProductProposal,
     ProductSku,
+    PlatformDelivery,
+    PlatformWebhookReceipt,
     ProposalRevision,
     PublishRecord,
     Store,
@@ -124,6 +126,8 @@ class _OwnedIds:
     manual_runs: set[str] = field(default_factory=set)
     actions: set[str] = field(default_factory=set)
     publishes: set[str] = field(default_factory=set)
+    deliveries: set[str] = field(default_factory=set)
+    receipts: set[str] = field(default_factory=set)
     audits: set[str] = field(default_factory=set)
     documents: set[str] = field(default_factory=set)
     versions: set[str] = field(default_factory=set)
@@ -569,6 +573,26 @@ async def _record_children(owned: _OwnedIds) -> None:
                 )
             ).all()
         )
+        owned.deliveries.update(
+            (
+                await session.scalars(
+                    select(PlatformDelivery.id).where(
+                        PlatformDelivery.publish_record_id.in_(owned.publishes)
+                    )
+                )
+            ).all()
+        )
+        owned.receipts.update(
+            (
+                await session.scalars(
+                    select(PlatformWebhookReceipt.id).where(
+                        PlatformWebhookReceipt.platform_delivery_id.in_(
+                            owned.deliveries
+                        )
+                    )
+                )
+            ).all()
+        )
         owned.audits.update(
             (
                 await session.scalars(
@@ -622,6 +646,12 @@ async def _unrelated_snapshot(owned: _OwnedIds) -> dict[str, tuple[object, ...]]
         "manual_runs": (ManualReviewRun, ManualReviewRun.id, owned.manual_runs),
         "actions": (ApprovalAction, ApprovalAction.id, owned.actions),
         "publishes": (PublishRecord, PublishRecord.id, owned.publishes),
+        "deliveries": (PlatformDelivery, PlatformDelivery.id, owned.deliveries),
+        "receipts": (
+            PlatformWebhookReceipt,
+            PlatformWebhookReceipt.id,
+            owned.receipts,
+        ),
         "audits": (AuditEvent, AuditEvent.id, owned.audits),
         "documents": (KnowledgeDocument, KnowledgeDocument.id, owned.documents),
         "versions": (
@@ -679,6 +709,8 @@ async def _assert_owned_absent(owned: _OwnedIds) -> None:
         (ManualReviewRun, ManualReviewRun.id, owned.manual_runs),
         (ApprovalAction, ApprovalAction.id, owned.actions),
         (PublishRecord, PublishRecord.id, owned.publishes),
+        (PlatformDelivery, PlatformDelivery.id, owned.deliveries),
+        (PlatformWebhookReceipt, PlatformWebhookReceipt.id, owned.receipts),
         (AuditEvent, AuditEvent.id, owned.audits),
         (KnowledgeDocument, KnowledgeDocument.id, owned.documents),
         (
@@ -734,6 +766,18 @@ async def _cleanup(owned: _OwnedIds) -> None:
                 )
         if owned.audits:
             await session.execute(delete(AuditEvent).where(AuditEvent.id.in_(owned.audits)))
+        if owned.receipts:
+            await session.execute(
+                delete(PlatformWebhookReceipt).where(
+                    PlatformWebhookReceipt.id.in_(owned.receipts)
+                )
+            )
+        if owned.deliveries:
+            await session.execute(
+                delete(PlatformDelivery).where(
+                    PlatformDelivery.id.in_(owned.deliveries)
+                )
+            )
         if owned.publishes:
             await session.execute(
                 delete(PublishRecord).where(PublishRecord.id.in_(owned.publishes))
@@ -2561,6 +2605,9 @@ async def test_postgres_concurrent_approve_replays_once_and_preserves_nonlisting
         )
         assert first.publish_record.id == second.publish_record.id
         assert first.action.id == second.action.id
+        assert first.platform_delivery is not None
+        assert second.platform_delivery is not None
+        assert first.platform_delivery.id == second.platform_delivery.id
         assert {first.created, second.created} == {True, False}
         winner_key = race_keys[0] if first.created else race_keys[1]
         same_key_replay = await approve(winner_key)
@@ -2639,6 +2686,15 @@ async def test_postgres_concurrent_approve_replays_once_and_preserves_nonlisting
                 )
                 or 0
             )
+            delivery_count = int(
+                await session.scalar(
+                    select(func.count(PlatformDelivery.id)).where(
+                        PlatformDelivery.publish_record_id
+                        == first.publish_record.id
+                    )
+                )
+                or 0
+            )
             publish_audits = list(
                 await session.scalars(
                     select(AuditEvent.event_type).where(
@@ -2647,17 +2703,19 @@ async def test_postgres_concurrent_approve_replays_once_and_preserves_nonlisting
                             [
                                 AuditEventType.PROPOSAL_APPROVED,
                                 AuditEventType.SIMULATED_PUBLISH_COMPLETED,
+                                AuditEventType.PLATFORM_DELIVERY_ENQUEUED,
                             ]
                         ),
                     )
                 )
             )
             run = await session.get(WorkflowRun, ids["optimization"])
-        assert (publish_count, approve_count) == (1, 1)
+        assert (publish_count, approve_count, delivery_count) == (1, 1, 1)
         assert publish_audits.count(AuditEventType.PROPOSAL_APPROVED) == 1
         assert publish_audits.count(
             AuditEventType.SIMULATED_PUBLISH_COMPLETED
         ) == 1
+        assert publish_audits.count(AuditEventType.PLATFORM_DELIVERY_ENQUEUED) == 1
         assert run is not None and (
             run.status,
             run.current_step,

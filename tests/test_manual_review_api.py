@@ -1395,6 +1395,9 @@ def test_audit_event_helper_rejects_unknown_unsafe_and_oversized_details_before_
             "evaluation_agent_type",
             "evaluation_status",
             "case_count",
+            "platform_delivery_status",
+            "attempt_count",
+            "provider",
         }
     )
     invalid = [

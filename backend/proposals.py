@@ -22,6 +22,7 @@ from backend.models import (
     ApprovalAction,
     ComplianceReview,
     ManualReviewRun,
+    PlatformDelivery,
     Product,
     ProductProposal,
     ProposalRevision,
@@ -57,6 +58,7 @@ class ProposalReadResult:
     submitted_revision: ProposalRevision | None
     latest_action: ApprovalAction | None
     publish_record: PublishRecord | None
+    platform_delivery: PlatformDelivery | None
 
 
 async def _selection_context(
@@ -422,6 +424,7 @@ async def get_proposal_for_actor(
             .where(PublishRecord.proposal_id == proposal.id)
             .execution_options(populate_existing=True)
         )
+        platform_delivery = None
         if publish_record is not None:
             publish_action = await session.scalar(
                 select(ApprovalAction)
@@ -453,6 +456,16 @@ async def get_proposal_for_actor(
                 or not set(publish_record.after_snapshot) <= snapshot_keys
             ):
                 raise ProposalDomainError("PROPOSAL_DATA_INCONSISTENT", 503)
+            platform_delivery = await session.scalar(
+                select(PlatformDelivery)
+                .where(PlatformDelivery.publish_record_id == publish_record.id)
+                .execution_options(populate_existing=True)
+            )
+            if platform_delivery is not None and (
+                platform_delivery.publish_record_id != publish_record.id
+                or platform_delivery.store_id != store.id
+            ):
+                raise ProposalDomainError("PROPOSAL_DATA_INCONSISTENT", 503)
         return ProposalReadResult(
             proposal=proposal,
             optimization_run=optimization_run,
@@ -463,6 +476,7 @@ async def get_proposal_for_actor(
             submitted_revision=submitted_revision,
             latest_action=latest_action,
             publish_record=publish_record,
+            platform_delivery=platform_delivery,
         )
     except ProposalDomainError:
         await session.rollback()

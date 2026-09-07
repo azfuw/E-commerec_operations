@@ -65,7 +65,9 @@ from backend.manual_reviews import (
 from backend.models import (
     KnowledgeDocument,
     KnowledgeDocumentVersion,
+    PlatformDelivery,
     Product,
+    PublishRecord,
     Store,
     User,
     UserStoreScope,
@@ -104,6 +106,7 @@ from backend.schemas import (
     ProposalActionRequest,
     ProposalCommentActionRequest,
     ProposalDetailView,
+    PlatformDeliveryView,
     ProposalRevisionView,
     ProposalView,
     PublishRecordView,
@@ -119,6 +122,23 @@ from backend.workbench import (
 )
 
 router = APIRouter()
+
+
+def _publish_record_view(
+    record: PublishRecord, delivery: PlatformDelivery | None
+) -> PublishRecordView:
+    return PublishRecordView(
+        **PublishRecordView.model_validate(record).model_dump(
+            exclude={"platform_delivery"}
+        ),
+        platform_delivery=(
+            None
+            if delivery is None
+            else PlatformDeliveryView.model_validate(delivery)
+        ),
+    )
+
+
 _logger = logging.getLogger("backend.knowledge")
 
 
@@ -600,7 +620,7 @@ async def read_proposal_route(
         else ApprovalActionView.model_validate(result.latest_action),
         publish_record=None
         if result.publish_record is None
-        else PublishRecordView.model_validate(result.publish_record),
+        else _publish_record_view(result.publish_record, result.platform_delivery),
     )
 
 
@@ -765,7 +785,7 @@ async def approve_proposal_route(
         ) from None
     if not result.created:
         response.status_code = status.HTTP_200_OK
-    return PublishRecordView.model_validate(result.publish_record)
+    return _publish_record_view(result.publish_record, result.platform_delivery)
 
 
 @router.post(

@@ -15,6 +15,7 @@ from backend.common import (
     ApprovalActionType,
     AuditEventType,
     AuditOutcome,
+    PlatformDeliveryStatus,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -28,6 +29,7 @@ from backend.models import (
     Product,
     ProductProposal,
     ProductSku,
+    PlatformDelivery,
     ProposalRevision,
     PublishRecord,
     Store,
@@ -70,6 +72,7 @@ class ApprovalActionResult:
 class ApprovalPublishResult:
     action: ApprovalAction
     publish_record: PublishRecord
+    platform_delivery: PlatformDelivery | None
     created: bool
 
 
@@ -1066,7 +1069,18 @@ async def _publish_replay(
         session, context=context, action=action, record=record
     ):
         raise ApprovalDomainError("PUBLISH_REPLAY_CONFLICT", 409)
-    return ApprovalPublishResult(action, record, False)
+    delivery = await session.scalar(
+        select(PlatformDelivery)
+        .where(PlatformDelivery.publish_record_id == record.id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if delivery is not None and (
+        delivery.publish_record_id != record.id
+        or delivery.store_id != context.store.id
+    ):
+        raise ApprovalDomainError("PUBLISH_REPLAY_CONFLICT", 409)
+    return ApprovalPublishResult(action, record, delivery, False)
 
 
 async def _first_publish(
@@ -1152,6 +1166,38 @@ async def _first_publish(
     )
     session.add(record)
     await session.flush()
+    delivery = PlatformDelivery(
+        id=str(uuid4()),
+        publish_record_id=record.id,
+        store_id=context.store.id,
+        provider="contract_simulator",
+        status=PlatformDeliveryStatus.PENDING,
+        attempt_count=0,
+    )
+    session.add(delivery)
+    await session.flush()
+    add_audit_event(
+        session,
+        event_type=AuditEventType.PLATFORM_DELIVERY_ENQUEUED,
+        outcome=AuditOutcome.SUCCESS,
+        store_id=context.store.id,
+        actor_id=context.actor.id,
+        actor_role=context.actor.role,
+        proposal_id=context.proposal.id,
+        proposal_revision_id=context.revision.id,
+        workflow_run_id=context.run.id,
+        approval_action_id=action.id,
+        publish_record_id=record.id,
+        request_id=request_id,
+        resource_type="platform_delivery",
+        resource_id=delivery.id,
+        details={
+            "provider": "contract_simulator",
+            "platform_delivery_status": "pending",
+            "attempt_count": 0,
+        },
+    )
+    await session.flush()
     add_audit_event(
         session,
         event_type=AuditEventType.PROPOSAL_APPROVED,
@@ -1205,7 +1251,7 @@ async def _first_publish(
     context.run.error_code = None
     await session.flush()
     await session.commit()
-    return ApprovalPublishResult(action, record, True)
+    return ApprovalPublishResult(action, record, delivery, True)
 
 
 async def approve_proposal(

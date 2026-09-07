@@ -15,6 +15,7 @@ from backend.common import (
     AuditEventType,
     AuditOutcome,
     OrderStatus,
+    PlatformDeliveryStatus,
     ProposalRevisionOrigin,
     RefundStatus,
     UserRole,
@@ -35,6 +36,7 @@ from backend.models import (
     Product,
     ProductProposal,
     ProductSku,
+    PlatformDelivery,
     ProposalRevision,
     PublishRecord,
     Store,
@@ -45,6 +47,7 @@ from backend.models import (
 )
 from backend.schemas import (
     ApprovalActionView,
+    PlatformDeliveryView,
     PublishRecordView,
     ProposalActionRequest,
     ProposalCommentActionRequest,
@@ -87,6 +90,10 @@ async def _action_counts(session) -> tuple[int, int]:
 
 async def _publish_count(session) -> int:
     return int(await session.scalar(select(func.count()).select_from(PublishRecord)) or 0)
+
+
+async def _delivery_count(session) -> int:
+    return int(await session.scalar(select(func.count()).select_from(PlatformDelivery)) or 0)
 
 
 def _published_output(parent: ProposalRevision) -> dict[str, object]:
@@ -1502,11 +1509,17 @@ async def test_approve_atomically_publishes_only_the_allowed_listing_fields_once
 
     assert response.status_code == 201
     record = await session.scalar(select(PublishRecord))
+    delivery = await session.scalar(select(PlatformDelivery))
     action = await session.scalar(
         select(ApprovalAction).where(ApprovalAction.action == ApprovalActionType.APPROVE)
     )
-    assert record is not None and action is not None
-    assert response.json() == PublishRecordView.model_validate(record).model_dump(mode="json")
+    assert record is not None and delivery is not None and action is not None
+    assert response.json() == PublishRecordView(
+        **PublishRecordView.model_validate(record).model_dump(
+            exclude={"platform_delivery"}
+        ),
+        platform_delivery=PlatformDeliveryView.model_validate(delivery),
+    ).model_dump(mode="json")
     product = await session.get(Product, "product-1", populate_existing=True)
     sku = await session.get(ProductSku, "sku-1", populate_existing=True)
     inventory = await session.get(InventorySnapshot, "inventory-1", populate_existing=True)
@@ -1632,7 +1645,44 @@ async def test_approve_atomically_publishes_only_the_allowed_listing_fields_once
     }
     assert await _model_count(session, ApprovalAction) == 2
     assert await _publish_count(session) == 1
-    assert await _model_count(session, AuditEvent) == 3
+    assert await _delivery_count(session) == 1
+    assert await _model_count(session, AuditEvent) == 4
+    delivery_audit = await session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.event_type == AuditEventType.PLATFORM_DELIVERY_ENQUEUED
+        )
+    )
+    assert delivery_audit is not None
+    assert (
+        delivery.publish_record_id,
+        delivery.store_id,
+        delivery.provider,
+        delivery.status,
+        delivery.attempt_count,
+    ) == (
+        record.id,
+        "store-1",
+        "contract_simulator",
+        PlatformDeliveryStatus.PENDING,
+        0,
+    )
+    assert (
+        delivery_audit.approval_action_id,
+        delivery_audit.publish_record_id,
+        delivery_audit.resource_type,
+        delivery_audit.resource_id,
+        delivery_audit.details,
+    ) == (
+        action.id,
+        record.id,
+        "platform_delivery",
+        delivery.id,
+        {
+            "provider": "contract_simulator",
+            "platform_delivery_status": "pending",
+            "attempt_count": 0,
+        },
+    )
     serialized = response.text
     assert "approve-key" not in serialized
     assert record.publish_idempotency_hash not in serialized
@@ -1703,14 +1753,23 @@ async def test_approve_exact_and_completed_new_key_replay_return_one_publish(
     await _submit(manual_client, actor)
     first = await _approve(manual_client, actor, key="approve-replay-key")
     assert first.status_code == 201
-    before = (await _action_counts(session), await _publish_count(session))
+    before = (
+        await _action_counts(session),
+        await _publish_count(session),
+        await _delivery_count(session),
+    )
 
     same_key = await _approve(manual_client, actor, key="approve-replay-key")
     new_key = await _approve(manual_client, actor, key="approve-new-key")
 
     assert same_key.status_code == new_key.status_code == 200
     assert same_key.json() == new_key.json() == first.json()
-    assert (await _action_counts(session), await _publish_count(session)) == before
+    assert first.json()["platform_delivery"]["status"] == "pending"
+    assert (
+        await _action_counts(session),
+        await _publish_count(session),
+        await _delivery_count(session),
+    ) == before
     product = await session.get(Product, "product-1", populate_existing=True)
     assert product is not None and product.current_version == 8
 
@@ -2279,7 +2338,7 @@ async def test_approve_replay_rejects_non_exact_immutable_publish_chains(
     assert (await _action_counts(session), await _publish_count(session)) == before
 
 
-@pytest.mark.parametrize("fail_at", range(1, 7))
+@pytest.mark.parametrize("fail_at", range(1, 9))
 async def test_approve_rolls_back_every_publish_boundary(
     manual_client, manual_route_data, session, monkeypatch, fail_at: int
 ) -> None:
@@ -2298,7 +2357,20 @@ async def test_approve_rolls_back_every_publish_boundary(
         product.current_version,
     )
     run_before = (run.status, run.quality_status, run.current_step, run.error_code)
-    counts_before = (await _action_counts(session), await _publish_count(session))
+    counts_before = (
+        await _action_counts(session),
+        await _publish_count(session),
+        await _delivery_count(session),
+        int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.event_type
+                    == AuditEventType.PLATFORM_DELIVERY_ENQUEUED
+                )
+            )
+            or 0
+        ),
+    )
     original_flush = session.flush
     calls = 0
 
@@ -2328,7 +2400,72 @@ async def test_approve_rolls_back_every_publish_boundary(
         product.current_version,
     ) == product_before
     assert (run.status, run.quality_status, run.current_step, run.error_code) == run_before
-    assert (await _action_counts(session), await _publish_count(session)) == counts_before
+    assert (
+        await _action_counts(session),
+        await _publish_count(session),
+        await _delivery_count(session),
+        int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.event_type
+                    == AuditEventType.PLATFORM_DELIVERY_ENQUEUED
+                )
+            )
+            or 0
+        ),
+    ) == counts_before
+
+
+async def test_historical_publish_without_delivery_reads_null_without_backfill(
+    manual_client, manual_route_data, session
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _prepare_publish_output(session, manual_route_data["parent"])
+    await _submit(manual_client, actor)
+    approved = await _approve(manual_client, actor, key="historical-approve")
+    assert approved.status_code == 201
+    delivery = await session.scalar(select(PlatformDelivery))
+    assert delivery is not None
+    await session.delete(delivery)
+    await session.commit()
+
+    detail = await manual_client.get(
+        "/proposals/proposal-1", headers=_headers(actor, None)
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["publish_record"]["platform_delivery"] is None
+    assert await _delivery_count(session) == 0
+
+
+@pytest.mark.parametrize("read_path", ["replay", "detail"])
+async def test_delivery_store_mismatch_is_rejected_on_replay_and_detail(
+    manual_client, manual_route_data, session, read_path: str
+) -> None:
+    actor = manual_route_data["supervisor"]
+    await _prepare_publish_output(session, manual_route_data["parent"])
+    await _submit(manual_client, actor)
+    approved = await _approve(manual_client, actor, key="delivery-store-check")
+    assert approved.status_code == 201
+    delivery = await session.scalar(select(PlatformDelivery))
+    assert delivery is not None
+    delivery.store_id = manual_route_data["other_store"].id
+    await session.commit()
+
+    response = (
+        await _approve(manual_client, actor, key="delivery-store-check")
+        if read_path == "replay"
+        else await manual_client.get(
+            "/proposals/proposal-1", headers=_headers(actor, None)
+        )
+    )
+
+    expected = (
+        (409, "PUBLISH_REPLAY_CONFLICT")
+        if read_path == "replay"
+        else (503, "PROPOSAL_DATA_INCONSISTENT")
+    )
+    assert (response.status_code, response.json()["detail"]["code"]) == expected
 
 
 async def test_approve_integrity_race_recovers_the_single_completed_winner(
@@ -2382,7 +2519,8 @@ async def test_approve_integrity_race_recovers_the_single_completed_winner(
 
     assert result.created is False
     assert await _publish_count(session) == 1
+    assert await _delivery_count(session) == 1
     assert await _model_count(session, ApprovalAction) == 2
-    assert await _model_count(session, AuditEvent) == 3
+    assert await _model_count(session, AuditEvent) == 4
     product = await session.get(Product, "product-1", populate_existing=True)
     assert product is not None and product.current_version == 8

@@ -167,6 +167,10 @@ def test_stage_five_closed_sets_are_exact() -> None:
         "admin_user_updated",
         "admin_user_scopes_replaced",
         "admin_store_updated",
+        "platform_delivery_enqueued",
+        "platform_delivery_completed",
+        "platform_delivery_failed",
+        "platform_webhook_received",
     }
     assert WorkflowType.MANUAL_REVIEW.value == "manual_review"
     assert WorkflowStatus.PENDING_APPROVAL.value == "pending_approval"
