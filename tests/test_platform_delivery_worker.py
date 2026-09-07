@@ -8,7 +8,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from backend.common import AuditEventType, PlatformDeliveryStatus
 from backend.config import Settings
-from backend.models import AuditEvent, PlatformDelivery
+from backend.models import AuditEvent, PlatformDelivery, PublishRecord
+from backend.optimization_validation import validate_optimization_output
 from backend.platform_client import (
     CommercePlatformClient,
     PlatformClientError,
@@ -23,6 +24,11 @@ from tests.test_platform_delivery_runs import (
     make_delivery_due,
     platform_delivery_factory,
     seed_pending_delivery,
+)
+from tests.test_optimization_validation import (
+    _attribute,
+    complete_legal_output,
+    complete_trusted_input,
 )
 
 
@@ -115,6 +121,66 @@ async def test_worker_success_uses_only_immutable_snapshot_and_completes_once(
             "idempotency_key": "a" * 64,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("trusted_attributes", "completion_count"),
+    [
+        ({f"现有属性{index}": "值" for index in range(50)}, 20),
+        ({"属性" * 65: "值"}, 0),
+        ({"长值": "值" * 513}, 0),
+        ({"": "保留值"}, 0),
+    ],
+    ids=["70-attributes", "65-character-key", "513-character-value", "empty-key"],
+)
+async def test_worker_publishes_every_attribute_shape_allowed_by_approved_snapshot(
+    platform_delivery_factory,
+    delivery_settings,
+    trusted_attributes: dict[str, str],
+    completion_count: int,
+) -> None:
+    trusted = complete_trusted_input(attributes=trusted_attributes)
+    output = complete_legal_output(
+        attribute_completions=[
+            _attribute(target=f"新增属性{index}") for index in range(completion_count)
+        ]
+    )
+    assert validate_optimization_output(trusted, output).passed
+    approved_attributes = {
+        **trusted.attributes,
+        **{
+            completion.target_attribute: completion.suggested_value
+            for completion in output.attribute_completions
+        },
+    }
+
+    delivery_id = await seed_pending_delivery(platform_delivery_factory)
+    async with platform_delivery_factory() as session:
+        record = await session.scalar(select(PublishRecord))
+        assert record is not None
+        record.after_snapshot = {
+            **record.after_snapshot,
+            "attributes": approved_attributes,
+        }
+        await session.commit()
+
+    app = create_platform_simulator()
+    client = CommercePlatformClient(
+        delivery_settings, transport=httpx.ASGITransport(app=app)
+    )
+    try:
+        assert await run_once(
+            platform_delivery_factory,
+            settings=delivery_settings,
+            lease_owner="worker-1",
+            client=client,
+        ) == delivery_id
+    finally:
+        await client.aclose()
+
+    row = await load_delivery(platform_delivery_factory, delivery_id)
+    assert row.status is PlatformDeliveryStatus.SUCCEEDED
+    assert app.state.mutation_count == 1
 
 
 async def test_transient_failures_retry_three_total_attempts_then_fail(

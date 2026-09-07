@@ -23,7 +23,7 @@ class _SimulatorListingPatch(BaseModel):
         default=None, min_length=1, max_length=20
     )
     attribute_completions: dict[str, str | int | float | bool | None] | None = Field(
-        default=None, max_length=50
+        default=None, max_length=70
     )
 
     @model_validator(mode="after")
@@ -32,10 +32,6 @@ class _SimulatorListingPatch(BaseModel):
             getattr(self, field) is None for field in self.model_fields_set
         ):
             raise ValueError("empty or null patch")
-        if self.attribute_completions is not None:
-            for key, value in self.attribute_completions.items():
-                if not 1 <= len(key) <= 64 or isinstance(value, str) and len(value) > 512:
-                    raise ValueError("invalid attribute completion")
         return self
 
 
