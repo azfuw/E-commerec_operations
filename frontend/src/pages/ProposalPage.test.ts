@@ -629,6 +629,13 @@ describe('ProposalPage', () => {
             base_product_version: 7,
             published_product_version: 8,
             published_at: '2026-09-03T09:00:00Z',
+            platform_delivery: {
+              status: 'succeeded',
+              attempt_count: 1,
+              external_operation_id: 'operation-1',
+              error_code: null,
+              completed_at: '2026-09-03T09:01:00Z',
+            },
           }
         }
         return response(current)
@@ -656,6 +663,82 @@ describe('ProposalPage', () => {
     )
     expect(wrapper.get('[data-test="publish-before"]').text()).toContain('原商品标题')
     expect(wrapper.get('[data-test="publish-after"]').text()).toContain('父版本标题')
+    wrapper.unmount()
+  })
+
+  it.each([
+    ['pending', '等待平台投递'],
+    ['processing', '正在投递平台'],
+    ['succeeded', '平台投递成功'],
+    ['failed', '平台投递失败'],
+  ] as const)('shows safe %s platform delivery evidence', async (status, label) => {
+    setMobile(false)
+    const current = proposalDetail('completed')
+    current.publish_record = {
+      id: 'publish-1',
+      proposal_id: 'proposal-1',
+      proposal_revision_id: 'revision-2',
+      product_id: 'product-1',
+      store_id: 'store-1',
+      approved_by: 'supervisor-1',
+      approval_action_id: 'action-1',
+      before_snapshot: {},
+      after_snapshot: {},
+      base_product_version: 7,
+      published_product_version: 8,
+      published_at: '2026-09-03T09:00:00Z',
+      platform_delivery: {
+        status,
+        attempt_count: 2,
+        external_operation_id: status === 'succeeded' ? 'operation-1' : null,
+        error_code: status === 'failed' ? 'PLATFORM_TEMPORARILY_UNAVAILABLE' : null,
+        completed_at: status === 'succeeded' || status === 'failed' ? '2026-09-03T09:01:00Z' : null,
+      },
+    }
+    Object.assign(current.publish_record.platform_delivery, {
+      token: 'secret-token',
+      url: 'https://private.example/platform',
+      headers: { Authorization: 'Bearer secret-token' },
+      raw_error: 'upstream stack trace',
+    })
+    vi.stubGlobal('fetch', async () => response(current))
+
+    const { wrapper } = await mountProposal()
+    await flushPromises()
+
+    const delivery = wrapper.get('[data-test="platform-delivery"]').text()
+    expect(delivery).toContain(label)
+    expect(delivery).toContain('尝试次数 2')
+    if (status === 'succeeded') expect(delivery).toContain('operation-1')
+    if (status === 'failed') {
+      expect(wrapper.get('[data-test="platform-delivery-error"]').text()).toContain('平台暂时不可用')
+    }
+    expect(wrapper.find('[data-test="platform-retry"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('secret-token')
+    expect(wrapper.text()).not.toContain('private.example')
+    expect(wrapper.text()).not.toContain('Authorization')
+    expect(wrapper.text()).not.toContain('upstream stack trace')
+    wrapper.unmount()
+  })
+
+  it('keeps historical publish records without delivery evidence readable', async () => {
+    setMobile(false)
+    const current = proposalDetail('completed')
+    current.publish_record = {
+      id: 'publish-1', proposal_id: 'proposal-1', proposal_revision_id: 'revision-2',
+      product_id: 'product-1', store_id: 'store-1', approved_by: 'supervisor-1',
+      approval_action_id: 'action-1', before_snapshot: {}, after_snapshot: {},
+      base_product_version: 7, published_product_version: 8,
+      published_at: '2026-09-03T09:00:00Z',
+      platform_delivery: null,
+    }
+    vi.stubGlobal('fetch', async () => response(current))
+
+    const { wrapper } = await mountProposal()
+    await flushPromises()
+
+    expect(wrapper.get('[data-test="publish-record"]').text()).toContain('本地模拟发布结果')
+    expect(wrapper.find('[data-test="platform-delivery"]').exists()).toBe(false)
     wrapper.unmount()
   })
 })

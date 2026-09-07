@@ -597,6 +597,13 @@ export async function installApiFixture(page: Page): Promise<ApiFixtureControlle
           base_product_version: 7,
           published_product_version: 8,
           published_at: '2026-09-03T08:00:00Z',
+          platform_delivery: {
+            status: 'succeeded',
+            attempt_count: 1,
+            external_operation_id: 'operation-1',
+            error_code: null,
+            completed_at: '2026-09-03T08:00:01Z',
+          },
         }
         await respond(route, state.publishRecord)
         return

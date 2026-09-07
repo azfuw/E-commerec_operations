@@ -16,7 +16,7 @@ import ManualRevisionForm from '../components/ManualRevisionForm.vue'
 import ProposalDiff from '../components/ProposalDiff.vue'
 import { buildManualRevisionRequest } from '../manualRevision'
 import type { ManualRevisionFormValue } from '../manualRevision'
-import type { ProposalDetail, WorkflowRun, WorkflowStatus } from '../types'
+import type { PlatformDelivery, ProposalDetail, WorkflowRun, WorkflowStatus } from '../types'
 import { session } from '../session'
 import { useSerialPoll } from '../useSerialPoll'
 
@@ -59,6 +59,15 @@ const showApprovalActions = computed(
     ),
 )
 const publishFields = ['title', 'selling_points', 'description', 'search_keywords', 'attributes']
+const platformStatusText: Record<PlatformDelivery['status'], string> = {
+  pending: '等待平台投递',
+  processing: '正在投递平台',
+  succeeded: '平台投递成功',
+  failed: '平台投递失败',
+}
+const platformErrorText: Record<string, string> = {
+  PLATFORM_TEMPORARILY_UNAVAILABLE: '平台暂时不可用',
+}
 
 function displaySnapshot(value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value)
@@ -283,6 +292,28 @@ onMounted(() => void loadProposal())
             </div>
           </div>
           <p><strong>价格、SKU、库存与真实平台均未变化。</strong></p>
+          <div
+            v-if="detail.publish_record.platform_delivery"
+            class="platform-delivery"
+            data-test="platform-delivery"
+          >
+            <h3>平台投递状态</h3>
+            <p>投递目标：合同模拟器</p>
+            <p>{{ platformStatusText[detail.publish_record.platform_delivery.status] }}</p>
+            <p>尝试次数 {{ detail.publish_record.platform_delivery.attempt_count }}</p>
+            <p v-if="detail.publish_record.platform_delivery.external_operation_id">
+              外部操作编号 {{ detail.publish_record.platform_delivery.external_operation_id }}
+            </p>
+            <p v-if="detail.publish_record.platform_delivery.completed_at">
+              完成时间 {{ detail.publish_record.platform_delivery.completed_at }}
+            </p>
+            <p
+              v-if="detail.publish_record.platform_delivery.error_code"
+              data-test="platform-delivery-error"
+            >
+              {{ platformErrorText[detail.publish_record.platform_delivery.error_code] ?? '平台投递失败' }}
+            </p>
+          </div>
         </section>
       </template>
     </template>
@@ -346,6 +377,12 @@ onMounted(() => void loadProposal())
 .publish-record h2,
 .publish-record h3 {
   margin-top: 0;
+}
+
+.platform-delivery {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #86a69f;
 }
 
 .publish-diff {

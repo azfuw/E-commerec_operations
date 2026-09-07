@@ -314,6 +314,14 @@ export type ApprovalAction = {
   created_at: string
 }
 
+export type PlatformDelivery = {
+  status: 'pending' | 'processing' | 'succeeded' | 'failed'
+  attempt_count: number
+  external_operation_id: string | null
+  error_code: string | null
+  completed_at: string | null
+}
+
 export type PublishRecord = {
   id: string
   proposal_id: string
@@ -327,6 +335,7 @@ export type PublishRecord = {
   base_product_version: number
   published_product_version: number
   published_at: string
+  platform_delivery: PlatformDelivery | null
 }
 
 export type ApprovalListItem = {

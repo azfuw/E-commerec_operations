@@ -78,6 +78,8 @@ if (isVitest) {
     await expect(page.locator('[data-test="publish-record"]')).toContainText(
       '价格、SKU、库存与真实平台均未变化',
     )
+    await expect(page.locator('[data-test="platform-delivery"]')).toContainText('平台投递成功')
+    await expect(page.locator('[data-test="platform-delivery"]')).toContainText('operation-1')
     fixture.assertProtocol()
   })
 
