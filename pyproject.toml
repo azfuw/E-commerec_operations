@@ -36,5 +36,6 @@ testpaths = ["tests"]
 markers = [
   "postgres_integration: requires the configured local PostgreSQL service",
   "deepseek_smoke: explicit real deepseek-v4-flash smoke test",
+  "phase10_deepseek: explicit bounded Phase 10 real DeepSeek contract gate",
   "knowledge_integration: requires configured local PostgreSQL, Milvus, and local BGE model paths",
 ]

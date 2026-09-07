@@ -183,6 +183,7 @@ class DeepSeekAnalysisClient:
         *,
         call_type: AgentCallType,
         before_http_attempt: BeforeHttpAttempt | None = None,
+        max_attempts: int = 3,
     ) -> AgentInvocation:
         instruction = (
             "Return JSON candidates with only product_id, rank, impact_explanation, reason, "
@@ -204,6 +205,7 @@ class DeepSeekAnalysisClient:
             user_payload={"facts": facts.model_dump(mode="json")},
             parse_response=parse_agent_response,
             before_http_attempt=renew if before_http_attempt is not None else None,
+            max_attempts=max_attempts,
         )
         return AgentInvocation(
             response=result.response,
