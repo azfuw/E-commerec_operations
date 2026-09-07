@@ -118,7 +118,7 @@ async def test_knowledge_vertical_slice(monkeypatch) -> None:
     )
     from backend.knowledge_search import search_active_knowledge
     from backend.knowledge_worker import run_once
-    from backend.models import KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion, User
+    from backend.models import AuditEvent, KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion, User
 
     settings = get_settings()
     demo_bytes = Path("data/knowledge/demo/platform-neutral-rules.md").read_bytes()
@@ -267,6 +267,19 @@ async def test_knowledge_vertical_slice(monkeypatch) -> None:
                 exhausted_state.status,
                 exhausted_state.error_code,
             ) == (KnowledgeVersionStatus.FAILED, "KNOWLEDGE_ATTEMPTS_EXHAUSTED")
+
+            # Finished claim fixtures must not expire and compete with later real-model work.
+            await session.execute(
+                delete(KnowledgeDocumentVersion).where(
+                    KnowledgeDocumentVersion.id.in_((first.id, second.id))
+                )
+            )
+            await session.execute(
+                delete(KnowledgeDocument).where(
+                    KnowledgeDocument.id.in_((first_document_id, second_document_id))
+                )
+            )
+            await session.commit()
 
         models = LocalKnowledgeModels(
             embedding_model_path=settings.knowledge_embedding_model_path,
@@ -466,6 +479,7 @@ async def test_knowledge_vertical_slice(monkeypatch) -> None:
                 )
             if document_ids:
                 await session.execute(delete(KnowledgeDocument).where(KnowledgeDocument.id.in_(document_ids)))
+            await session.execute(delete(AuditEvent).where(AuditEvent.actor_id == actor_id))
             await session.execute(delete(User).where(User.id == actor_id))
             await session.commit()
         for path in stored_paths:
