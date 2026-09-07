@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     milvus_collection: str = "knowledge_chunks"
     knowledge_lease_seconds: int = 60
     knowledge_dependency_timeout_seconds: float = 30.0
+    platform_base_url: str | None = None
+    platform_client_id: SecretStr | None = None
+    platform_client_secret: SecretStr | None = None
+    platform_webhook_secret: SecretStr | None = None
+    platform_timeout_seconds: float = 10.0
+    platform_delivery_lease_seconds: int = 60
 
 
 @lru_cache
