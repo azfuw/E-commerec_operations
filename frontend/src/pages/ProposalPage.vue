@@ -298,7 +298,7 @@ onMounted(() => void loadProposal())
             data-test="platform-delivery"
           >
             <h3>平台投递状态</h3>
-            <p>投递目标：合同模拟器</p>
+            <p>投递目标：契约模拟器</p>
             <p>{{ platformStatusText[detail.publish_record.platform_delivery.status] }}</p>
             <p>尝试次数 {{ detail.publish_record.platform_delivery.attempt_count }}</p>
             <p v-if="detail.publish_record.platform_delivery.external_operation_id">
