@@ -8,9 +8,35 @@ from typing import Annotated
 
 from fastapi import FastAPI, Form, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from backend.platform_client import _ListingPatch
+
+class _SimulatorListingPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    title: str | None = Field(default=None, min_length=1, max_length=60)
+    selling_points: list[Annotated[str, Field(min_length=1, max_length=80)]] | None = Field(
+        default=None, min_length=1, max_length=5
+    )
+    description: str | None = Field(default=None, min_length=1, max_length=10428)
+    keywords: list[Annotated[str, Field(min_length=1, max_length=32)]] | None = Field(
+        default=None, min_length=1, max_length=20
+    )
+    attribute_completions: dict[str, str | int | float | bool | None] | None = Field(
+        default=None, max_length=50
+    )
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> "_SimulatorListingPatch":
+        if not self.model_fields_set or any(
+            getattr(self, field) is None for field in self.model_fields_set
+        ):
+            raise ValueError("empty or null patch")
+        if self.attribute_completions is not None:
+            for key, value in self.attribute_completions.items():
+                if not 1 <= len(key) <= 64 or isinstance(value, str) and len(value) > 512:
+                    raise ValueError("invalid attribute completion")
+        return self
 
 
 def create_platform_simulator(*, fault: str | None = None) -> FastAPI:
@@ -21,6 +47,9 @@ def create_platform_simulator(*, fault: str | None = None) -> FastAPI:
     app.state.mutation_count = 0
     app.state.operations = {}
     app.state.disconnect_used = False
+    app.state.issued_tokens = set()
+    expected_client_id = os.getenv("PLATFORM_CLIENT_ID", "client-id")
+    expected_client_secret = os.getenv("PLATFORM_CLIENT_SECRET", "client-secret")
 
     @app.get("/health/live")
     async def health() -> dict[str, str]:
@@ -28,18 +57,28 @@ def create_platform_simulator(*, fault: str | None = None) -> FastAPI:
 
     @app.post("/oauth/token")
     async def token(
-        client_id: Annotated[str, Form()], client_secret: Annotated[str, Form()]
+        client_id: Annotated[str, Form()],
+        client_secret: Annotated[str, Form()],
+        grant_type: Annotated[str, Form()],
     ) -> dict[str, str]:
-        if not client_id or not client_secret:
+        if (
+            client_id != expected_client_id
+            or client_secret != expected_client_secret
+            or grant_type != "client_credentials"
+        ):
             raise HTTPException(401)
         app.state.token_requests += 1
+        access_token = f"token-{app.state.token_requests}"
+        app.state.issued_tokens.add(access_token)
         return {
-            "access_token": f"token-{app.state.token_requests}",
+            "access_token": access_token,
             "token_type": "bearer",
         }
 
     def authorize(authorization: str | None) -> None:
-        if not authorization or not authorization.startswith("Bearer token-"):
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(401)
+        if authorization.removeprefix("Bearer ") not in app.state.issued_tokens:
             raise HTTPException(401)
 
     @app.put("/v1/stores/{store_id}/listings/{product_id}")
@@ -69,7 +108,9 @@ def create_platform_simulator(*, fault: str | None = None) -> FastAPI:
         ):
             raise HTTPException(422)
         try:
-            payload = _ListingPatch.model_validate(await request.json()).model_dump(exclude_none=True)
+            payload = _SimulatorListingPatch.model_validate(await request.json()).model_dump(
+                exclude_none=True
+            )
         except (ValueError, ValidationError):
             raise HTTPException(422) from None
         digest = hashlib.sha256(

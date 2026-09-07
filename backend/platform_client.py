@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Annotated
 
 import httpx
@@ -31,18 +32,20 @@ class _ListingPatch(BaseModel):
     selling_points: list[Annotated[str, Field(min_length=1, max_length=80)]] | None = Field(
         default=None, min_length=1, max_length=5
     )
-    description: str | None = Field(default=None, min_length=1, max_length=10420)
+    description: str | None = Field(default=None, min_length=1, max_length=10428)
     keywords: list[Annotated[str, Field(min_length=1, max_length=32)]] | None = Field(
         default=None, min_length=1, max_length=20
     )
     attribute_completions: dict[str, str | int | float | bool | None] | None = Field(
-        default=None, max_length=20
+        default=None, max_length=50
     )
 
     @model_validator(mode="after")
     def validate_patch(self) -> "_ListingPatch":
         if not self.model_fields_set:
             raise ValueError("empty patch")
+        if any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("null patch field")
         if self.attribute_completions is not None:
             for key, value in self.attribute_completions.items():
                 if not 1 <= len(key) <= 64 or isinstance(value, str) and len(value) > 512:
@@ -83,29 +86,44 @@ class CommercePlatformClient:
         client_secret = self._settings.platform_client_secret
         if not self._settings.platform_base_url or client_id is None or client_secret is None:
             raise PlatformClientError("PLATFORM_REQUEST_INVALID", False)
-        try:
-            response = await self._client.post(
-                "/oauth/token",
-                data={
-                    "client_id": client_id.get_secret_value(),
-                    "client_secret": client_secret.get_secret_value(),
-                    "grant_type": "client_credentials",
-                },
-            )
-        except httpx.TimeoutException as exc:
-            raise PlatformClientError("PLATFORM_TIMEOUT", True) from exc
-        except httpx.TransportError as exc:
-            raise PlatformClientError("PLATFORM_CONNECTION_FAILED", True) from exc
+        response = await self._request(
+            "POST",
+            "/oauth/token",
+            data={
+                "client_id": client_id.get_secret_value(),
+                "client_secret": client_secret.get_secret_value(),
+                "grant_type": "client_credentials",
+            },
+        )
         if response.status_code != 200:
+            if response.status_code == 429:
+                raise self._status_error(response)
+            if 500 <= response.status_code <= 599:
+                raise self._status_error(response)
             raise PlatformClientError("PLATFORM_AUTH_FAILED", False)
+        invalid = False
         try:
             token = _TokenResponse.model_validate(response.json())
             if token.token_type.lower() != "bearer":
                 raise ValueError
-        except (ValueError, ValidationError) as exc:
-            raise PlatformClientError("PLATFORM_RESPONSE_INVALID", False) from exc
+        except (ValueError, ValidationError):
+            invalid = True
+        if invalid:
+            raise PlatformClientError("PLATFORM_RESPONSE_INVALID", False)
         self._access_token = token.access_token
         return token.access_token
+
+    async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        error: PlatformClientError | None = None
+        try:
+            return await self._client.request(method, url, **kwargs)
+        except httpx.TimeoutException:
+            error = PlatformClientError("PLATFORM_TIMEOUT", True)
+        except httpx.TransportError:
+            error = PlatformClientError("PLATFORM_CONNECTION_FAILED", True)
+        except Exception:
+            error = PlatformClientError("PLATFORM_CONNECTION_FAILED", True)
+        raise error
 
     async def _post_listing(
         self,
@@ -115,18 +133,12 @@ class CommercePlatformClient:
         payload: dict[str, object],
         idempotency_key: str,
     ) -> httpx.Response:
-        try:
-            return await self._client.put(
-                f"/v1/stores/{store_id}/listings/{product_id}",
-                headers={"Authorization": f"Bearer {token}", "Idempotency-Key": idempotency_key},
-                json=payload,
-            )
-        except httpx.TimeoutException as exc:
-            raise PlatformClientError("PLATFORM_TIMEOUT", True) from exc
-        except httpx.TransportError as exc:
-            raise PlatformClientError("PLATFORM_CONNECTION_FAILED", True) from exc
-        except Exception as exc:
-            raise PlatformClientError("PLATFORM_CONNECTION_FAILED", True) from exc
+        return await self._request(
+            "PUT",
+            f"/v1/stores/{store_id}/listings/{product_id}",
+            headers={"Authorization": f"Bearer {token}", "Idempotency-Key": idempotency_key},
+            json=payload,
+        )
 
     async def publish_listing(
         self,
@@ -136,14 +148,19 @@ class CommercePlatformClient:
         payload: dict[str, object],
         idempotency_key: str,
     ) -> PlatformPublishResult:
+        invalid = False
         try:
-            if not 1 <= len(store_id) <= 36 or not 1 <= len(product_id) <= 36:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,35}", store_id) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_-]{0,35}", product_id
+            ):
                 raise ValueError
             if len(idempotency_key) != 64 or any(c not in "0123456789abcdef" for c in idempotency_key):
                 raise ValueError
             validated = _ListingPatch.model_validate(payload).model_dump(exclude_none=True)
-        except (TypeError, ValueError, ValidationError) as exc:
-            raise PlatformClientError("PLATFORM_REQUEST_INVALID", False) from exc
+        except (TypeError, ValueError, ValidationError):
+            invalid = True
+        if invalid:
+            raise PlatformClientError("PLATFORM_REQUEST_INVALID", False)
 
         token = await self._token()
         response = await self._post_listing(
@@ -166,17 +183,26 @@ class CommercePlatformClient:
         if status == 409:
             raise PlatformClientError("PLATFORM_IDEMPOTENCY_CONFLICT", False)
         if status == 429:
-            retry_after = response.headers.get("Retry-After", "")
-            seconds = int(retry_after) if retry_after.isdigit() else -1
-            raise PlatformClientError(
-                "PLATFORM_RATE_LIMITED", True, seconds if 0 <= seconds <= 60 else None
-            )
+            raise CommercePlatformClient._status_error(response)
         if 500 <= status <= 599:
             raise PlatformClientError("PLATFORM_SERVER_ERROR", True)
         if not 200 <= status <= 299:
             raise PlatformClientError("PLATFORM_REQUEST_REJECTED", False)
+        invalid = False
         try:
             parsed = _PublishResponse.model_validate(response.json())
-        except (ValueError, ValidationError) as exc:
-            raise PlatformClientError("PLATFORM_RESPONSE_INVALID", False) from exc
+        except (ValueError, ValidationError):
+            invalid = True
+        if invalid:
+            raise PlatformClientError("PLATFORM_RESPONSE_INVALID", False)
         return PlatformPublishResult(parsed.external_operation_id)
+
+    @staticmethod
+    def _status_error(response: httpx.Response) -> PlatformClientError:
+        if response.status_code == 429:
+            value = response.headers.get("Retry-After", "")
+            seconds = int(value) if len(value) <= 2 and value.isascii() and value.isdecimal() else -1
+            return PlatformClientError(
+                "PLATFORM_RATE_LIMITED", True, seconds if 0 <= seconds <= 60 else None
+            )
+        return PlatformClientError("PLATFORM_SERVER_ERROR", True)

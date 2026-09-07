@@ -139,6 +139,122 @@ async def test_client_rejects_unsafe_operation_id_as_invalid_response() -> None:
     await client.aclose()
 
 
+async def test_client_error_does_not_retain_secret_bearing_cause_or_context() -> None:
+    secret = "oauth-private-secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"failed request containing {secret}", request=request)
+
+    configured = settings().model_copy(
+        update={"platform_client_secret": SecretStr(secret)}
+    )
+    client = CommercePlatformClient(configured, transport=httpx.MockTransport(handler))
+    with pytest.raises(PlatformClientError) as raised:
+        await client.publish_listing(
+            store_id="store-1",
+            product_id="product-1",
+            payload={"title": "已审批标题"},
+            idempotency_key="6" * 64,
+        )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert secret not in repr(raised.value)
+    await client.aclose()
+
+
+@pytest.mark.parametrize("payload", [{"title": None}, {"title": "已审批标题", "keywords": None}])
+async def test_client_rejects_explicit_null_fields(payload: dict[str, object]) -> None:
+    client = CommercePlatformClient(settings(), transport=httpx.MockTransport(lambda _: None))
+    with pytest.raises(PlatformClientError) as raised:
+        await client.publish_listing(
+            store_id="store-1",
+            product_id="product-1",
+            payload=payload,
+            idempotency_key="5" * 64,
+        )
+    assert raised.value.code == "PLATFORM_REQUEST_INVALID"
+    await client.aclose()
+
+
+async def test_client_accepts_maximum_flattened_description_and_attributes() -> None:
+    app = create_platform_simulator()
+    client = CommercePlatformClient(settings(), transport=httpx.ASGITransport(app=app))
+    result = await client.publish_listing(
+        store_id="store-1",
+        product_id="product-1",
+        payload={
+            "description": "中" * 10428,
+            "attribute_completions": {f"属性{index}": "值" for index in range(50)},
+        },
+        idempotency_key="4" * 64,
+    )
+    assert result.external_operation_id.startswith("operation-")
+    await client.aclose()
+
+
+@pytest.mark.parametrize("identifier", ["../oauth", "a/b", "a?b", "a#b"])
+async def test_client_rejects_path_unsafe_identifiers(identifier: str) -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200)
+
+    client = CommercePlatformClient(settings(), transport=httpx.MockTransport(handler))
+    with pytest.raises(PlatformClientError) as raised:
+        await client.publish_listing(
+            store_id=identifier,
+            product_id="product-1",
+            payload={"title": "已审批标题"},
+            idempotency_key="3" * 64,
+        )
+    assert (raised.value.code, requests) == ("PLATFORM_REQUEST_INVALID", 0)
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "retryable"),
+    [(429, "PLATFORM_RATE_LIMITED", True), (500, "PLATFORM_SERVER_ERROR", True)],
+)
+async def test_token_endpoint_preserves_retryable_status_semantics(
+    status: int, code: str, retryable: bool
+) -> None:
+    client = CommercePlatformClient(
+        settings(), transport=httpx.MockTransport(lambda _: httpx.Response(status))
+    )
+    with pytest.raises(PlatformClientError) as raised:
+        await client.publish_listing(
+            store_id="store-1",
+            product_id="product-1",
+            payload={"title": "已审批标题"},
+            idempotency_key="2" * 64,
+        )
+    assert (raised.value.code, raised.value.retryable) == (code, retryable)
+    await client.aclose()
+
+
+async def test_oversized_retry_after_is_safely_ignored() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth/token":
+            return httpx.Response(200, json={"access_token": "token-1", "token_type": "bearer"})
+        return httpx.Response(429, headers={"Retry-After": "9" * 5000})
+
+    client = CommercePlatformClient(settings(), transport=httpx.MockTransport(handler))
+    with pytest.raises(PlatformClientError) as raised:
+        await client.publish_listing(
+            store_id="store-1",
+            product_id="product-1",
+            payload={"title": "已审批标题"},
+            idempotency_key="1" * 64,
+        )
+    assert (raised.value.code, raised.value.retry_after_seconds) == (
+        "PLATFORM_RATE_LIMITED",
+        None,
+    )
+    await client.aclose()
+
+
 @pytest.mark.parametrize(
     "changes",
     [

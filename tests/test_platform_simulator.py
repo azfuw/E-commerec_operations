@@ -15,7 +15,12 @@ from tests.support.platform_simulator import create_platform_simulator
 
 async def _token(client: httpx.AsyncClient) -> str:
     response = await client.post(
-        "/oauth/token", data={"client_id": "client-id", "client_secret": "client-secret"}
+        "/oauth/token",
+        data={
+            "client_id": "client-id",
+            "client_secret": "client-secret",
+            "grant_type": "client_credentials",
+        },
     )
     return response.json()["access_token"]
 
@@ -85,6 +90,42 @@ async def test_simulator_supports_numeric_fault_names(fault: str, status: int) -
             json={"title": "已审批标题"},
         )
     assert response.status_code == status
+
+
+async def test_simulator_independently_rejects_bad_oauth_and_unissued_tokens() -> None:
+    app = create_platform_simulator()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://platform.test"
+    ) as client:
+        wrong_secret = await client.post(
+            "/oauth/token",
+            data={
+                "client_id": "client-id",
+                "client_secret": "wrong",
+                "grant_type": "client_credentials",
+            },
+        )
+        wrong_grant = await client.post(
+            "/oauth/token",
+            data={
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "grant_type": "password",
+            },
+        )
+        unissued = await client.put(
+            "/v1/stores/store-1/listings/product-1",
+            headers={"Authorization": "Bearer token-999", "Idempotency-Key": "0" * 64},
+            json={"title": "已审批标题"},
+        )
+        token = await _token(client)
+        null_field = await client.put(
+            "/v1/stores/store-1/listings/product-1",
+            headers={"Authorization": f"Bearer {token}", "Idempotency-Key": "0" * 64},
+            json={"title": None},
+        )
+    assert wrong_secret.status_code == wrong_grant.status_code == unissued.status_code == 401
+    assert null_field.status_code == 422
 
 
 def _free_port() -> int:
