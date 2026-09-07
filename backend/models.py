@@ -970,7 +970,10 @@ class PlatformWebhookReceipt(Base):
     __table_args__ = (
         UniqueConstraint("event_id", name="uq_platform_webhook_receipts_event_id"),
         CheckConstraint("event_type = 'publish.confirmed'", name="ck_platform_webhook_receipts_event_type"),
-        CheckConstraint("payload_digest ~ '^[0-9a-f]{64}$'", name="ck_platform_webhook_receipts_payload_digest"),
+        CheckConstraint(
+            "length(payload_digest) = 64 AND trim(payload_digest, '0123456789abcdef') = ''",
+            name="ck_platform_webhook_receipts_payload_digest",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))

@@ -1,5 +1,9 @@
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
+
 from backend.common import AuditEventType, PlatformDeliveryStatus
-from backend.models import PlatformDelivery, PlatformWebhookReceipt
+from backend.models import Base, PlatformDelivery, PlatformWebhookReceipt
 
 
 def _constraint_names(model) -> set[str]:
@@ -43,3 +47,34 @@ def test_webhook_receipt_and_audit_contract_are_closed() -> None:
         AuditEventType.PLATFORM_DELIVERY_FAILED,
         AuditEventType.PLATFORM_WEBHOOK_RECEIVED,
     } <= set(AuditEventType)
+
+
+def test_webhook_digest_constraint_accepts_only_lowercase_hex_on_sqlite() -> None:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            PlatformWebhookReceipt.__table__.insert().values(
+                id="receipt-valid",
+                platform_delivery_id="delivery-1",
+                event_id="event-valid",
+                event_type="publish.confirmed",
+                payload_digest="a" * 64,
+            )
+        )
+
+    for index, digest in enumerate(("a" * 63, "A" * 64, "g" * 64)):
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    PlatformWebhookReceipt.__table__.insert().values(
+                        id=f"receipt-invalid-{index}",
+                        platform_delivery_id="delivery-1",
+                        event_id=f"event-invalid-{index}",
+                        event_type="publish.confirmed",
+                        payload_digest=digest,
+                    )
+                )
+
+    engine.dispose()
