@@ -316,6 +316,16 @@ class PlatformDeliveryView(BaseModel):
     completed_at: datetime | None
 
 
+class PlatformWebhookPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    event_type: Literal["publish.confirmed"]
+    delivery_id: str = Field(min_length=1, max_length=36)
+    external_operation_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
+    )
+
+
 class PublishRecordView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

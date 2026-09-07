@@ -1,5 +1,10 @@
+import asyncio
+import hashlib
+import hmac
 import importlib.util
+import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -8,8 +13,11 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from backend.database import engine
+from backend.platform_webhooks import receive_platform_webhook
 
 
 pytestmark = pytest.mark.skipif(
@@ -173,3 +181,150 @@ async def test_phase10_migration_enforces_delivery_and_webhook_constraints() -> 
         finally:
             if transaction.is_active:
                 await transaction.rollback()
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.postgres_integration
+async def test_webhook_exact_duplicate_unique_race_writes_once() -> None:
+    schema = f"phase10_webhook_{uuid4().hex}"
+    quoted_schema = f'"{schema}"'
+    ids = {name: f"{name}-{uuid4().hex[:12]}" for name in (
+        "user", "store", "product", "analysis", "optimization", "candidate",
+        "proposal", "revision", "action", "publish", "delivery",
+    )}
+    secret = "postgres-webhook-secret"
+    timestamp = str(int(datetime.now(UTC).timestamp()))
+    body = json.dumps(
+        {
+            "event_type": "publish.confirmed",
+            "delivery_id": ids["delivery"],
+            "external_operation_id": "operation-1",
+        },
+        separators=(",", ":"),
+    ).encode()
+    signature = hmac.new(
+        secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256
+    ).hexdigest()
+
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(sa.text(f"CREATE SCHEMA {quoted_schema}"))
+            await connection.execute(sa.text(f"SET LOCAL search_path TO {quoted_schema}"))
+
+            def run_migration(sync, action):
+                with Operations.context(MigrationContext.configure(sync)):
+                    action()
+
+            for migration in _migrations():
+                await connection.run_sync(run_migration, migration.upgrade)
+
+        scoped_engine = create_async_engine(
+            engine.url,
+            poolclass=NullPool,
+            connect_args={"server_settings": {"search_path": schema}},
+        )
+        factory = async_sessionmaker(scoped_engine, expire_on_commit=False)
+        try:
+            async with factory() as session:
+                statements = [
+                    (
+                        "INSERT INTO users (id,username,password_hash,role,status,created_at) "
+                        "VALUES (:user,:user,'test','supervisor','active',now())",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO stores (id,name,code,enabled,created_at) "
+                        "VALUES (:store,'Webhook',:store,true,now())",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO products (id,store_id,code,title,category,brand,selling_points,"
+                        "description,search_keywords,attributes,current_version,enabled) VALUES "
+                        "(:product,:store,:product,'Webhook','test','', '[]','', '[]','{}',2,true)",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO workflow_runs (id,workflow_type,store_id,created_by,start_date,end_date,"
+                        "status,quality_status,attempt_count,input,output,quality,created_at,updated_at) VALUES "
+                        "(:analysis,'analysis',:store,:user,CURRENT_DATE,CURRENT_DATE,'completed','normal',0,"
+                        "'{}','{}','{}',now(),now()), "
+                        "(:optimization,'optimization',:store,:user,NULL,NULL,'completed','normal',0,"
+                        "'{}','{}','{}',now(),now())",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO analysis_candidates (id,workflow_run_id,product_id,rank,product_code,"
+                        "anomaly_types,metrics,business_impact,evidence,impact_explanation,reason,"
+                        "recommended_action,confidence,created_at,updated_at) VALUES "
+                        "(:candidate,:analysis,:product,1,:product,'[]','{}',0,'[]','test','test','test',1,now(),now())",
+                        ids,
+                    ),
+                    (
+                        "INSERT INTO product_proposals (id,analysis_run_id,analysis_candidate_id,optimization_run_id,"
+                        "store_id,product_id,base_product_version,selection_idempotency_hash,created_at,updated_at) "
+                        "VALUES (:proposal,:analysis,:candidate,:optimization,:store,:product,1,:hash,now(),now())",
+                        {**ids, "hash": "a" * 64},
+                    ),
+                    (
+                        "INSERT INTO proposal_revisions (id,proposal_id,iteration,revision_number,origin,created_by,"
+                        "base_product_version,trusted_fact_hash,proposal_output,citations,created_at) VALUES "
+                        "(:revision,:proposal,0,1,'agent',:user,1,:hash,'{}','[]',now())",
+                        {**ids, "hash": "b" * 64},
+                    ),
+                    (
+                        "INSERT INTO approval_actions (id,proposal_id,proposal_revision_id,store_id,actor_id,actor_role,"
+                        "action,comment,idempotency_key_hash,request_hash,created_at) VALUES "
+                        "(:action,:proposal,:revision,:store,:user,'supervisor','approve',NULL,:key_hash,:request_hash,now())",
+                        {**ids, "key_hash": "c" * 64, "request_hash": "d" * 64},
+                    ),
+                    (
+                        "INSERT INTO publish_records (id,proposal_id,proposal_revision_id,product_id,store_id,approved_by,"
+                        "approval_action_id,publish_idempotency_hash,before_snapshot,after_snapshot,base_product_version,"
+                        "published_product_version,published_at) VALUES "
+                        "(:publish,:proposal,:revision,:product,:store,:user,:action,:hash,'{}','{}',1,2,now())",
+                        {**ids, "hash": "e" * 64},
+                    ),
+                    (
+                        "INSERT INTO platform_deliveries (id,publish_record_id,store_id,provider,status,attempt_count,"
+                        "external_operation_id,created_at,updated_at,completed_at) VALUES "
+                        "(:delivery,:publish,:store,'contract_simulator','succeeded',1,'operation-1',now(),now(),now())",
+                        ids,
+                    ),
+                ]
+                for statement, parameters in statements:
+                    await session.execute(sa.text(statement), parameters)
+                await session.commit()
+
+            barrier = asyncio.Barrier(2)
+
+            async def receive() -> bool:
+                async with factory() as session:
+                    commit = session.commit
+
+                    async def synchronized_commit() -> None:
+                        await barrier.wait()
+                        await commit()
+
+                    session.commit = synchronized_commit
+                    return await receive_platform_webhook(
+                        session,
+                        body=body,
+                        event_id="event-race",
+                        timestamp=timestamp,
+                        signature=signature,
+                        secret=secret,
+                    )
+
+            assert sorted(await asyncio.gather(receive(), receive())) == [False, True]
+            async with factory() as session:
+                assert await session.scalar(sa.text(
+                    "SELECT count(*) FROM platform_webhook_receipts WHERE event_id='event-race'"
+                )) == 1
+                assert await session.scalar(sa.text(
+                    "SELECT count(*) FROM audit_events WHERE event_type='platform_webhook_received'"
+                )) == 1
+        finally:
+            await scoped_engine.dispose()
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(sa.text(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE"))

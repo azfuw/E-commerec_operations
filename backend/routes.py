@@ -3,7 +3,7 @@ from time import perf_counter
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Body, Depends, Form, Header, HTTPException, Path, Query, Response, UploadFile, status
+from fastapi import APIRouter, Body, Depends, Form, Header, HTTPException, Path, Query, Request, Response, UploadFile, status
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -77,6 +77,11 @@ from backend.proposals import (
     get_proposal_for_actor,
     select_product_for_optimization,
 )
+from backend.platform_webhooks import (
+    MAX_WEBHOOK_BODY_BYTES,
+    PlatformWebhookError,
+    receive_platform_webhook,
+)
 from backend.schemas import (
     AccessToken,
     AnalysisCandidateView,
@@ -137,6 +142,69 @@ def _publish_record_view(
             else PlatformDeliveryView.model_validate(delivery)
         ),
     )
+
+
+async def _bounded_webhook_body(request: Request) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_WEBHOOK_BODY_BYTES:
+            raise PlatformWebhookError("PLATFORM_WEBHOOK_TOO_LARGE", 413)
+        body.extend(chunk)
+    return bytes(body)
+
+
+async def _rollback_webhook(session: AsyncSession) -> None:
+    try:
+        await session.rollback()
+    except SQLAlchemyError:
+        pass
+
+
+@router.post("/integrations/platform/webhooks", status_code=status.HTTP_201_CREATED)
+async def platform_webhook_route(
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, bool]:
+    content_type = request.headers.get("content-type", "")
+    try:
+        if (
+            len(content_type) > 64
+            or content_type.partition(";")[0].strip().lower() != "application/json"
+        ):
+            raise PlatformWebhookError(
+                "PLATFORM_WEBHOOK_CONTENT_TYPE_INVALID",
+                status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            )
+        body = await _bounded_webhook_body(request)
+        configured_secret = settings.platform_webhook_secret
+        created = await receive_platform_webhook(
+            session,
+            body=body,
+            event_id=request.headers.get("x-event-id", ""),
+            timestamp=request.headers.get("x-webhook-timestamp", ""),
+            signature=request.headers.get("x-webhook-signature", ""),
+            secret=(
+                ""
+                if configured_secret is None
+                else configured_secret.get_secret_value()
+            ),
+        )
+    except PlatformWebhookError as error:
+        await _rollback_webhook(session)
+        raise HTTPException(
+            status_code=error.status_code, detail={"code": error.code}
+        ) from None
+    except SQLAlchemyError:
+        await _rollback_webhook(session)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "PLATFORM_WEBHOOK_UNAVAILABLE"},
+        ) from None
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return {"created": created}
 
 
 _logger = logging.getLogger("backend.knowledge")
