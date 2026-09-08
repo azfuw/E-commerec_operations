@@ -40,7 +40,10 @@ def _snapshot() -> dict[str, object]:
     }
 
 
-async def seed_pending_delivery(factory, *, suffix: str | None = None) -> str:
+async def seed_pending_delivery(
+    factory, *, suffix: str | None = None, product_id: str | None = None,
+    store_id: str | None = None, version: int = 8, publish_hash: str = "a" * 64,
+) -> str:
     token = suffix or uuid4().hex[:8]
     record_id = f"publish-{token}"
     delivery_id = f"delivery-{token}"
@@ -50,15 +53,15 @@ async def seed_pending_delivery(factory, *, suffix: str | None = None) -> str:
                 id=record_id,
                 proposal_id=f"proposal-{token}",
                 proposal_revision_id=f"revision-{token}",
-                product_id=f"product-{token}",
-                store_id=f"store-{token}",
+                product_id=product_id or f"product-{token}",
+                store_id=store_id or f"store-{token}",
                 approved_by=f"user-{token}",
                 approval_action_id=f"action-{token}",
-                publish_idempotency_hash="a" * 64,
-                before_snapshot={**_snapshot(), "current_version": 7},
-                after_snapshot=_snapshot(),
-                base_product_version=7,
-                published_product_version=8,
+                publish_idempotency_hash=publish_hash,
+                before_snapshot={**_snapshot(), "current_version": version - 1},
+                after_snapshot={**_snapshot(), "current_version": version},
+                base_product_version=version - 1,
+                published_product_version=version,
             )
         )
         await session.flush()
@@ -66,7 +69,7 @@ async def seed_pending_delivery(factory, *, suffix: str | None = None) -> str:
             PlatformDelivery(
                 id=delivery_id,
                 publish_record_id=record_id,
-                store_id=f"store-{token}",
+                store_id=store_id or f"store-{token}",
                 provider="contract_simulator",
                 status=PlatformDeliveryStatus.PENDING,
                 attempt_count=0,
@@ -169,6 +172,54 @@ async def test_retry_clears_lease_and_uses_capped_retry_after(
     )
     async with platform_delivery_factory() as session:
         assert await session.scalar(select(func.count(AuditEvent.id))) == 0
+
+
+@pytest.mark.parametrize("delayed", [False, True])
+@pytest.mark.parametrize("terminal", ["complete", "fail"])
+async def test_successive_versions_wait_for_predecessor_terminal_state(
+    platform_delivery_factory, delayed, terminal,
+) -> None:
+    factory = platform_delivery_factory
+    older = await seed_pending_delivery(factory, product_id="same-product", store_id="same-store")
+    async with factory() as session:
+        first = await claim_next_platform_delivery(session, lease_owner="older", lease_seconds=60)
+        assert first is not None and first.id == older
+    newer = await seed_pending_delivery(factory, product_id="same-product", store_id="same-store", version=9, publish_hash="b" * 64)
+    # Creation order cannot replace the immutable published version ordering.
+    async with factory() as session:
+        row = await session.get(PlatformDelivery, newer)
+        row.created_at = datetime.now(UTC) - timedelta(days=1)
+        await session.commit()
+    if delayed:
+        async with factory() as session:
+            assert await return_platform_delivery_for_retry(
+                session, delivery_id=older, lease_owner="older",
+                error_code="PLATFORM_CONNECTION_FAILED", retry_after_seconds=60,
+            )
+    async with factory() as session:
+        assert await claim_next_platform_delivery(session, lease_owner="newer", lease_seconds=60) is None
+
+    unrelated = await seed_pending_delivery(factory, store_id="same-store", publish_hash="c" * 64)
+    async with factory() as session:
+        other = await claim_next_platform_delivery(session, lease_owner="other", lease_seconds=60)
+        assert other is not None and other.id == unrelated
+    if delayed:
+        await make_delivery_due(factory, older)
+        async with factory() as session:
+            retried = await claim_next_platform_delivery(session, lease_owner="older", lease_seconds=60)
+            assert retried is not None and retried.id == older
+    async with factory() as session:
+        if terminal == "complete":
+            assert await complete_platform_delivery(
+                session, delivery_id=older, lease_owner="older", external_operation_id="older-operation",
+            )
+        else:
+            assert await fail_platform_delivery(
+                session, delivery_id=older, lease_owner="older", error_code="PLATFORM_FORBIDDEN",
+            )
+    async with factory() as session:
+        released = await claim_next_platform_delivery(session, lease_owner="newer", lease_seconds=60)
+        assert released is not None and released.id == newer
 
 
 @pytest.mark.parametrize("transition", ["complete", "fail"])

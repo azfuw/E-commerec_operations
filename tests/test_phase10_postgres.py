@@ -338,7 +338,8 @@ async def test_webhook_exact_duplicate_unique_race_writes_once() -> None:
 
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.postgres_integration
-async def test_platform_delivery_claim_skip_locked_reclaim_and_stale_owner_guard() -> None:
+@pytest.mark.parametrize("successive_versions", [False, True])
+async def test_platform_delivery_claim_skip_locked_reclaim_and_stale_owner_guard(successive_versions) -> None:
     schema = f"phase10_delivery_{uuid4().hex}"
     quoted_schema = f'"{schema}"'
     ids = {
@@ -413,13 +414,13 @@ async def test_platform_delivery_claim_skip_locked_reclaim_and_stale_owner_guard
                     (
                         "INSERT INTO product_proposals (id,analysis_run_id,analysis_candidate_id,optimization_run_id,"
                         "store_id,product_id,base_product_version,selection_idempotency_hash,created_at,updated_at) "
-                        "VALUES (:proposal,:analysis,:candidate,:optimization,:store,:product,1,:hash,now(),now())",
+                        "VALUES (:proposal,:analysis,:candidate,:optimization,:store,:product,:base_version,:hash,now(),now())",
                         {**ids, "hash": "a" * 64},
                     ),
                     (
                         "INSERT INTO proposal_revisions (id,proposal_id,iteration,revision_number,origin,created_by,"
                         "base_product_version,trusted_fact_hash,proposal_output,citations,created_at) VALUES "
-                        "(:revision,:proposal,0,1,'agent',:user,1,:hash,'{}','[]',now())",
+                        "(:revision,:proposal,0,1,'agent',:user,:base_version,:hash,'{}','[]',now())",
                         {**ids, "hash": "b" * 64},
                     ),
                     (
@@ -432,7 +433,7 @@ async def test_platform_delivery_claim_skip_locked_reclaim_and_stale_owner_guard
                         "INSERT INTO publish_records (id,proposal_id,proposal_revision_id,product_id,store_id,approved_by,"
                         "approval_action_id,publish_idempotency_hash,before_snapshot,after_snapshot,base_product_version,"
                         "published_product_version,published_at) VALUES "
-                        "(:publish,:proposal,:revision,:product,:store,:user,:action,:hash,'{}','{}',1,2,now())",
+                        "(:publish,:proposal,:revision,:product,:store,:user,:action,:hash,'{}','{}',:base_version,:published_version,now())",
                         {**ids, "hash": "e" * 64},
                     ),
                     (
@@ -443,23 +444,61 @@ async def test_platform_delivery_claim_skip_locked_reclaim_and_stale_owner_guard
                     ),
                 ]
                 for statement, parameters in statements:
-                    await session.execute(sa.text(statement), parameters)
+                    await session.execute(sa.text(statement), {**parameters, "base_version": 1, "published_version": 2})
                 await session.commit()
 
-            barrier = asyncio.Barrier(2)
-
-            async def claim(owner: str):
+            newer_ids = {name: f"{name}-{uuid4().hex[:12]}" for name in ids}
+            newer_ids.update({key: ids[key] for key in ("user", "store", "product")})
+            other_ids = {name: f"{name}-{uuid4().hex[:12]}" for name in ids}
+            other_ids.update({key: ids[key] for key in ("user", "store")})
+            if successive_versions:
                 async with factory() as session:
-                    await barrier.wait()
-                    return await claim_next_platform_delivery(
-                        session, lease_owner=owner, lease_seconds=60
-                    )
+                    # Real FK chains for the next version and an unrelated product in the same store.
+                    for record_ids, start, version in ((newer_ids, 3, 3), (other_ids, 2, 2)):
+                        for statement, parameters in statements[start:]:
+                            parameters = {**parameters, **record_ids}
+                            for key in ("hash", "key_hash", "request_hash"):
+                                if key in parameters:
+                                    parameters[key] = hashlib.sha256((key + record_ids["publish"]).encode()).hexdigest()
+                            await session.execute(sa.text(statement), {**parameters, "base_version": version - 1, "published_version": version})
+                    await session.execute(sa.text(
+                        "UPDATE products SET current_version=3 WHERE id=:product"
+                    ), ids)
+                    await session.commit()
 
-            claims = await asyncio.gather(claim("worker-a"), claim("worker-b"))
-            claimed = [delivery for delivery in claims if delivery is not None]
-            assert len(claimed) == 1
-            first_owner = claimed[0].lease_owner
-            assert first_owner in {"worker-a", "worker-b"}
+            locked, release = asyncio.Event(), asyncio.Event()
+
+            async def claim_first():
+                async with factory() as session:
+                    commit = session.commit
+
+                    async def hold_claim_lock():
+                        locked.set()
+                        await release.wait()
+                        await commit()
+
+                    session.commit = hold_claim_lock
+                    return await claim_next_platform_delivery(session, lease_owner="worker-a", lease_seconds=60)
+
+            first = asyncio.create_task(claim_first())
+            try:
+                await asyncio.wait_for(locked.wait(), timeout=10)
+                async with factory() as session:
+                    second = await asyncio.wait_for(claim_next_platform_delivery(
+                        session, lease_owner="worker-b", lease_seconds=60,
+                    ), timeout=10)
+            finally:
+                release.set()
+                first_claim = await first
+            assert first_claim is not None and first_claim.id == ids["delivery"]
+            if successive_versions:
+                assert second is not None and second.id == other_ids["delivery"]
+            else:
+                assert second is None
+            first_owner = first_claim.lease_owner
+            assert first_owner == "worker-a"
+            async with factory() as session:
+                assert await claim_next_platform_delivery(session, lease_owner="blocked", lease_seconds=60) is None
 
             async with factory() as session:
                 await session.execute(
@@ -505,6 +544,10 @@ async def test_platform_delivery_claim_skip_locked_reclaim_and_stale_owner_guard
                     None,
                     "operation-current",
                 )
+            if successive_versions:
+                async with factory() as session:
+                    released = await claim_next_platform_delivery(session, lease_owner="newer", lease_seconds=60)
+                    assert released is not None and released.id == newer_ids["delivery"]
         finally:
             await scoped_engine.dispose()
     finally:

@@ -58,8 +58,9 @@ def build_child_environment(run_id: str, *, evidence_root: Path = EVIDENCE_ROOT)
         os.environ.get("DATABASE_URL", "postgresql+asyncpg://ecommerce:ecommerce@127.0.0.1:5434/ecommerce"), run_id
     )
     # An allowlist prevents inherited API keys, proxies and opt-in flags reaching children.
-    allowed = {"PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA"}
+    allowed = {"PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "PROGRAMFILES", "PROGRAMFILES(X86)"}
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    temp = evidence_root / run_id / "temp"
     env.update({
         "PYTHONPATH": str(WORKTREE), "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1",
         "APP_ENV": "phase10_e2e", "DATABASE_URL": database_url, "LANGGRAPH_DATABASE_URL": graph_url,
@@ -86,6 +87,10 @@ def build_child_environment(run_id: str, *, evidence_root: Path = EVIDENCE_ROOT)
         "NPM_CONFIG_CACHE": str(evidence_root / run_id / "temp" / "npm-cache"),
         "PLAYWRIGHT_BROWSERS_PATH": r"D:\E-commerce_operations_env\playwright-browsers",
         "TEMP": str(evidence_root / run_id / "temp"), "TMP": str(evidence_root / run_id / "temp"),
+        # Injected Windows IMEs expand %SystemDrive%\ProgramData themselves.
+        "SYSTEMDRIVE": str(temp / "system-drive"), "PROGRAMDATA": str(temp / "system-drive" / "ProgramData"),
+        "USERPROFILE": str(temp / "profile"), "APPDATA": str(temp / "profile" / "AppData" / "Roaming"),
+        "LOCALAPPDATA": str(temp / "profile" / "AppData" / "Local"),
         "PHASE10_E2E_BASE_URL": "http://127.0.0.1:4174/app/",
         "PHASE10_EVIDENCE_DIR": str(evidence_root / run_id), "PHASE10_RUN_ID": run_id,
     })
@@ -428,6 +433,8 @@ class Runner:
         # Never adopt an old evidence directory, even with a syntactically valid run ID.
         self.evidence.mkdir(parents=True, exist_ok=False)
         (self.evidence / "temp").mkdir()
+        for key in ("USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA"):
+            Path(self.environment[key]).mkdir(parents=True, exist_ok=True)
         failed = False
         try:
             self.preflight()

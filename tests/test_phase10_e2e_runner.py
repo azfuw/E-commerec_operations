@@ -1,4 +1,6 @@
+import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -42,6 +44,34 @@ def test_environment_is_explicit_and_offline(monkeypatch):
     assert env["PYTHONPATH"].endswith("phase10-platform-delivery")
     assert env["PLAYWRIGHT_BROWSERS_PATH"] == r"D:\E-commerce_operations_env\playwright-browsers"
     assert env["TEMP"] == env["TMP"] and env["TEMP"].endswith("a1b2c3d4\\temp")
+
+
+def test_windows_profile_and_expanded_ime_cache_stay_in_run_temp(tmp_path, monkeypatch):
+    import ntpath
+
+    for key in ("SYSTEMDRIVE", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA"):
+        monkeypatch.setenv(key, "C:\\ambient-personal")
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setenv("WINDIR", r"C:\Windows")
+    env = build_child_environment("a1b2c3d4", evidence_root=tmp_path)
+    temp = tmp_path / "a1b2c3d4" / "temp"
+    for key in ("SYSTEMDRIVE", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA"):
+        assert Path(env[key]).is_relative_to(temp)
+    assert env["SYSTEMROOT"] == env["WINDIR"] == r"C:\Windows"
+    with monkeypatch.context() as child:
+        for key, value in env.items():
+            child.setenv(key, value)
+        for cache in (r"%SystemDrive%\ProgramData\SogouInput\cache", r"%USERPROFILE%\.cache", r"%APPDATA%\cache", r"%LOCALAPPDATA%\cache", r"%PROGRAMDATA%\cache"):
+            expanded = Path(ntpath.expandvars(cache))
+            assert "%" not in str(expanded)
+            assert expanded.is_absolute() and expanded.is_relative_to(temp)
+            if os.name == "nt":
+                import ctypes
+
+                buffer = ctypes.create_unicode_buffer(32768)
+                count = ctypes.windll.kernel32.ExpandEnvironmentStringsW(cache, buffer, len(buffer))
+                assert 0 < count <= len(buffer) and Path(buffer.value) == expanded
+        assert Path.home().is_relative_to(temp)
 
 
 class FakeResources:
@@ -107,6 +137,9 @@ async def test_owned_cleanup_all_failure_paths(tmp_path, monkeypatch, failure):
         assert kwargs["cwd"] == runner.worktree
         assert kwargs["stdout"] == kwargs["stderr"] == subprocess.DEVNULL
         assert kwargs["env"]["PYTHONPATH"] == str(runner.worktree)
+        for key in ("SYSTEMDRIVE", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA"):
+            directory = Path(kwargs["env"][key])
+            assert directory.is_relative_to(runner.evidence / "temp") and directory.is_dir()
         events.append("seed" if "scripts.seed_demo" in command else "start")
         name = "migrate" if "alembic" in command else "playwright" if "test:e2e" in command else str(len(children))
         running = "uvicorn" in command or any(str(c).startswith("scripts.run_") for c in command)

@@ -6,11 +6,12 @@ from datetime import datetime
 from sqlalchemy import and_, func, literal, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from backend.audit_events import add_audit_event
 from backend.common import AuditEventType, AuditOutcome, PlatformDeliveryStatus
-from backend.models import PlatformDelivery
+from backend.models import PlatformDelivery, PublishRecord
 
 
 _ERROR_CODES = frozenset(
@@ -142,11 +143,26 @@ async def claim_next_platform_delivery(
                 PlatformDelivery.lease_expires_at <= func.now(),
             ),
         )
+        older_record = aliased(PublishRecord)
+        older_delivery = aliased(PlatformDelivery)
+        predecessor = (
+            select(1)
+            .select_from(older_delivery)
+            .join(older_record, older_record.id == older_delivery.publish_record_id)
+            .where(
+                older_record.store_id == PublishRecord.store_id,
+                older_record.product_id == PublishRecord.product_id,
+                older_record.published_product_version < PublishRecord.published_product_version,
+                older_delivery.status.in_((PlatformDeliveryStatus.PENDING, PlatformDeliveryStatus.PROCESSING)),
+            )
+            .exists()
+        )
         delivery = await session.scalar(
             select(PlatformDelivery)
-            .where(eligible, PlatformDelivery.attempt_count < 3)
+            .join(PublishRecord, PublishRecord.id == PlatformDelivery.publish_record_id)
+            .where(eligible, PlatformDelivery.attempt_count < 3, ~predecessor)
             .order_by(PlatformDelivery.created_at, PlatformDelivery.id)
-            .with_for_update(skip_locked=True)
+            .with_for_update(of=PlatformDelivery, skip_locked=True)
             .limit(1)
         )
         if delivery is None:
