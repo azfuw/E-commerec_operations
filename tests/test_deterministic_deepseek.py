@@ -3,9 +3,10 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from backend.analysis_agent import parse_agent_response, validate_agent_response
-from backend.common import AgentCallType, ComplianceRiskLevel
+from backend.common import AgentCallType, ComplianceRiskLevel, WorkflowQuality, WorkflowStatus
 from backend.compliance_agent import parse_compliance_response, validate_compliance_response
 from backend.config import Settings
 from backend.optimization_agent import (
@@ -14,6 +15,9 @@ from backend.optimization_agent import (
     validate_optimization_response,
 )
 from backend.optimization_validation import validate_optimization_output
+from backend.models import AgentCall, ProposalRevision
+from backend.optimization_runs import persist_optimization_revision
+from backend.optimization_worker import run_once
 from backend.schemas import (
     AnalysisFacts,
     CanonicalRuleCitation,
@@ -25,6 +29,17 @@ from backend.schemas import (
     ValidatedRequiredChange,
 )
 from tests.support.deterministic_deepseek import create_deterministic_deepseek
+from tests.test_optimization_worker import (
+    _chain,
+    _RecordingSaver,
+    _trusted,
+    _TrustedLoader,
+    _worker_chain,
+    _worker_counts,
+    _worker_run,
+    _worker_settings,
+    optimization_worker_factory,
+)
 
 
 RULE_CHUNK = "phase10-rule-chunk-1"
@@ -292,6 +307,75 @@ async def test_actual_optimization_client_receives_editable_title_metadata() -> 
         ("fact", "product.title")
     ]
     assert validate_optimization_output(trusted, invocation.response).passed
+
+
+@pytest.mark.parametrize("omit_citations", [False, True], ids=["complete", "omitted"])
+async def test_actual_client_citations_satisfy_revision_persistence_guard(
+    session, omit_citations: bool
+) -> None:
+    chain = await _chain(session, live=True)
+    trusted = _trusted(chain)
+    app = create_deterministic_deepseek()
+    client = ProductOptimizationAgentClient(
+        _worker_settings(), transport=httpx.ASGITransport(app=app)
+    )
+    invocation = await client.request(
+        trusted, required_changes=[], call_type=AgentCallType.PRIMARY,
+        iteration=0, max_attempts=1,
+    )
+    assert invocation.response is not None
+    output = invocation.response
+    if omit_citations:
+        output = output.model_copy(update={"citations": []})
+    validate_optimization_response(trusted, [], output)
+    deterministic = validate_optimization_output(trusted, output)
+    assert deterministic.passed
+
+    result = await persist_optimization_revision(
+        session, workflow_run_id="optimization-1", lease_owner="worker-a",
+        iteration=0, trusted=trusted, output=output,
+        canonical_citations=deterministic.canonical_citations, calls=invocation.records,
+    )
+    if omit_citations:
+        assert deterministic.canonical_citations == ()
+        assert (result.disposition, result.error_code) == (
+            "failed", "OPTIMIZATION_FACT_ERROR"
+        )
+        await session.refresh(chain["run"])
+        assert (chain["run"].status, chain["run"].error_code) == (
+            WorkflowStatus.FAILED, "OPTIMIZATION_FACT_ERROR"
+        )
+        assert await session.scalar(select(ProposalRevision)) is None
+        assert await session.scalar(select(AgentCall)) is None
+    else:
+        assert (result.disposition, result.error_code) == ("created", None)
+        revision = await session.get(ProposalRevision, result.revision_id)
+        assert revision is not None
+        assert revision.citations == [
+            citation.model_dump(mode="json") for citation in trusted.canonical_rule_citations
+        ]
+        assert revision.proposal_output["citations"] == [{"chunk_id": "chunk-1"}]
+
+
+async def test_deterministic_server_worker_persists_review_and_reaches_draft(
+    optimization_worker_factory,
+) -> None:
+    chain = await _worker_chain(optimization_worker_factory)
+    app = create_deterministic_deepseek()
+    processed = await run_once(
+        optimization_worker_factory, settings=_worker_settings(), lease_owner="worker-a",
+        checkpointer=_RecordingSaver(), trusted_input_loader=_TrustedLoader(_trusted(chain)),
+        transport=httpx.ASGITransport(app=app), max_agent_attempts=1,
+    )
+    run = await _worker_run(optimization_worker_factory)
+    assert processed == "optimization-1"
+    assert (run.status, run.quality_status, run.error_code) == (
+        WorkflowStatus.DRAFT_READY, WorkflowQuality.NORMAL, None
+    )
+    assert await _worker_counts(optimization_worker_factory) == (1, 1, 2)
+    assert app.state.calls == [
+        {"kind": "optimization", "attempt": 1}, {"kind": "compliance", "attempt": 1}
+    ]
 
 
 @pytest.mark.parametrize(

@@ -175,6 +175,11 @@ def _optimization_content(payload: dict[str, object]) -> dict[str, object]:
         allowed_citations,
     )
     output = template.model_dump(mode="json")
+    output["citations"] = [
+        {"chunk_id": citation.chunk_id}
+        for citation in trusted.canonical_rule_citations
+        if citation.active and citation.applicable
+    ]
 
     if not output["title"].startswith(_RESERVED_PREFIX):
         output["title"] = ("优选" + output["title"])[:60]
