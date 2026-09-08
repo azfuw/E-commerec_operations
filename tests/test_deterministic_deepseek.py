@@ -5,9 +5,11 @@ import httpx
 import pytest
 
 from backend.analysis_agent import parse_agent_response, validate_agent_response
-from backend.common import ComplianceRiskLevel
+from backend.common import AgentCallType, ComplianceRiskLevel
 from backend.compliance_agent import parse_compliance_response, validate_compliance_response
+from backend.config import Settings
 from backend.optimization_agent import (
+    ProductOptimizationAgentClient,
     parse_optimization_response,
     validate_optimization_response,
 )
@@ -258,6 +260,40 @@ async def test_server_returns_a_production_validated_response(kind, request_body
     assert app.state.calls == [{"kind": kind, "attempt": 1}]
 
 
+async def test_actual_optimization_client_receives_editable_title_metadata() -> None:
+    trusted = _trusted_input()
+    app = create_deterministic_deepseek()
+    client = ProductOptimizationAgentClient(
+        Settings(
+            _env_file=None,
+            jwt_secret_key="phase10-test-secret-at-least-32-characters",
+            deepseek_api_key="phase10-deterministic-key",
+            deepseek_base_url="http://model",
+        ),
+        transport=httpx.ASGITransport(app=app),
+    )
+
+    invocation = await client.request(
+        trusted,
+        required_changes=[],
+        call_type=AgentCallType.PRIMARY,
+        iteration=0,
+        max_attempts=1,
+    )
+
+    assert invocation.response is not None
+    title_change = next(
+        change for change in invocation.response.changes if change.field == "title"
+    )
+    assert invocation.response.title != trusted.title
+    assert title_change.current_value == trusted.title
+    assert title_change.suggested_value == invocation.response.title
+    assert [(item.kind, item.value) for item in title_change.evidence] == [
+        ("fact", "product.title")
+    ]
+    assert validate_optimization_output(trusted, invocation.response).passed
+
+
 @pytest.mark.parametrize(
     "request_json",
     [
@@ -299,6 +335,34 @@ async def test_server_rejects_unknown_oversized_or_malformed_shapes_without_echo
     }
     assert "unknown-provider-marker" not in response.text
     assert "unknown-provider-marker" not in repr(app.state.calls)
+    assert app.state.calls == []
+
+
+async def test_server_rejects_schema_valid_template_that_breaks_business_limits() -> None:
+    trusted = _trusted_input()
+    payload = _optimization_payload(trusted)
+    template = payload["response_template"]
+    overlong = "中" * 81
+    template["selling_points"] = [overlong]
+    template["changes"].append(
+        {
+            "field": "selling_points",
+            "current_value": trusted.selling_points,
+            "suggested_value": [overlong],
+            "reason": "调整商品卖点",
+            "evidence": [{"kind": "fact", "value": "product.selling_points"}],
+        }
+    )
+    app = create_deterministic_deepseek()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://model"
+    ) as client:
+        response = await client.post("/chat/completions", json=_request(payload))
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {"code": "DETERMINISTIC_MODEL_REQUEST_INVALID"}
+    }
     assert app.state.calls == []
 
 

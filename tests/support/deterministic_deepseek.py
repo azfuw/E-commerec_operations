@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from decimal import Decimal
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
@@ -9,148 +8,37 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.analysis_agent import validate_agent_response
+from backend.compliance_agent import ComplianceAgentResponse, validate_compliance_response
+from backend.optimization_agent import validate_optimization_response
+from backend.optimization_validation import validate_optimization_output
+from backend.schemas import (
+    AgentAnalysisResponse,
+    AnalysisFacts,
+    CanonicalRuleCitation,
+    OptimizationProposalOutput,
+    TrustedOptimizationInput,
+    ValidatedRequiredChange,
+)
+
 
 _ERROR = {"detail": {"code": "DETERMINISTIC_MODEL_REQUEST_INVALID"}}
 _RESERVED_PREFIX = "阶段十连续失败验证"
-_OUTPUT_FIELDS = {
-    "title",
-    "selling_points",
-    "description",
-    "keywords",
-    "attribute_completions",
-    "changes",
-    "citations",
-    "price_suggestions",
-    "sku_suggestions",
-}
 
 
-class _ClosedModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class _Message(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-
-class _Message(_ClosedModel):
     role: Literal["system", "user"]
     content: str = Field(min_length=1, max_length=1_000_000)
 
 
-class CompletionRequest(_ClosedModel):
+class CompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     model: Literal["deepseek-v4-flash"]
     response_format: dict[Literal["type"], Literal["json_object"]]
     messages: list[_Message] = Field(min_length=2, max_length=2)
-
-
-class _Evidence(_ClosedModel):
-    kind: Literal["fact", "citation"]
-    value: str = Field(min_length=1, max_length=128)
-
-
-class _Description(_ClosedModel):
-    heading: str = Field(min_length=1, max_length=40)
-    body: str = Field(min_length=1, max_length=1000)
-    evidence: list[_Evidence] = Field(min_length=1, max_length=20)
-
-
-class _Change(_ClosedModel):
-    field: Literal["title", "selling_points", "description", "keywords"]
-    current_value: str | list[str] | list[_Description]
-    suggested_value: str | list[str] | list[_Description]
-    reason: str = Field(min_length=1, max_length=500)
-    evidence: list[_Evidence] = Field(min_length=1, max_length=20)
-
-
-class _Attribute(_ClosedModel):
-    target_attribute: str = Field(min_length=1, max_length=64)
-    current_value: str | None
-    suggested_value: str = Field(min_length=1, max_length=256)
-    reason: str = Field(min_length=1, max_length=500)
-    evidence: list[_Evidence] = Field(min_length=1, max_length=20)
-
-
-class _Price(_ClosedModel):
-    target_sku_id: str = Field(min_length=1, max_length=36)
-    current_price: Decimal
-    suggested_price: Decimal
-    reason: str = Field(min_length=1, max_length=500)
-    evidence: list[_Evidence] = Field(min_length=1, max_length=20)
-
-
-class _Sku(_ClosedModel):
-    target_sku_id: str = Field(min_length=1, max_length=36)
-    current_code: str = Field(min_length=1, max_length=64)
-    current_spec: dict[str, str] = Field(max_length=50)
-    suggested_code: str = Field(min_length=1, max_length=64)
-    suggested_spec: dict[str, str] = Field(max_length=50)
-    reason: str = Field(min_length=1, max_length=500)
-    evidence: list[_Evidence] = Field(min_length=1, max_length=20)
-
-
-class _Citation(_ClosedModel):
-    chunk_id: str = Field(min_length=1, max_length=128)
-
-
-class _Output(_ClosedModel):
-    title: str = Field(min_length=1, max_length=60)
-    selling_points: list[str] = Field(min_length=1, max_length=5)
-    description: list[_Description] = Field(min_length=1, max_length=10)
-    keywords: list[str] = Field(min_length=1, max_length=20)
-    attribute_completions: list[_Attribute] = Field(max_length=20)
-    changes: list[_Change] = Field(max_length=4)
-    citations: list[_Citation] = Field(max_length=20)
-    price_suggestions: list[_Price] = Field(max_length=20)
-    sku_suggestions: list[_Sku] = Field(max_length=20)
-
-
-class _Trusted(_ClosedModel):
-    store_id: str = Field(min_length=1, max_length=36)
-    product_id: str = Field(min_length=1, max_length=36)
-    base_product_version: int = Field(ge=1)
-    title: str = Field(min_length=1, max_length=512)
-    category: str = Field(min_length=1, max_length=128)
-    brand: str = Field(max_length=128)
-    selling_points: list[str] = Field(min_length=1, max_length=20)
-    description: str = Field(min_length=1, max_length=8000)
-    search_keywords: list[str] = Field(min_length=1, max_length=100)
-    attributes: dict[str, str] = Field(max_length=50)
-    skus: list[dict[str, object]] = Field(max_length=100)
-    candidate_metrics: dict[str, object]
-    candidate_evidence: list[str] = Field(min_length=1, max_length=50)
-    rag_quality: Literal["normal", "zero_hit", "low_confidence"]
-    canonical_rule_citations: list[dict[str, object]] = Field(max_length=50)
-
-
-class _RequiredChange(_ClosedModel):
-    source_track: Literal["deterministic", "semantic"]
-    source_violation_code: str = Field(min_length=1, max_length=64)
-    field: str = Field(min_length=1, max_length=64)
-    instruction: str = Field(min_length=1, max_length=240)
-    citation_chunk_ids: list[str] = Field(max_length=20)
-
-
-class _CanonicalCitation(_ClosedModel):
-    document_id: str = Field(max_length=36)
-    version_id: str = Field(max_length=36)
-    chunk_id: str = Field(min_length=1, max_length=128)
-    document_name: str = Field(max_length=255)
-    version_number: int
-    category: str = Field(max_length=64)
-    canonical_text: str = Field(max_length=12000)
-    active: bool
-    applicable: bool
-
-
-class _AnalysisCandidate(_ClosedModel):
-    product_id: str = Field(min_length=1, max_length=128)
-    product_code: str = Field(min_length=1, max_length=128)
-    anomaly_types: list[str]
-    metrics: dict[str, object]
-    business_impact: Decimal
-    evidence: list[str]
-
-
-class _AnalysisFacts(_ClosedModel):
-    store_summary: dict[str, object]
-    candidates: list[_AnalysisCandidate] = Field(min_length=1, max_length=100)
 
 
 def _safe_error() -> None:
@@ -174,100 +62,84 @@ def _strings(value: object, maximum: int) -> list[str]:
     return value
 
 
-def _fact_paths(trusted: _Trusted) -> set[str]:
-    paths = {
-        "product.title",
-        "product.category",
-        "product.brand",
-        "product.selling_points",
-        "product.description",
-        "product.search_keywords",
-    }
-    paths.update(f"product.attributes.{key}" for key in trusted.attributes)
-    for sku in trusted.skus:
-        sku_id = sku.get("id")
-        if not isinstance(sku_id, str):
-            _safe_error()
-        paths.update(
-            f"product.skus.{sku_id}.{field}"
-            for field in ("code", "spec", "price", "stock")
-        )
-    paths.update(
-        f"candidate.metrics.{field}"
-        for field, value in trusted.candidate_metrics.items()
-        if value is not None
+def _analysis_content(value: object) -> dict[str, object]:
+    raw = _closed_payload(value, {"store_summary", "candidates"})
+    facts = AnalysisFacts.model_validate(raw)
+    if facts.model_dump(mode="json") != raw:
+        _safe_error()
+    response = AgentAnalysisResponse.model_validate(
+        {
+            "candidates": [
+                {
+                    "product_id": candidate.product_id,
+                    "rank": rank,
+                    "impact_explanation": "该商品经营表现需要关注",
+                    "reason": "可信指标显示转化表现偏低",
+                    "recommended_action": "建议核验商品标题与详情",
+                    "confidence": "0.8000",
+                }
+                for rank, candidate in enumerate(facts.candidates, start=1)
+            ]
+        }
     )
-    paths.update(
-        f"candidate.evidence.{index}"
-        for index in range(len(trusted.candidate_evidence))
-    )
-    return paths
+    validate_agent_response(facts, response)
+    return response.model_dump(mode="json")
 
 
-def _validate_output(
-    output: _Output,
-    trusted: _Trusted,
+def _evidence_is_supplied(
+    output: OptimizationProposalOutput,
     allowed_facts: set[str],
     allowed_citations: set[str],
-) -> _Output:
-    citation_ids = [citation.chunk_id for citation in output.citations]
-    if len(citation_ids) != len(set(citation_ids)) or not set(citation_ids) <= allowed_citations:
-        _safe_error()
+) -> bool:
     evidence_lists = [section.evidence for section in output.description]
-    evidence_lists += [change.evidence for change in output.changes]
-    evidence_lists += [item.evidence for item in output.attribute_completions]
-    evidence_lists += [item.evidence for item in output.price_suggestions]
-    evidence_lists += [item.evidence for item in output.sku_suggestions]
-    if any(
-        (item.kind == "fact" and item.value not in allowed_facts)
-        or (
-            item.kind == "citation"
-            and (item.value not in allowed_citations or item.value not in citation_ids)
-        )
+    evidence_lists.extend(change.evidence for change in output.changes)
+    evidence_lists.extend(item.evidence for item in output.attribute_completions)
+    evidence_lists.extend(item.evidence for item in output.price_suggestions)
+    evidence_lists.extend(item.evidence for item in output.sku_suggestions)
+    return all(
+        (item.kind == "fact" and item.value in allowed_facts)
+        or (item.kind == "citation" and item.value in allowed_citations)
         for evidence in evidence_lists
         for item in evidence
-    ):
-        _safe_error()
+    ) and all(citation.chunk_id in allowed_citations for citation in output.citations)
 
-    current = {
-        "title": trusted.title,
-        "selling_points": trusted.selling_points,
-        "description": trusted.description,
-        "keywords": trusted.search_keywords,
-    }
-    dumped = output.model_dump(mode="json")
-    declared: set[str] = set()
-    for change in output.changes:
-        if (
-            change.field in declared
-            or change.current_value != current[change.field]
-            or change.model_dump(mode="json")["suggested_value"] != dumped[change.field]
-        ):
-            _safe_error()
-        declared.add(change.field)
-    if any(dumped[field] != value and field not in declared for field, value in current.items()):
+
+def _validated_output(
+    value: object,
+    trusted: TrustedOptimizationInput,
+    required_changes: list[ValidatedRequiredChange],
+    allowed_facts: set[str],
+    allowed_citations: set[str],
+) -> OptimizationProposalOutput:
+    output = OptimizationProposalOutput.model_validate(value)
+    validate_optimization_response(trusted, required_changes, output)
+    if (
+        not _evidence_is_supplied(output, allowed_facts, allowed_citations)
+        or not validate_optimization_output(trusted, output).passed
+    ):
         _safe_error()
     return output
 
 
-def _analysis_content(value: object) -> dict[str, object]:
-    facts = _AnalysisFacts.model_validate(value)
-    product_ids = [candidate.product_id for candidate in facts.candidates]
-    if len(product_ids) != len(set(product_ids)):
-        _safe_error()
-    return {
-        "candidates": [
-            {
-                "product_id": product_id,
-                "rank": rank,
-                "impact_explanation": "该商品经营表现需要关注",
-                "reason": "可信指标显示转化表现偏低",
-                "recommended_action": "建议核验商品标题与详情",
-                "confidence": "0.8000",
-            }
-            for rank, product_id in enumerate(product_ids, start=1)
-        ]
-    }
+def _declare_change(
+    output: dict[str, object],
+    trusted: TrustedOptimizationInput,
+    field: str,
+    evidence: list[dict[str, str]],
+) -> None:
+    output["changes"] = [
+        item for item in output["changes"] if item["field"] != field
+    ]
+    current_field = "search_keywords" if field == "keywords" else field
+    output["changes"].append(
+        {
+            "field": field,
+            "current_value": trusted.model_dump(mode="json")[current_field],
+            "suggested_value": output[field],
+            "reason": "根据可信事实调整商品文案",
+            "evidence": evidence,
+        }
+    )
 
 
 def _optimization_content(payload: dict[str, object]) -> dict[str, object]:
@@ -280,38 +152,55 @@ def _optimization_content(payload: dict[str, object]) -> dict[str, object]:
         "response_template",
     }
     _closed_payload(payload, fields)
-    if not isinstance(payload["iteration"], int) or not 0 <= payload["iteration"] <= 2:
+    if (
+        not isinstance(payload["iteration"], int)
+        or isinstance(payload["iteration"], bool)
+        or not 0 <= payload["iteration"] <= 2
+        or not isinstance(payload["required_changes"], list)
+        or len(payload["required_changes"]) > 20
+    ):
         _safe_error()
-    trusted = _Trusted.model_validate(payload["trusted_facts"])
+    trusted = TrustedOptimizationInput.model_validate(payload["trusted_facts"])
+    required_changes = [
+        ValidatedRequiredChange.model_validate(item)
+        for item in payload["required_changes"]
+    ]
     allowed_facts = set(_strings(payload["allowed_fact_paths"], 1000))
     allowed_citations = set(_strings(payload["allowed_rule_chunk_ids"], 50))
-    output = _validate_output(
-        _Output.model_validate(payload["response_template"]),
+    template = _validated_output(
+        payload["response_template"],
         trusted,
+        required_changes,
         allowed_facts,
         allowed_citations,
-    ).model_dump(mode="json")
-    if not isinstance(payload["required_changes"], list) or len(payload["required_changes"]) > 20:
-        _safe_error()
+    )
+    output = template.model_dump(mode="json")
 
-    for raw_change in payload["required_changes"]:
-        change = _RequiredChange.model_validate(raw_change)
-        field = change.field
-        if field == "title":
-            root = "title"
-        elif field in {"selling_point", "selling_points"} or field.startswith("selling_points["):
-            root = "selling_points"
-        elif field == "description" or field.startswith("description["):
-            root = "description"
-        elif field in {"keyword", "keywords"} or field.startswith("keywords["):
-            root = "keywords"
+    if not output["title"].startswith(_RESERVED_PREFIX):
+        output["title"] = ("优选" + output["title"])[:60]
+        _declare_change(
+            output,
+            trusted,
+            "title",
+            [{"kind": "fact", "value": "product.title"}],
+        )
+
+    for change in required_changes:
+        if change.field == "title":
+            field = "title"
+        elif change.field in {"selling_point", "selling_points"} or change.field.startswith(
+            "selling_points["
+        ):
+            field = "selling_points"
+        elif change.field == "description" or change.field.startswith("description["):
+            field = "description"
+        elif change.field in {"keyword", "keywords"} or change.field.startswith("keywords["):
+            field = "keywords"
         else:
             _safe_error()
-        if len(change.citation_chunk_ids) != len(set(change.citation_chunk_ids)) or not set(
-            change.citation_chunk_ids
-        ) <= allowed_citations:
+        if not set(change.citation_chunk_ids) <= allowed_citations:
             _safe_error()
-        fact_path = f"product.{root if root != 'keywords' else 'search_keywords'}"
+        fact_path = f"product.{field if field != 'keywords' else 'search_keywords'}"
         evidence = (
             [{"kind": "citation", "value": item} for item in change.citation_chunk_ids]
             if change.citation_chunk_ids
@@ -321,35 +210,26 @@ def _optimization_content(payload: dict[str, object]) -> dict[str, object]:
             _safe_error()
 
         suffix = "（已调整）"
-        if root == "title":
+        if field == "title":
             base = _RESERVED_PREFIX if output["title"].startswith(_RESERVED_PREFIX) else output["title"]
             output["title"] = base[: 60 - len(suffix)] + suffix
-        elif root == "selling_points":
-            output[root][0] = output[root][0][: 80 - len(suffix)] + suffix
-        elif root == "description":
+        elif field == "selling_points":
+            output[field][0] = output[field][0][: 80 - len(suffix)] + suffix
+        elif field == "description":
             suffix = " 已按要求调整。"
-            output[root][0]["body"] = output[root][0]["body"][: 1000 - len(suffix)] + suffix
+            output[field][0]["body"] = output[field][0]["body"][: 1000 - len(suffix)] + suffix
         else:
-            output[root][0] = output[root][0][:30] + "优化"
-        output["changes"] = [item for item in output["changes"] if item["field"] != root]
-        output["changes"].append(
-            {
-                "field": root,
-                "current_value": getattr(
-                    trusted, "search_keywords" if root == "keywords" else root
-                ),
-                "suggested_value": output[root],
-                "reason": "根据合规要求调整字段",
-                "evidence": evidence,
-            }
-        )
+            output[field][0] = output[field][0][:30] + "优化"
+        _declare_change(output, trusted, field, evidence)
         listed = {item["chunk_id"] for item in output["citations"]}
-        output["citations"] += [
-            {"chunk_id": item} for item in change.citation_chunk_ids if item not in listed
-        ]
+        output["citations"].extend(
+            {"chunk_id": item}
+            for item in change.citation_chunk_ids
+            if item not in listed
+        )
 
-    return _validate_output(
-        _Output.model_validate(output), trusted, allowed_facts, allowed_citations
+    return _validated_output(
+        output, trusted, required_changes, allowed_facts, allowed_citations
     ).model_dump(mode="json")
 
 
@@ -362,25 +242,26 @@ def _compliance_content(payload: dict[str, object]) -> dict[str, object]:
         "canonical_citations",
     }
     _closed_payload(payload, fields)
-    if not isinstance(payload["iteration"], int) or not 0 <= payload["iteration"] <= 2:
+    if (
+        not isinstance(payload["iteration"], int)
+        or isinstance(payload["iteration"], bool)
+        or not 0 <= payload["iteration"] <= 2
+        or not isinstance(payload["canonical_citations"], list)
+    ):
         _safe_error()
-    trusted = _Trusted.model_validate(payload["trusted_facts"])
-    if not isinstance(payload["canonical_citations"], list):
-        _safe_error()
+    trusted = TrustedOptimizationInput.model_validate(payload["trusted_facts"])
+    candidate = OptimizationProposalOutput.model_validate(payload["candidate_output"])
+    validate_optimization_response(trusted, [], candidate)
     canonical = [
-        _CanonicalCitation.model_validate(item) for item in payload["canonical_citations"]
+        CanonicalRuleCitation.model_validate(item)
+        for item in payload["canonical_citations"]
     ]
-    if any(not item.active or not item.applicable for item in canonical):
-        _safe_error()
     citation_ids = [item.chunk_id for item in canonical]
-    if len(citation_ids) != len(set(citation_ids)):
+    if (
+        len(citation_ids) != len(set(citation_ids))
+        or any(not item.active or not item.applicable for item in canonical)
+    ):
         _safe_error()
-    candidate = _validate_output(
-        _Output.model_validate(payload["candidate_output"]),
-        trusted,
-        _fact_paths(trusted),
-        set(citation_ids),
-    )
     deterministic = _closed_payload(
         payload["deterministic_result"],
         {"passed", "violations", "canonical_citation_chunk_ids"},
@@ -392,44 +273,50 @@ def _compliance_content(payload: dict[str, object]) -> dict[str, object]:
     ):
         _safe_error()
 
-    citations = [{"chunk_id": item} for item in citation_ids]
     if not candidate.title.startswith(_RESERVED_PREFIX):
-        return {
-            "passed": True,
-            "risk_level": "low",
-            "violations": [],
-            "required_changes": [],
-            "citations": citations,
-            "confidence": "0.9000",
-            "degraded": False,
-        }
-    if not citation_ids:
-        _safe_error()
-    first = citation_ids[0]
-    return {
-        "passed": False,
-        "risk_level": "medium",
-        "violations": [
+        response = ComplianceAgentResponse.model_validate(
             {
-                "code": "UNPROVABLE_PROMISE",
-                "field": "title",
-                "message_zh": "标题包含无法证实的承诺",
-                "citation_chunk_ids": [first],
+                "passed": True,
+                "risk_level": "low",
+                "violations": [],
+                "required_changes": [],
+                "citations": [{"chunk_id": item} for item in citation_ids],
+                "confidence": "0.9000",
+                "degraded": False,
             }
-        ],
-        "required_changes": [
+        )
+    else:
+        if not citation_ids:
+            _safe_error()
+        first = citation_ids[0]
+        response = ComplianceAgentResponse.model_validate(
             {
-                "source_track": "semantic",
-                "source_violation_code": "UNPROVABLE_PROMISE",
-                "field": "title",
-                "instruction": "请调整标题中的无法证实承诺",
-                "citation_chunk_ids": [first],
+                "passed": False,
+                "risk_level": "medium",
+                "violations": [
+                    {
+                        "code": "UNPROVABLE_PROMISE",
+                        "field": "title",
+                        "message_zh": "标题包含无法证实的承诺",
+                        "citation_chunk_ids": [first],
+                    }
+                ],
+                "required_changes": [
+                    {
+                        "source_track": "semantic",
+                        "source_violation_code": "UNPROVABLE_PROMISE",
+                        "field": "title",
+                        "instruction": "请调整标题中的无法证实承诺",
+                        "citation_chunk_ids": [first],
+                    }
+                ],
+                "citations": [{"chunk_id": first}],
+                "confidence": "0.9000",
+                "degraded": False,
             }
-        ],
-        "citations": [{"chunk_id": first}],
-        "confidence": "0.9000",
-        "degraded": False,
-    }
+        )
+    validate_compliance_response(trusted, response)
+    return response.model_dump(mode="json")
 
 
 def _completion(content: dict[str, object]) -> dict[str, object]:
