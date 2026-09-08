@@ -469,7 +469,7 @@ test.describe.serial('Phase 10 real local services', () => {
       String(reviewed.current_revision!.proposal_output.changes.find((item) => item.field === 'title')!.current_value),
     )
     await expect(page.locator('[data-test="publish-after"]')).toContainText(manualTitle)
-    await expect(page.locator('[data-test="proposal-diff"]')).toHaveText(proposalDiff)
+    await expect(page.locator('[data-test="proposal-diff"]')).toHaveText(proposalDiff, { useInnerText: true })
     await expect(page.locator('[data-test="publish-record"]')).toContainText(
       '价格、SKU、库存与真实平台均未变化',
     )
@@ -641,12 +641,15 @@ test.describe.serial('Phase 10 real local services', () => {
     )
     await expect(page.locator('[data-test="proposal-diff"]')).toHaveText(
       successEvidence!.proposal_diff,
+      { useInnerText: true },
     )
     await expect(page.locator('[data-test="publish-before"]')).toHaveText(
       successEvidence!.publish_before,
+      { useInnerText: true },
     )
     await expect(page.locator('[data-test="publish-after"]')).toHaveText(
       successEvidence!.publish_after,
+      { useInnerText: true },
     )
     rejectionEvidence = { proposal_id: proposalId, product_id: rejected.proposal.product_id }
   })
