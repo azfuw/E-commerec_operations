@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
-import { expect, test, type Page, type Response } from '@playwright/test'
+import { expect, test, type Frame, type Page } from '@playwright/test'
 
 import type {
   AgentCallList,
@@ -165,24 +165,41 @@ function observeProtocol(page: Page): void {
   })
 }
 
-function matches(response: Response, method: string, pathname: string): boolean {
-  return response.request().method() === method && new URL(response.url()).pathname === pathname
-}
-
 async function actAndRead<T>(
   page: Page,
   method: string,
   pathname: string,
   action: () => Promise<void>,
+  { queryMatches = () => true, afterNavigation = false }: {
+    queryMatches?: (url: URL) => boolean
+    afterNavigation?: boolean
+  } = {},
 ): Promise<T> {
-  const responsePromise = page.waitForResponse(
-    (response) => matches(response, method, pathname),
+  let documentReady = !afterNavigation
+  const onNavigation = (frame: Frame) => {
+    if (frame === page.mainFrame()) documentReady = true
+  }
+  if (afterNavigation) page.on('framenavigated', onNavigation)
+  // Bind a new request: a pending response from before a reload belongs to the old document.
+  const bodyPromise = page.waitForRequest(
+    (request) => {
+      const url = new URL(request.url())
+      return documentReady && request.method() === method && url.pathname === pathname && queryMatches(url)
+    },
     { timeout: ASYNC_TIMEOUT },
-  )
-  await action()
-  const response = await responsePromise
-  expect(response.ok(), `${method} ${pathname} returned ${response.status()}`).toBe(true)
-  return response.json() as Promise<T>
+  ).then(async (request) => {
+    const response = await request.response()
+    expect(response, `${method} ${pathname} did not return a response`).not.toBeNull()
+    expect(response!.ok(), `${method} ${pathname} returned ${response!.status()}`).toBe(true)
+    // Consume immediately, while the action may still be waiting for navigation.
+    return response!.json() as Promise<T>
+  })
+  try {
+    const [body] = await Promise.all([bodyPromise, action()])
+    return body
+  } finally {
+    if (afterNavigation) page.off('framenavigated', onNavigation)
+  }
 }
 
 async function assertSafePage(page: Page): Promise<void> {
@@ -239,7 +256,7 @@ async function reloadWorkflowUntilCandidates(page: Page, workflowId: string): Pr
       async () => {
         const workflow = await actAndRead<WorkflowRun>(page, 'GET', pathname, async () => {
           await page.reload({ waitUntil: 'domcontentloaded' })
-        })
+        }, { afterNavigation: true })
         if (workflow.status !== 'awaiting_selection' || !workflow.candidates_ready) {
           return false
         }
@@ -262,7 +279,7 @@ async function reloadProposalUntil(
   while (Date.now() < deadline) {
     const detail = await actAndRead<ProposalDetail>(page, 'GET', pathname, async () => {
       await page.reload({ waitUntil: 'domcontentloaded' })
-    })
+    }, { afterNavigation: true })
     const { status, quality_status: quality, error_code: errorCode } = detail.optimization_run
     diagnostic = [
       `status=${SAFE_DIAGNOSTIC_STATUSES.has(status) ? status : 'unknown'}`,
@@ -294,18 +311,15 @@ async function createDraftProposal(page: Page): Promise<ProposalDetail> {
   await expect(page).toHaveURL(new RegExp(`/app/analysis/${analysis.workflow_run_id}$`))
   await reloadWorkflowUntilCandidates(page, analysis.workflow_run_id)
 
-  const selectionResponse = page.waitForResponse(
-    (response) =>
-      response.request().method() === 'POST' &&
-      new URL(response.url()).pathname ===
-        `/analysis-runs/${analysis.workflow_run_id}/select-product`,
-    { timeout: ASYNC_TIMEOUT },
+  const selection = await actAndRead<ProductSelection>(
+    page,
+    'POST',
+    `/analysis-runs/${analysis.workflow_run_id}/select-product`,
+    async () => {
+      await page.locator('[data-test^="select-"]').first().click()
+      await page.getByRole('button', { name: '确认', exact: true }).click()
+    },
   )
-  await page.locator('[data-test^="select-"]').first().click()
-  await page.getByRole('button', { name: '确认', exact: true }).click()
-  const response = await selectionResponse
-  expect(response.ok()).toBe(true)
-  const selection = (await response.json()) as ProductSelection
   await expect(page).toHaveURL(new RegExp(`/app/proposals/${selection.proposal_id}$`))
   const detail = await reloadProposalUntil(
     page,
@@ -376,14 +390,9 @@ function assertSafeComplianceReview(detail: ProposalDetail): void {
 }
 
 async function gotoProposal(page: Page, proposalId: string): Promise<ProposalDetail> {
-  const detailPromise = page.waitForResponse(
-    (response) => matches(response, 'GET', `/proposals/${proposalId}`),
-    { timeout: ASYNC_TIMEOUT },
-  )
-  await page.goto(`/app/proposals/${proposalId}`)
-  const response = await detailPromise
-  expect(response.ok()).toBe(true)
-  return response.json() as Promise<ProposalDetail>
+  return actAndRead(page, 'GET', `/proposals/${proposalId}`, async () => {
+    await page.goto(`/app/proposals/${proposalId}`)
+  }, { afterNavigation: true })
 }
 
 test.beforeEach(async ({ page }) => observeProtocol(page))
@@ -483,27 +492,17 @@ test.describe.serial('Phase 10 real local services', () => {
     ).toHaveCount(1)
 
     await page.getByRole('link', { name: 'Agent 评测', exact: true }).click()
-    const callsPromise = page.waitForResponse(
-      (response) => new URL(response.url()).pathname === '/agent-calls',
-      { timeout: ASYNC_TIMEOUT },
-    )
-    await page.getByRole('tab', { name: 'Agent 调用', exact: true }).click()
-    const callsResponse = await callsPromise
-    expect(callsResponse.ok()).toBe(true)
-    const calls = (await callsResponse.json()) as AgentCallList
+    const calls = await actAndRead<AgentCallList>(page, 'GET', '/agent-calls', async () => {
+      await page.getByRole('tab', { name: 'Agent 调用', exact: true }).click()
+    })
     expect(calls.items.length).toBeGreaterThan(0)
     for (const call of calls.items) expect(Object.keys(call).sort()).toEqual(SAFE_AGENT_CALL_KEYS)
     await expect(page.locator('.el-table')).toContainText(calls.items[0]!.node_name)
     await expect(page.locator('.el-table')).toContainText(calls.items[0]!.prompt_version)
 
-    const auditPromise = page.waitForResponse(
-      (response) => new URL(response.url()).pathname === '/audit-events',
-      { timeout: ASYNC_TIMEOUT },
-    )
-    await page.getByRole('link', { name: '审计日志', exact: true }).click()
-    const auditResponse = await auditPromise
-    expect(auditResponse.ok()).toBe(true)
-    const audits = (await auditResponse.json()) as AuditEventList
+    const audits = await actAndRead<AuditEventList>(page, 'GET', '/audit-events', async () => {
+      await page.getByRole('link', { name: '审计日志', exact: true }).click()
+    })
     const enqueued = audits.items.find(
       (item) =>
         item.event_type === 'platform_delivery_enqueued' &&
@@ -581,17 +580,15 @@ test.describe.serial('Phase 10 real local services', () => {
     await expect(page.getByRole('heading', { name: '审计日志', exact: true })).toBeVisible()
     await page.getByLabel('方案 ID', { exact: true }).fill(proposalId)
     await page.getByLabel('审批动作', { exact: true }).selectOption('reject')
-    const filteredAuditPromise = page.waitForResponse(
-      (response) =>
-        new URL(response.url()).pathname === '/audit-events' &&
-        new URL(response.url()).searchParams.get('proposal_id') === proposalId &&
-        new URL(response.url()).searchParams.get('action') === 'reject',
-      { timeout: ASYNC_TIMEOUT },
+    const rejectionAudits = await actAndRead<AuditEventList>(
+      page,
+      'GET',
+      '/audit-events',
+      async () => { await page.getByRole('button', { name: '筛选', exact: true }).click() },
+      { queryMatches: (url) =>
+        url.searchParams.get('proposal_id') === proposalId &&
+        url.searchParams.get('action') === 'reject' },
     )
-    await page.getByRole('button', { name: '筛选', exact: true }).click()
-    const filteredResponse = await filteredAuditPromise
-    expect(filteredResponse.ok()).toBe(true)
-    const rejectionAudits = (await filteredResponse.json()) as AuditEventList
     expect(rejectionAudits.items).toHaveLength(1)
     expect(rejectionAudits.items[0]).toMatchObject({
       event_type: 'proposal_rejected',
@@ -603,22 +600,16 @@ test.describe.serial('Phase 10 real local services', () => {
     await page.getByLabel('方案 ID', { exact: true }).fill('')
     await page.getByLabel('审批动作', { exact: true }).selectOption('')
     await page.getByLabel('审计店铺 ID', { exact: true }).fill(successEvidence!.store_id)
-    const storeAuditPromise = page.waitForResponse(
-      (response) => {
-        const url = new URL(response.url())
-        return (
-          url.pathname === '/audit-events' &&
-          url.searchParams.get('store_id') === successEvidence!.store_id &&
-          !url.searchParams.has('proposal_id') &&
-          !url.searchParams.has('action')
-        )
-      },
-      { timeout: ASYNC_TIMEOUT },
+    const storeAudits = await actAndRead<AuditEventList>(
+      page,
+      'GET',
+      '/audit-events',
+      async () => { await page.getByRole('button', { name: '筛选', exact: true }).click() },
+      { queryMatches: (url) =>
+        url.searchParams.get('store_id') === successEvidence!.store_id &&
+        !url.searchParams.has('proposal_id') &&
+        !url.searchParams.has('action') },
     )
-    await page.getByRole('button', { name: '筛选', exact: true }).click()
-    const storeResponse = await storeAuditPromise
-    expect(storeResponse.ok()).toBe(true)
-    const storeAudits = (await storeResponse.json()) as AuditEventList
     const completions = storeAudits.items.filter(
       (item) => item.event_type === 'platform_delivery_completed',
     )
