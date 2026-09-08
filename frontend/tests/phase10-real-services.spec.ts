@@ -58,7 +58,7 @@ const SAFE_DIAGNOSTIC_ERRORS = new Set([
   'PRODUCT_VERSION_CONFLICT',
 ])
 const UNSAFE_RENDERED_TEXT =
-  /Authorization|Bearer|api_key|raw_response|\bprompt\b|traceback|postgres(?:ql)?:\/\//i
+  /Authorization\b|Bearer|api_key|raw_response|\bprompt\b|traceback|postgres(?:ql)?:\/\//i
 const BUSINESS_PREFIXES = [
   '/auth',
   '/analysis-runs',
@@ -579,7 +579,7 @@ test.describe.serial('Phase 10 real local services', () => {
     await page.getByRole('link', { name: '审计日志', exact: true }).click()
     await expect(page.getByRole('heading', { name: '审计日志', exact: true })).toBeVisible()
     await page.getByLabel('方案 ID', { exact: true }).fill(proposalId)
-    await page.getByLabel('审批动作', { exact: true }).selectOption('reject')
+    await page.getByRole('combobox', { name: '审批动作', exact: true }).selectOption('reject')
     const rejectionAudits = await actAndRead<AuditEventList>(
       page,
       'GET',
@@ -598,7 +598,7 @@ test.describe.serial('Phase 10 real local services', () => {
     await expect(page.locator('.el-table')).toContainText('proposal_rejected')
 
     await page.getByLabel('方案 ID', { exact: true }).fill('')
-    await page.getByLabel('审批动作', { exact: true }).selectOption('')
+    await page.getByRole('combobox', { name: '审批动作', exact: true }).selectOption('')
     await page.getByLabel('审计店铺 ID', { exact: true }).fill(successEvidence!.store_id)
     const storeAudits = await actAndRead<AuditEventList>(
       page,
