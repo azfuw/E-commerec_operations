@@ -17,7 +17,7 @@ from backend.schemas import (
 )
 
 
-OPTIMIZATION_PROMPT_VERSION = "product-optimization-v3"
+OPTIMIZATION_PROMPT_VERSION = "product-optimization-v4"
 OPTIMIZATION_PRIMARY_PROMPT = (
     "你是商品优化助手。只输出纯 JSON 对象，不要 Markdown，禁止额外字段。"
     "顶层必须且仅有 title、selling_points、description、keywords、attribute_completions、"
@@ -244,7 +244,7 @@ class ProductOptimizationAgentClient:
             "description": [
                 {
                     "heading": "商品详情",
-                    "body": trusted.description[:4000],
+                    "body": trusted.description[:1000],
                     "evidence": [{"kind": "fact", "value": "product.description"}],
                 }
             ],
@@ -255,6 +255,15 @@ class ProductOptimizationAgentClient:
             "price_suggestions": [],
             "sku_suggestions": [],
         }
+        response_template["changes"] = [
+            {
+                "field": "description",
+                "current_value": trusted.description,
+                "suggested_value": response_template["description"],
+                "reason": "将可信商品详情整理为分节文案",
+                "evidence": [{"kind": "fact", "value": "product.description"}],
+            }
+        ]
         user_payload = {
             "iteration": iteration,
             "trusted_facts": trusted.model_dump(mode="json"),

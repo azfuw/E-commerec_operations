@@ -16,6 +16,7 @@ from backend.optimization_agent import (
     parse_optimization_response,
     validate_optimization_response,
 )
+from backend.optimization_validation import validate_optimization_output
 from backend.schemas import (
     AttributeCompletion,
     CanonicalRuleCitation,
@@ -247,7 +248,7 @@ def test_optimization_primary_prompt_requires_complete_json_skeleton() -> None:
         '"attribute_completions":[],"changes":[],"citations":[],'
         '"price_suggestions":[],"sku_suggestions":[]}'
     )
-    assert OPTIMIZATION_PROMPT_VERSION == "product-optimization-v3"
+    assert OPTIMIZATION_PROMPT_VERSION == "product-optimization-v4"
     assert skeleton in OPTIMIZATION_PRIMARY_PROMPT
     assert skeleton not in OPTIMIZATION_SCHEMA_REPAIR_PROMPT
     assert "所有九字段不得省略" in OPTIMIZATION_PRIMARY_PROMPT
@@ -336,6 +337,15 @@ async def test_optimization_client_uses_distinct_nodes_and_safe_equal_shape_payl
         "price_suggestions": [],
         "sku_suggestions": [],
     }
+    response_template["changes"] = [
+        {
+            "field": "description",
+            "current_value": trusted.description,
+            "suggested_value": response_template["description"],
+            "reason": "将可信商品详情整理为分节文案",
+            "evidence": [{"kind": "fact", "value": "product.description"}],
+        }
+    ]
     assert primary_user["response_template"] == repair_user["response_template"] == response_template
     for payload, required_changes in (
         (primary_user, primary_required_changes),
@@ -343,6 +353,7 @@ async def test_optimization_client_uses_distinct_nodes_and_safe_equal_shape_payl
     ):
         typed_template = OptimizationProposalOutput.model_validate(payload["response_template"])
         assert validate_optimization_response(trusted, required_changes, typed_template) == typed_template
+        assert validate_optimization_output(trusted, typed_template).passed
     assert "建议" in posts[0]["messages"][0]["content"]
     assert "建议" in posts[1]["messages"][0]["content"]
     forbidden = {
@@ -366,7 +377,8 @@ async def test_optimization_client_response_template_truncates_legal_long_descri
         response_template = json.loads(json.loads(request.content)["messages"][1]["content"])["response_template"]
         typed_template = OptimizationProposalOutput.model_validate(response_template)
         assert validate_optimization_response(trusted, [], typed_template) == typed_template
-        assert response_template["description"][0]["body"] == "中" * 4000
+        assert validate_optimization_output(trusted, typed_template).passed
+        assert response_template["description"][0]["body"] == "中" * 1000
         assert response_template["description"][0]["evidence"] == [
             {"kind": "fact", "value": "product.description"}
         ]
