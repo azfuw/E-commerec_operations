@@ -1,5 +1,6 @@
 import json
 import os
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -14,6 +15,7 @@ from backend.analysis_agent import (
 )
 from backend.common import AgentCallType, ComplianceRiskLevel
 from backend.compliance_agent import (
+    ComplianceAgentSchemaError,
     ComplianceAgentInvocation,
     ComplianceAgentResponse,
     ProductComplianceAgentClient,
@@ -21,6 +23,7 @@ from backend.compliance_agent import (
 )
 from backend.config import Settings, get_settings
 from backend.optimization_agent import (
+    OptimizationAgentSchemaError,
     OptimizationAgentInvocation,
     ProductOptimizationAgentClient,
     validate_optimization_response,
@@ -47,6 +50,7 @@ from backend.schemas import (
 pytest_plugins = ("pytester",)
 
 _SUMMARY_PREFIX = "PHASE10_DEEPSEEK_SUMMARY="
+_FAILURE_PREFIX = "PHASE10_DEEPSEEK_FAILURE="
 _SAFE_ERROR_CODES = frozenset(
     {
         "DEEPSEEK_KEY_MISSING",
@@ -61,6 +65,12 @@ _SAFE_ERROR_CODES = frozenset(
         "DEEPSEEK_HTTP_ERROR",
     }
 )
+_SAFE_FAILURE_CATEGORIES = _SAFE_ERROR_CODES | {
+    "ATTEMPT_CEILING_INVALID",
+    "BUSINESS_INVALID",
+    "CONTRACT_INVALID",
+    "FIXTURE_INVALID",
+}
 _SYNTHETIC_INPUT_TEXT = (
     "phase10-smoke-store",
     "phase10-smoke-product",
@@ -110,13 +120,16 @@ def safe_record(agent_type: str, record: Any) -> dict[str, object]:
         "completion_tokens": record.completion_tokens,
         "total_tokens": record.total_tokens,
         "estimated_cost": None if record.estimated_cost is None else str(record.estimated_cost),
-        "error_code": record.error_code,
+        "error_code": (
+            None if record.error_code is None else _safe_error_code(record.error_code)
+        ),
     }
 
 
-def _summary_line(agent_type: str, records: list[Any], api_key: str | None = None) -> str:
-    payload = {"records": [safe_record(agent_type, record) for record in records]}
-    line = _SUMMARY_PREFIX + json.dumps(
+def _evidence_line(
+    prefix: str, payload: dict[str, object], api_key: str | None = None
+) -> str:
+    line = prefix + json.dumps(
         payload,
         ensure_ascii=False,
         sort_keys=True,
@@ -144,8 +157,48 @@ def _summary_line(agent_type: str, records: list[Any], api_key: str | None = Non
     return line
 
 
+def _summary_line(agent_type: str, records: list[Any], api_key: str | None = None) -> str:
+    return _evidence_line(
+        _SUMMARY_PREFIX,
+        {"records": [safe_record(agent_type, record) for record in records]},
+        api_key,
+    )
+
+
 def _safe_error_code(error_code: str | None) -> str:
     return error_code if error_code in _SAFE_ERROR_CODES else "UNKNOWN"
+
+
+def _safe_failure_category(category: str | None) -> str:
+    return category if category in _SAFE_FAILURE_CATEGORIES else "UNKNOWN"
+
+
+def _failure_line(
+    agent_type: str,
+    category: str | None,
+    records: list[Any],
+    api_key: str | None = None,
+) -> str:
+    return _evidence_line(
+        _FAILURE_PREFIX,
+        {
+            "agent_type": agent_type,
+            "error_category": _safe_failure_category(category),
+            "records": [safe_record(agent_type, record) for record in records],
+        },
+        api_key,
+    )
+
+
+def _fail_with_evidence(
+    agent_type: str,
+    category: str | None,
+    records: list[Any],
+    api_key: str | None = None,
+) -> None:
+    safe_category = _safe_failure_category(category)
+    print(_failure_line(agent_type, safe_category, records, api_key))
+    pytest.fail(f"PHASE10_{agent_type.upper()}_{safe_category}", pytrace=False)
 
 
 def _analysis_facts() -> AnalysisFacts:
@@ -569,6 +622,124 @@ async def test_success_summary_is_canonical_and_allowlisted() -> None:
     }
 
 
+async def test_failure_evidence_closes_unexpected_errors_without_raw_output(capsys) -> None:
+    facts = _analysis_facts()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return _completion(_valid_analysis_response(facts).model_dump_json())
+
+    result, _ = await _request_analysis(
+        DeepSeekAnalysisClient(_mock_settings(), httpx.MockTransport(handler)), facts
+    )
+    raw_sentinel = "provider-raw-sentinel-never-print"
+    unsafe_record = replace(result.records[0], error_code=raw_sentinel)
+
+    with pytest.raises(pytest.fail.Exception, match="PHASE10_ANALYSIS_UNKNOWN"):
+        _fail_with_evidence(
+            "analysis", raw_sentinel, [unsafe_record], "phase10-test-key"
+        )
+
+    output = capsys.readouterr().out.strip()
+    assert output.startswith(_FAILURE_PREFIX)
+    payload = json.loads(output.removeprefix(_FAILURE_PREFIX))
+    assert payload["agent_type"] == "analysis"
+    assert payload["error_category"] == "UNKNOWN"
+    assert payload["records"][0]["attempt"] == 1
+    assert payload["records"][0]["error_code"] == "UNKNOWN"
+    assert raw_sentinel not in output
+    assert "phase10-test-key" not in output
+
+
+async def test_live_failure_branches_emit_one_safe_evidence_line_offline(
+    monkeypatch, capsys
+) -> None:
+    settings = _mock_settings()
+    analysis_client = DeepSeekAnalysisClient
+    optimization_client = ProductOptimizationAgentClient
+    compliance_client = ProductComplianceAgentClient
+    raw_sentinel = "provider-raw-sentinel-never-print"
+
+    async def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(raw_sentinel, request=request)
+
+    async def invalid_schema_handler(_request: httpx.Request) -> httpx.Response:
+        return _completion("not-json")
+
+    business_invalid = _valid_optimization_output().model_copy(
+        update={"title": "全网最低桌面收纳盒"}
+    )
+
+    async def business_invalid_handler(_request: httpx.Request) -> httpx.Response:
+        return _completion(business_invalid.model_dump_json())
+
+    async def unexpected_handler(_request: httpx.Request) -> httpx.Response:
+        raise RuntimeError(raw_sentinel)
+
+    cases = (
+        (
+            "analysis",
+            test_live_phase10_analysis_contract,
+            "DeepSeekAnalysisClient",
+            lambda configured: analysis_client(
+                configured, httpx.MockTransport(timeout_handler)
+            ),
+            "DEEPSEEK_TIMEOUT",
+            1,
+        ),
+        (
+            "compliance",
+            test_live_phase10_compliance_contract,
+            "ProductComplianceAgentClient",
+            lambda configured: compliance_client(
+                configured, httpx.MockTransport(invalid_schema_handler)
+            ),
+            "DEEPSEEK_SCHEMA_INVALID",
+            2,
+        ),
+        (
+            "optimization",
+            test_live_phase10_optimization_contract,
+            "ProductOptimizationAgentClient",
+            lambda configured: optimization_client(
+                configured, httpx.MockTransport(business_invalid_handler)
+            ),
+            "BUSINESS_INVALID",
+            1,
+        ),
+        (
+            "analysis",
+            test_live_phase10_analysis_contract,
+            "DeepSeekAnalysisClient",
+            lambda configured: analysis_client(
+                configured, httpx.MockTransport(unexpected_handler)
+            ),
+            "UNKNOWN",
+            0,
+        ),
+    )
+    monkeypatch.setitem(globals(), "_settings_or_fail", lambda: settings)
+
+    for agent_type, live_test, client_name, client_factory, category, attempts in cases:
+        with monkeypatch.context() as patch:
+            patch.setitem(globals(), client_name, client_factory)
+            with pytest.raises(
+                pytest.fail.Exception,
+                match=f"PHASE10_{agent_type.upper()}_{category}",
+            ):
+                await live_test()
+
+        output = capsys.readouterr().out.strip()
+        assert len(output.splitlines()) == 1
+        assert output.startswith(_FAILURE_PREFIX)
+        payload = json.loads(output.removeprefix(_FAILURE_PREFIX))
+        assert set(payload) == {"agent_type", "error_category", "records"}
+        assert payload["agent_type"] == agent_type
+        assert payload["error_category"] == category
+        assert len(payload["records"]) == attempts <= 2
+        assert raw_sentinel not in output
+        assert "phase10-test-key" not in output
+
+
 @pytest.mark.phase10_deepseek
 @pytest.mark.skipif(
     not _enabled(), reason="explicit Phase 10 DeepSeek opt-in required"
@@ -576,19 +747,24 @@ async def test_success_summary_is_canonical_and_allowlisted() -> None:
 async def test_live_phase10_analysis_contract() -> None:
     settings = _settings_or_fail()
     facts = _analysis_facts()
-    result, attempts = await _request_analysis(DeepSeekAnalysisClient(settings), facts)
-    if result.response is None:
-        pytest.fail(
-            f"PHASE10_ANALYSIS_{_safe_error_code(result.error_code)}", pytrace=False
-        )
-    if not 1 <= attempts == len(result.records) <= 2:
-        pytest.fail("PHASE10_ANALYSIS_ATTEMPT_CEILING_INVALID", pytrace=False)
-    try:
-        validate_agent_response(facts, result.response)
-    except AgentSchemaError:
-        pytest.fail("PHASE10_ANALYSIS_CONTRACT_INVALID", pytrace=False)
     key = settings.deepseek_api_key
-    print(_summary_line("analysis", result.records, key.get_secret_value() if key else None))
+    api_key = key.get_secret_value() if key else None
+    records: list[Any] = []
+    try:
+        result, attempts = await _request_analysis(DeepSeekAnalysisClient(settings), facts)
+        records = result.records
+        if result.response is None:
+            _fail_with_evidence("analysis", result.error_code, records, api_key)
+        if not 1 <= attempts == len(records) <= 2:
+            _fail_with_evidence(
+                "analysis", "ATTEMPT_CEILING_INVALID", records, api_key
+            )
+        validate_agent_response(facts, result.response)
+        print(_summary_line("analysis", records, api_key))
+    except AgentSchemaError:
+        _fail_with_evidence("analysis", "CONTRACT_INVALID", records, api_key)
+    except Exception:
+        _fail_with_evidence("analysis", "UNKNOWN", records, api_key)
 
 
 @pytest.mark.phase10_deepseek
@@ -598,24 +774,28 @@ async def test_live_phase10_analysis_contract() -> None:
 async def test_live_phase10_optimization_contract() -> None:
     settings = _settings_or_fail()
     trusted = _trusted_optimization_input()
-    result, attempts = await _request_optimization(
-        ProductOptimizationAgentClient(settings), trusted
-    )
-    if result.response is None:
-        pytest.fail(
-            f"PHASE10_OPTIMIZATION_{_safe_error_code(result.error_code)}",
-            pytrace=False,
-        )
-    if not 1 <= attempts == len(result.records) <= 2:
-        pytest.fail("PHASE10_OPTIMIZATION_ATTEMPT_CEILING_INVALID", pytrace=False)
-    try:
-        output = validate_optimization_response(trusted, (), result.response)
-    except ValueError:
-        pytest.fail("PHASE10_OPTIMIZATION_CONTRACT_INVALID", pytrace=False)
-    if not validate_optimization_output(trusted, output).passed:
-        pytest.fail("PHASE10_OPTIMIZATION_BUSINESS_INVALID", pytrace=False)
     key = settings.deepseek_api_key
-    print(_summary_line("optimization", result.records, key.get_secret_value() if key else None))
+    api_key = key.get_secret_value() if key else None
+    records: list[Any] = []
+    try:
+        result, attempts = await _request_optimization(
+            ProductOptimizationAgentClient(settings), trusted
+        )
+        records = result.records
+        if result.response is None:
+            _fail_with_evidence("optimization", result.error_code, records, api_key)
+        if not 1 <= attempts == len(records) <= 2:
+            _fail_with_evidence(
+                "optimization", "ATTEMPT_CEILING_INVALID", records, api_key
+            )
+        output = validate_optimization_response(trusted, (), result.response)
+        if not validate_optimization_output(trusted, output).passed:
+            _fail_with_evidence("optimization", "BUSINESS_INVALID", records, api_key)
+        print(_summary_line("optimization", records, api_key))
+    except OptimizationAgentSchemaError:
+        _fail_with_evidence("optimization", "CONTRACT_INVALID", records, api_key)
+    except Exception:
+        _fail_with_evidence("optimization", "UNKNOWN", records, api_key)
 
 
 @pytest.mark.phase10_deepseek
@@ -626,20 +806,25 @@ async def test_live_phase10_compliance_contract() -> None:
     settings = _settings_or_fail()
     trusted = _trusted_optimization_input()
     proposal = _valid_optimization_output()
-    if not validate_optimization_output(trusted, proposal).passed:
-        pytest.fail("PHASE10_COMPLIANCE_FIXTURE_INVALID", pytrace=False)
-    result, attempts = await _request_compliance(
-        ProductComplianceAgentClient(settings), proposal, trusted
-    )
-    if result.response is None:
-        pytest.fail(
-            f"PHASE10_COMPLIANCE_{_safe_error_code(result.error_code)}", pytrace=False
-        )
-    if not 1 <= attempts == len(result.records) <= 2:
-        pytest.fail("PHASE10_COMPLIANCE_ATTEMPT_CEILING_INVALID", pytrace=False)
-    try:
-        validate_compliance_response(trusted, result.response)
-    except ValueError:
-        pytest.fail("PHASE10_COMPLIANCE_CONTRACT_INVALID", pytrace=False)
     key = settings.deepseek_api_key
-    print(_summary_line("compliance", result.records, key.get_secret_value() if key else None))
+    api_key = key.get_secret_value() if key else None
+    records: list[Any] = []
+    try:
+        if not validate_optimization_output(trusted, proposal).passed:
+            _fail_with_evidence("compliance", "FIXTURE_INVALID", records, api_key)
+        result, attempts = await _request_compliance(
+            ProductComplianceAgentClient(settings), proposal, trusted
+        )
+        records = result.records
+        if result.response is None:
+            _fail_with_evidence("compliance", result.error_code, records, api_key)
+        if not 1 <= attempts == len(records) <= 2:
+            _fail_with_evidence(
+                "compliance", "ATTEMPT_CEILING_INVALID", records, api_key
+            )
+        validate_compliance_response(trusted, result.response)
+        print(_summary_line("compliance", records, api_key))
+    except ComplianceAgentSchemaError:
+        _fail_with_evidence("compliance", "CONTRACT_INVALID", records, api_key)
+    except Exception:
+        _fail_with_evidence("compliance", "UNKNOWN", records, api_key)
