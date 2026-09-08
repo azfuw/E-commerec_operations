@@ -2,6 +2,7 @@ import { defineConfig } from '@playwright/test'
 
 export default defineConfig({
   testDir: './tests',
+  testIgnore: 'phase10-real-services.spec.ts',
   fullyParallel: false,
   reporter: 'list',
   use: {
