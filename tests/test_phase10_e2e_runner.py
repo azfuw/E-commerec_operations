@@ -1,6 +1,8 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
@@ -414,6 +416,87 @@ async def test_webhook_fault_gate_requires_zero_invalid_writes_and_one_replay(tm
     else:
         await runner.webhook_checks()
         assert request_count == 5 and counts == [1, 1]
+
+
+@pytest.mark.parametrize("store_id", ["owned-flagship-id", ""])
+def test_worker_recovery_reaches_owned_store_without_parent_settings(tmp_path, store_id):
+    # conftest imports settings with a JWT: only a fresh interpreter catches this boundary.
+    environment = build_child_environment("a1b2c3d4", evidence_root=tmp_path)
+    environment.pop("JWT_SECRET_KEY")
+    for key in ("TEMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA"):
+        Path(environment[key]).mkdir(parents=True, exist_ok=True)
+    result = subprocess.run([sys.executable, "-B", "-c", dedent('''
+        import asyncio
+        import os
+        from pathlib import Path
+        import sys
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+        from scripts.run_phase10_e2e import Runner
+
+        assert "JWT_SECRET_KEY" not in os.environ
+        assert not any(key.startswith("RUN_") for key in os.environ)
+        assert not Path(".env.local").exists()
+        before = dict(os.environ)
+        store_id = sys.argv[1] or None
+        connection = AsyncMock()
+        connection.fetchval.return_value = store_id
+        runner = Runner("a1b2c3d4", evidence_root=Path.cwd())
+        runner.resources.connect = AsyncMock(return_value=connection)
+        runner.start = MagicMock(side_effect=AssertionError("unexpected child process"))
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+
+        class RequestBoundary(Exception):
+            pass
+
+        async def post(path, **kwargs):
+            if path == "/auth/login":
+                return httpx.Response(200, json={"access_token": "synthetic"})
+            assert path == "/analysis-runs"
+            assert kwargs["json"]["store_id"] == "owned-flagship-id"
+            raise RequestBoundary()
+
+        client.post.side_effect = post
+        with asyncio.Runner() as loop, \\
+             patch("scripts.run_phase10_e2e.ThreadingHTTPServer") as server, \\
+             patch("httpx.AsyncClient", return_value=client), \\
+             patch("socket.socket.connect", side_effect=AssertionError("unexpected network")):
+            try:
+                loop.run(runner.worker_recovery_check())
+            except RequestBoundary:
+                assert store_id is not None
+            except RuntimeError as error:
+                assert store_id is None and str(error) == "PHASE10_EVIDENCE_INVALID"
+                client.post.assert_not_awaited()
+            else:
+                raise AssertionError("recovery skipped the owned-resource gate")
+            connection.fetchval.assert_awaited_once_with("SELECT id FROM stores WHERE code=$1", "flagship")
+            connection.close.assert_awaited_once_with(timeout=5)
+            server.return_value.shutdown.assert_called_once()
+            server.return_value.server_close.assert_called_once()
+        assert os.environ == before
+        assert "backend.seed" not in sys.modules and "backend.database" not in sys.modules
+    '''), store_id], cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+async def test_worker_recovery_failure_has_fixed_stage(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    runner = Runner("a1b2c3d4", evidence_root=tmp_path, resources=FakeResources([]))
+    monkeypatch.setattr(runner, "webhook_checks", AsyncMock())
+    monkeypatch.setattr(runner, "worker_recovery_check", AsyncMock(side_effect=RuntimeError("sensitive")))
+    monkeypatch.setattr(runner, "milvus_unavailable_check", AsyncMock())
+    with pytest.raises(RuntimeError):
+        await runner.fault_checks()
+    assert runner.stage == "worker_recovery"
+    runner.evidence.mkdir()
+    runner.record("failed")
+    assert (runner.evidence / "lifecycle.jsonl").read_text() == '{"stage": "worker_recovery", "status": "failed"}\n'
+    runner.worker_recovery_check.side_effect = None
+    await runner.fault_checks()
+    assert runner.stage == "faults"
 
 
 @pytest.mark.parametrize("code", ["KNOWLEDGE_MILVUS_UNAVAILABLE", "KNOWLEDGE_MODEL_UNAVAILABLE"])

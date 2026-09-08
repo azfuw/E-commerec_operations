@@ -300,7 +300,9 @@ class Runner:
 
     async def fault_checks(self):
         await self.webhook_checks()
+        self.stage = "worker_recovery"
         await self.worker_recovery_check()
+        self.stage = "faults"
         await self.milvus_unavailable_check()
 
     def fault_evidence(self, name: str, value: dict):
@@ -352,7 +354,6 @@ class Runner:
         from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
         from backend.analysis_runs import finalize_analysis_run
         from backend.common import WorkflowQuality
-        from backend.seed import stable_id
 
         for name, process in self.processes:
             if name == "analysis_worker":
@@ -375,10 +376,12 @@ class Runner:
         connection = None
         try:
             connection = await self.resources.connect()
+            store_id = await connection.fetchval("SELECT id FROM stores WHERE code=$1", "flagship")
+            require(store_id is not None)
             async with httpx.AsyncClient(base_url="http://127.0.0.1:4174", timeout=10, trust_env=False) as client:
                 login = await client.post("/auth/login", json={"username": "operator", "password": "DemoPass!2026"})
                 require(login.status_code == 200)
-                accepted = await client.post("/analysis-runs", headers={"Authorization": "Bearer " + login.json()["access_token"]}, json={"store_id": stable_id("store:flagship"), "start_date": "2026-07-26", "end_date": "2026-08-24"})
+                accepted = await client.post("/analysis-runs", headers={"Authorization": "Bearer " + login.json()["access_token"]}, json={"store_id": store_id, "start_date": "2026-07-26", "end_date": "2026-08-24"})
                 require(accepted.status_code == 202)
                 run_id = accepted.json()["workflow_run_id"]
             crashed = self.start("fault_analysis_worker", [PYTHON, "-m", "scripts.run_analysis_worker", "--once"], extra_env={"DEEPSEEK_BASE_URL": f"http://127.0.0.1:{server.server_port}", "ANALYSIS_LEASE_SECONDS": "5"})
