@@ -56,6 +56,14 @@ def create_platform_simulator(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/__phase10/evidence")
+    async def safe_evidence() -> dict[str, int | bool]:
+        return {
+            "mutation_count": app.state.mutation_count,
+            "operation_count": len(app.state.operations),
+            "disconnect_used": app.state.disconnect_used,
+        }
+
     @app.post("/oauth/token")
     async def token(
         client_id: Annotated[str, Form()],

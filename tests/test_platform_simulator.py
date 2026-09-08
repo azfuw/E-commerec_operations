@@ -25,6 +25,17 @@ async def _token(client: httpx.AsyncClient) -> str:
     return response.json()["access_token"]
 
 
+async def test_process_evidence_exposes_only_counts_and_boolean() -> None:
+    app = create_platform_simulator(client_secret="must-not-appear")
+    app.state.operations["must-not-appear-key"] = ("private-body-digest", "operation-private")
+    app.state.mutation_count = 1
+    app.state.disconnect_used = True
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://platform.test") as client:
+        response = await client.get("/__phase10/evidence")
+    assert response.status_code == 200
+    assert response.json() == {"mutation_count": 1, "operation_count": 1, "disconnect_used": True}
+
+
 async def test_simulator_validates_idempotency_fields_and_pagination() -> None:
     app = create_platform_simulator()
     async with httpx.AsyncClient(
