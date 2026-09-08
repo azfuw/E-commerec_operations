@@ -17,6 +17,46 @@ import type {
 const PASSWORD = 'DemoPass!2026'
 const FAILURE_PREFIX = '阶段十连续失败验证'
 const ASYNC_TIMEOUT = 180_000
+const SAFE_DIAGNOSTIC_STATUSES = new Set([
+  'accepted',
+  'processing',
+  'awaiting_selection',
+  'completed',
+  'draft_ready',
+  'pending_manual',
+  'pending_approval',
+  'rejected',
+  'failed',
+])
+const SAFE_DIAGNOSTIC_QUALITIES = new Set(['normal', 'partial', 'degraded'])
+const SAFE_DIAGNOSTIC_ERRORS = new Set([
+  'COMPLIANCE_AGENT_DEGRADED',
+  'DEEPSEEK_FORBIDDEN',
+  'DEEPSEEK_HTTP_ERROR',
+  'DEEPSEEK_KEY_MISSING',
+  'DEEPSEEK_RATE_LIMIT',
+  'DEEPSEEK_SCHEMA_INVALID',
+  'DEEPSEEK_SERVER_ERROR',
+  'DEEPSEEK_TIMEOUT',
+  'DEEPSEEK_TRANSPORT',
+  'DEEPSEEK_UNAUTHORIZED',
+  'KNOWLEDGE_DEPENDENCY_ERROR',
+  'KNOWLEDGE_DEPENDENCY_TIMEOUT',
+  'KNOWLEDGE_LOW_CONFIDENCE',
+  'KNOWLEDGE_MODEL_UNAVAILABLE',
+  'KNOWLEDGE_ZERO_HIT',
+  'LEASE_ATTEMPTS_EXHAUSTED',
+  'LEASE_LOST',
+  'OPTIMIZATION_AUTHORIZATION_CHANGED',
+  'OPTIMIZATION_CHECKPOINT_ERROR',
+  'OPTIMIZATION_CONTEXT_INCONSISTENT',
+  'OPTIMIZATION_CONTEXT_NOT_FOUND',
+  'OPTIMIZATION_DATABASE_ERROR',
+  'OPTIMIZATION_FACT_ERROR',
+  'OPTIMIZATION_ITERATION_LIMIT',
+  'OPTIMIZATION_REPLAY_CONFLICT',
+  'PRODUCT_VERSION_CONFLICT',
+])
 const UNSAFE_RENDERED_TEXT =
   /Authorization|Bearer|api_key|raw_response|\bprompt\b|traceback|postgres(?:ql)?:\/\//i
 const BUSINESS_PREFIXES = [
@@ -214,17 +254,26 @@ async function reloadProposalUntil(
   page: Page,
   proposalId: string,
   ready: (detail: ProposalDetail) => boolean,
+  stopStatuses: ReadonlySet<ProposalDetail['optimization_run']['status']> = new Set(),
 ): Promise<ProposalDetail> {
   const pathname = `/proposals/${proposalId}`
   const deadline = Date.now() + ASYNC_TIMEOUT
+  let diagnostic = 'status=unknown quality=unknown error_code=unknown'
   while (Date.now() < deadline) {
     const detail = await actAndRead<ProposalDetail>(page, 'GET', pathname, async () => {
       await page.reload({ waitUntil: 'domcontentloaded' })
     })
+    const { status, quality_status: quality, error_code: errorCode } = detail.optimization_run
+    diagnostic = [
+      `status=${SAFE_DIAGNOSTIC_STATUSES.has(status) ? status : 'unknown'}`,
+      `quality=${SAFE_DIAGNOSTIC_QUALITIES.has(quality) ? quality : 'unknown'}`,
+      `error_code=${errorCode === null ? 'none' : SAFE_DIAGNOSTIC_ERRORS.has(errorCode) ? errorCode : 'unknown'}`,
+    ].join(' ')
     if (ready(detail)) return detail
+    if (stopStatuses.has(status)) throw new Error(`PHASE10_PROPOSAL_TERMINAL ${diagnostic}`)
     await page.waitForTimeout(500)
   }
-  throw new Error('PHASE10_PROPOSAL_STATUS_TIMEOUT')
+  throw new Error(`PHASE10_PROPOSAL_STATUS_TIMEOUT ${diagnostic}`)
 }
 
 async function createDraftProposal(page: Page): Promise<ProposalDetail> {
@@ -262,6 +311,7 @@ async function createDraftProposal(page: Page): Promise<ProposalDetail> {
     page,
     selection.proposal_id,
     (value) => value.optimization_run.status === 'draft_ready' && value.current_review?.passed === true,
+    new Set(['pending_manual', 'failed']),
   )
   await expect(page.locator('[data-test="submit-proposal"]')).toBeVisible()
   await assertSafePage(page)
