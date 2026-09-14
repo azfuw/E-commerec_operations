@@ -43,7 +43,7 @@ def test_environment_is_explicit_and_offline(monkeypatch):
     assert "real-key-must-not-propagate" not in env.values()
     assert "ambient-secret" not in env.values()
     assert env["KNOWLEDGE_UPLOAD_DIR"].endswith("a1b2c3d4\\knowledge-uploads")
-    assert env["PYTHONPATH"].endswith("phase10-platform-delivery")
+    assert Path(env["PYTHONPATH"]) == Path(__file__).resolve().parents[1]
     assert env["PLAYWRIGHT_BROWSERS_PATH"] == r"D:\E-commerce_operations_env\playwright-browsers"
     assert env["TEMP"] == env["TMP"] and env["TEMP"].endswith("a1b2c3d4\\temp")
 
