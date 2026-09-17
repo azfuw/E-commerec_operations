@@ -13,11 +13,12 @@ vi.mock('../api', () => ({
   login: (username: string, password: string) => apiMock.login(username, password),
 }))
 
-async function mountLogin() {
+async function mountLogin(query = '') {
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [
       { path: '/app/login', name: 'login', component: { template: '<div />' } },
+      { path: '/app/logistics', name: 'logistics', component: { template: '<div />' } },
       {
         path: '/app/workbench',
         name: 'workbench',
@@ -25,7 +26,7 @@ async function mountLogin() {
       },
     ],
   })
-  await router.push('/app/login')
+  await router.push('/app/login' + query)
   await router.isReady()
   const wrapper = mount(LoginPage, { global: { plugins: [ElementPlus, router] } })
   return { router, wrapper }
@@ -76,5 +77,14 @@ describe('LoginPage', () => {
     await flushPromises()
 
     expect(router.currentRoute.value.fullPath).toBe('/app/workbench')
+  })
+
+  it('returns a logistics visitor to the logistics workspace', async () => {
+    const { router, wrapper } = await mountLogin('?next=logistics')
+    await wrapper.get('input#username').setValue('logistics')
+    await wrapper.get('input#password').setValue('Logistics!2026')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/app/logistics')
   })
 })

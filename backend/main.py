@@ -10,6 +10,7 @@ from starlette.responses import FileResponse
 from starlette.staticfiles import StaticFiles
 
 from backend.routes import router
+from backend.logistics import router as logistics_router
 from backend.schemas import KnowledgeEnvelope, KnowledgeError
 
 DEFAULT_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
@@ -75,6 +76,7 @@ def _mount_frontend(app: FastAPI, frontend_dist: Path) -> None:
 def create_app(frontend_dist: Path | None = None) -> FastAPI:
     app = FastAPI(title="智营台 API", version="0.1.0")
     app.include_router(router)
+    app.include_router(logistics_router)
 
     @app.exception_handler(StarletteHTTPException)
     async def knowledge_http_exception(request: Request, exception: StarletteHTTPException):

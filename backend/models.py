@@ -1215,3 +1215,7 @@ class KnowledgeChunk(Base):
     chunk_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSON, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+# Register the logistics tables with the shared metadata for migrations and tests.
+from backend import logistics_models  # noqa: E402, F401

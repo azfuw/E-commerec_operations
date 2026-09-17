@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 
 import { login } from '../api'
 import InlineError from '../components/InlineError.vue'
 
 const router = useRouter()
+const route = useRoute()
 const username = ref('')
 const password = ref('')
 const submitting = ref(false)
@@ -17,7 +18,7 @@ async function submit(): Promise<void> {
   errorMessage.value = ''
   try {
     await login(username.value, password.value)
-    await router.replace({ name: 'workbench' })
+    await router.replace({ name: route.query.next === 'logistics' ? 'logistics' : 'workbench' })
   } catch {
     errorMessage.value = '登录失败，请检查账号或密码'
   } finally {

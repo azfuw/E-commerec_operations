@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Checked, House, SwitchButton, TrendCharts } from '@element-plus/icons-vue'
+import { Checked, House, SwitchButton, TrendCharts, Van } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 
 import { clearSession, session } from '../session'
@@ -21,6 +21,9 @@ function logout(): void {
     <aside class="app-sidebar" aria-label="主导航">
       <div class="app-brand">智营台</div>
       <nav>
+        <router-link class="nav-link" :to="{ name: 'logistics' }">
+          <el-icon><Van /></el-icon><span>物流工作台</span>
+        </router-link>
         <router-link v-if="session.user && canManageSystem(session.user.role, isMobile)" class="nav-link" :to="{name:'admin'}">系统管理</router-link>
         <router-link v-if="session.user && canViewAuditEvents(session.user.role, isMobile)" class="nav-link" :to="{name:'audit-events'}">审计日志</router-link>
         <router-link v-if="session.user && canViewAgentObservability(session.user.role, isMobile)" class="nav-link" :to="{name:'agent-evaluations'}">Agent 评测</router-link>

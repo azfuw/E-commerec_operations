@@ -1,0 +1,54 @@
+# 智流物流协同工作台
+
+## 打开系统
+
+在仓库目录执行 `./start-logistics.ps1`，访问 `http://127.0.0.1:8010/app/logistics`。
+
+本机演示账号：`logistics / Logistics!2026`（三个店铺的物流主管），`warehouse / Logistics!2026`（仅旗舰店）。页面显示本地演示数据及规则 Agent 模式。演示记录保存到 `data/logistics-demo/`，停止服务后重新启动不会还原状态。
+
+在现有正式内部环境中，沿用原系统账号和店铺权限。先执行 Alembic 数据库迁移，再构建前端并启动服务。物流入口与原运营系统共用登录和权限。
+
+## 日常操作
+
+1. 打开“物流总览”，选择店铺，查看待发货、在途、签收及异常指标。预计到货是计划，不是已经到达。
+2. 在“运单追踪”搜索订单或运单，打开详情查看时间节点。新建运单时从尚未登记物流的已有订单中选择，填写承运商、运单号、目的地、发货截止和预计到货。
+3. 在详情录入发货、运输节点或签收。系统拒绝未来时间、倒序节点和非法状态跳转；历史轨迹只追加，不覆盖。
+4. 对已发出的运单创建退货申请，进入“退货管理”依次审核、登记退回运输、仓库收货、质检完成。质检结果写在处理备注。拒绝和完成都是终态；完成不会扣库存或执行退款。
+5. 在“异常工单”查看规则依据和建议，分配负责人、填写处理结果。完成业务动作后，可重新巡检检查剩余风险。同一份触发证据不会重复建单。
+6. 在“Agent 工作台”运行巡检，或询问“哪些运单发货超时”“哪些退货需要跟进”“今天物流情况”。答复基于当前账号可见数据，引用可打开的运单；自由对话超出规则理解范围时，应直接用筛选核实。
+
+本地演示服务启动后每 60 秒自动巡检一次，也可以手动运行。普通 PostgreSQL 部署可另开进程运行 `python -m scripts.run_logistics_worker --username 已有业务账号 --interval 300`；只扫描该账号可访问的启用店铺。停用账号后停止产生业务任务。
+
+## 时效规则
+
+规则检查发货截止、预计到货、运输轨迹更新时间、预计退回时间。业务人员录入的承诺时间是规则依据。接口使用带时区时间，数据库按 UTC 保存，界面显示北京时间。
+
+异常工单的关闭表示该次异常已处理。没有发生新的业务进展时，关闭同一异常不会消除运单仍然存在的客观时效风险；总览的风险提示与工单状态分别表达这两件事。
+
+## 数据与边界
+
+- 运单关联既有电商订单；不修改原订单、价格、库存或财务退款事实。
+- 当前不自动连接顺丰、中通等真实平台，不向客户或承运商发送消息。
+- 规则 Agent 无需密钥，不能据此视为外部大模型推理或真实承运商同步。
+- 目前每个订单一个运单、每个运单一条退货流程；暂不支持拆包合单和多次退货。
+- 列表导出以按钮旁说明的范围为准，包含用户当前可见记录；不绕过店铺权限。
+
+## 启动与验收命令
+
+```powershell
+# 指定现有 Python 环境，跳过已完成的前端构建
+.\start-logistics.ps1 -Python 'D:\E-commerce_operations_env\python.exe' -SkipBuild
+
+# 仅初始化或检查演示数据
+& 'D:\E-commerce_operations_env\python.exe' -m scripts.run_logistics_demo --seed-only
+
+# 后端物流验证
+& 'D:\E-commerce_operations_env\python.exe' -m pytest tests/test_logistics.py tests/test_logistics_demo_launcher.py -q
+
+# 前端及真实服务浏览器验收
+$env:LOGISTICS_PYTHON='D:\E-commerce_operations_env\python.exe'
+$env:PLAYWRIGHT_BROWSERS_PATH='D:\E-commerce_operations_env\playwright-browsers'
+npm.cmd --prefix frontend run test:logistics
+```
+
+浏览器验收使用独立的 `data/logistics-demo/e2e/` 数据库和 8011 端口，不改动 8010 演示记录。验证报告会记录实际运行结果及截图位置。

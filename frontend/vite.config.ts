@@ -3,6 +3,7 @@ import { defineConfig } from 'vitest/config'
 
 const proxyTarget = { target: 'http://127.0.0.1:8000', changeOrigin: false }
 const apiProxy = {
+  '/logistics': proxyTarget,
   '/auth': proxyTarget,
   '/stores': proxyTarget,
   '/analysis-runs': proxyTarget,

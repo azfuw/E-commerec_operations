@@ -21,6 +21,7 @@ export function createAppRouter() {
     history: createWebHistory('/app/'),
     routes: [
       { path: '/login', name: 'login', component: LoginPage },
+      { path: '/logistics', name: 'logistics', component: () => import('./pages/LogisticsPage.vue'), meta: { requiresAuth: true } },
       { path: '/forbidden', name: 'forbidden', component: ForbiddenPage },
       { path: '/desktop-required', name: 'desktop-required', component: { render: () => h('section', {class:'page-state'}, [h('h1','请使用桌面或平板访问管理模块'), h('a',{href:'/app/workbench'},'返回工作台')]) } },
       {
@@ -51,8 +52,8 @@ export function createAppRouter() {
   })
 
   router.beforeEach((to) => {
-    if (to.name === 'login' && session.user) return { name: 'workbench' }
-    if (to.meta.requiresAuth && !session.user) return { name: 'login' }
+    if (to.name === 'login' && session.user) return { name: to.query.next === 'logistics' ? 'logistics' : 'workbench' }
+    if (to.meta.requiresAuth && !session.user) return { name: 'login', query: to.name === 'logistics' ? { next: 'logistics' } : {} }
     const mobile = typeof matchMedia === 'function' && matchMedia('(max-width: 767px)').matches
     if (to.name === 'knowledge' && session.user && !canUseKnowledge(session.user.role, mobile)) {
       return { name: canUseKnowledge(session.user.role, false) ? 'desktop-required' : 'forbidden' }
