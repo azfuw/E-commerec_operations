@@ -15,26 +15,28 @@ import ProposalPage from './pages/ProposalPage.vue'
 import ApprovalsPage from './pages/ApprovalsPage.vue'
 import WorkbenchPage from './pages/WorkbenchPage.vue'
 import { session } from './session'
+import { logisticsLocation } from './logistics'
 
 export function createAppRouter() {
   const router = createRouter({
     history: createWebHistory('/app/'),
+    scrollBehavior: (_to, _from, savedPosition) => savedPosition ?? { top: 0 },
     routes: [
       { path: '/login', name: 'login', component: LoginPage },
-      { path: '/logistics', name: 'logistics', component: () => import('./pages/LogisticsPage.vue'), meta: { requiresAuth: true } },
       { path: '/forbidden', name: 'forbidden', component: ForbiddenPage },
       { path: '/desktop-required', name: 'desktop-required', component: { render: () => h('section', {class:'page-state'}, [h('h1','请使用桌面或平板访问管理模块'), h('a',{href:'/app/workbench'},'返回工作台')]) } },
       {
         path: '/',
         component: AppShell,
-        meta: { requiresAuth: true },
+        meta: { requiresAuth: true, workspace: 'operations' },
         children: [
           { path: '', redirect: { name: 'workbench' } },
+          { path: 'logistics', name: 'logistics', component: () => import('./pages/LogisticsPage.vue'), meta: { workspace: 'logistics' } },
           { path: 'workbench', name: 'workbench', component: WorkbenchPage },
-          { path: 'knowledge', name: 'knowledge', component: KnowledgePage },
-          { path: 'agent-evaluations', name: 'agent-evaluations', component: AgentEvaluationsPage },
-          { path: 'audit-events', name: 'audit-events', component: AuditEventsPage },
-          { path: 'admin', name: 'admin', component: SystemManagementPage },
+          { path: 'knowledge', name: 'knowledge', component: KnowledgePage, meta: { workspace: 'shared' } },
+          { path: 'agent-evaluations', name: 'agent-evaluations', component: AgentEvaluationsPage, meta: { workspace: 'shared' } },
+          { path: 'audit-events', name: 'audit-events', component: AuditEventsPage, meta: { workspace: 'shared' } },
+          { path: 'admin', name: 'admin', component: SystemManagementPage, meta: { workspace: 'shared' } },
           { path: 'analysis', name: 'analysis', component: AnalysisPage },
           { path: 'analysis/:runId', name: 'analysis-run', component: AnalysisRunPage },
           { path: 'proposals', name: 'proposals', component: WorkbenchPage },
@@ -52,8 +54,8 @@ export function createAppRouter() {
   })
 
   router.beforeEach((to) => {
-    if (to.name === 'login' && session.user) return { name: to.query.next === 'logistics' ? 'logistics' : 'workbench' }
-    if (to.meta.requiresAuth && !session.user) return { name: 'login', query: to.name === 'logistics' ? { next: 'logistics' } : {} }
+    if (to.name === 'login' && session.user) return to.query.next === 'logistics' ? logisticsLocation(to.query.view) : { name: 'workbench' }
+    if (to.meta.requiresAuth && !session.user) return { name: 'login', query: to.name === 'logistics' ? { next: 'logistics', ...logisticsLocation(to.query.view).query } : {} }
     const mobile = typeof matchMedia === 'function' && matchMedia('(max-width: 767px)').matches
     if (to.name === 'knowledge' && session.user && !canUseKnowledge(session.user.role, mobile)) {
       return { name: canUseKnowledge(session.user.role, false) ? 'desktop-required' : 'forbidden' }

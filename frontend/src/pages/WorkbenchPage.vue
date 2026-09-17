@@ -131,7 +131,7 @@ onBeforeUnmount(() => {
       <div>
         <p class="eyebrow">OPERATIONS</p>
         <h1 id="workbench-title">{{ proposalOnly ? '优化任务' : '任务工作台' }}</h1>
-        <p class="muted">从服务端恢复并继续处理你的业务任务。</p>
+        <p class="muted">集中处理经营分析、商品优化与审批任务。</p>
       </div>
       <span class="current-page-label" data-test="summary-label">当前页</span>
     </header>
@@ -145,6 +145,7 @@ onBeforeUnmount(() => {
       <div class="summary-item"><strong>{{ summary.completed }}</strong><span>最近完成</span></div>
     </div>
 
+    <div class="task-panel">
     <div class="task-filters" aria-label="任务筛选">
       <el-select
         v-model="storeId"
@@ -199,7 +200,8 @@ onBeforeUnmount(() => {
       v-else-if="!items.length"
       :data-test="hasFilters ? 'filtered-empty' : 'system-empty'"
       :description="hasFilters ? '没有符合筛选条件的任务' : '当前没有任务'"
-    />
+      :image-size="84"
+    ><p class="empty-note">{{ hasFilters ? '调整筛选条件，查看其他任务。' : '新的分析与优化任务会在这里汇总，方便持续跟进。' }}</p></el-empty>
     <template v-else>
       <el-table class="desktop-task-table" :data="items" table-layout="fixed">
         <el-table-column label="任务详情">
@@ -257,6 +259,7 @@ onBeforeUnmount(() => {
         @current-change="changePage"
       />
     </template>
+    </div>
   </section>
 </template>
 
@@ -280,17 +283,16 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-bottom: 20px;
-  border: 1px solid #dbe2e8;
+  border: 1px solid var(--app-border);
   border-radius: var(--app-radius);
   background: var(--app-surface);
 }
 
 .summary-item {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 16px 20px;
-  border-right: 1px solid #dbe2e8;
+  display: grid;
+  gap: 8px;
+  padding: 20px;
+  border-right: 1px solid var(--app-border);
 }
 
 .summary-item:last-child {
@@ -298,17 +300,35 @@ onBeforeUnmount(() => {
 }
 
 .summary-item strong {
-  font-size: 24px;
+  order: 1;
+  font-size: 32px;
+  font-weight: 650;
+  line-height: 1.2;
 }
 
 .summary-item span {
   color: var(--app-muted);
-  font-size: 13px;
+  font-size: 12px;
 }
+
+.task-panel {
+  min-width: 0;
+  padding: 20px;
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius);
+  background: var(--app-surface);
+}
+
+.empty-note { margin: 0; color: var(--app-muted); font-size: 12px; line-height: 1.7; text-align: center; }
+.task-panel :deep(.el-empty) { min-height: 280px; }
+.task-panel :deep(.el-empty__bottom) { margin-top: 8px; }
 
 .task-filters {
   justify-content: flex-start;
   margin-bottom: 16px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--app-border);
+  flex-wrap: wrap;
 }
 
 .task-filters .el-select {
@@ -338,7 +358,7 @@ onBeforeUnmount(() => {
 
 .desktop-task-row a,
 .mobile-task-row a {
-  color: #0b5f59;
+  color: var(--app-accent);
   font-weight: 600;
   text-decoration: none;
 }
@@ -362,7 +382,7 @@ onBeforeUnmount(() => {
   }
 
   .summary-item:nth-child(-n + 2) {
-    border-bottom: 1px solid #dbe2e8;
+    border-bottom: 1px solid var(--app-border);
   }
 
   .task-filters {
@@ -386,7 +406,7 @@ onBeforeUnmount(() => {
   .mobile-task-row {
     min-width: 0;
     padding: 16px;
-    border: 1px solid #dbe2e8;
+    border: 1px solid var(--app-border);
     border-radius: var(--app-radius);
     background: var(--app-surface);
     overflow-wrap: anywhere;
@@ -396,5 +416,9 @@ onBeforeUnmount(() => {
     color: var(--app-muted);
     font-size: 14px;
   }
+
+  .task-panel { padding: 16px; }
+  .summary-item { padding: 17px; }
+  .summary-item strong { font-size: 28px; }
 }
 </style>

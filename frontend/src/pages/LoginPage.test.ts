@@ -79,12 +79,12 @@ describe('LoginPage', () => {
     expect(router.currentRoute.value.fullPath).toBe('/app/workbench')
   })
 
-  it('returns a logistics visitor to the logistics workspace', async () => {
-    const { router, wrapper } = await mountLogin('?next=logistics')
+  it('preserves a logistics visitor’s destination after login', async () => {
+    const { router, wrapper } = await mountLogin('?next=logistics&view=returns')
     await wrapper.get('input#username').setValue('logistics')
     await wrapper.get('input#password').setValue('Logistics!2026')
     await wrapper.get('form').trigger('submit')
     await flushPromises()
-    expect(router.currentRoute.value.fullPath).toBe('/app/logistics')
+    expect(router.currentRoute.value.fullPath).toBe('/app/logistics?view=returns')
   })
 })

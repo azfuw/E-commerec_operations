@@ -1,5 +1,25 @@
 import { apiRequest } from './api'
 
+export const logisticsViewLabels = {
+  overview: '物流总览',
+  shipments: '运单追踪',
+  returns: '退货管理',
+  exceptions: '异常工单',
+  agent: 'Agent 工作台',
+} as const
+export type LogisticsView = keyof typeof logisticsViewLabels
+
+export function getLogisticsView(value: unknown): LogisticsView {
+  return typeof value === 'string' && Object.hasOwn(logisticsViewLabels, value)
+    ? value as LogisticsView
+    : 'overview'
+}
+
+export function logisticsLocation(value: unknown) {
+  const view = getLogisticsView(value)
+  return { name: 'logistics', query: view === 'overview' ? {} : { view } }
+}
+
 export type ShipmentStatus = 'pending_dispatch' | 'in_transit' | 'delivered'
 export type ReturnStatus = 'requested' | 'approved' | 'in_transit' | 'received' | 'closed' | 'rejected'
 export type ExceptionStatus = 'open' | 'in_progress' | 'resolved'

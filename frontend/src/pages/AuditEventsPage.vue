@@ -44,4 +44,16 @@ onMounted(()=>void load());onBeforeUnmount(()=>controller?.abort())
     </template>
   </section>
 </template>
-<style scoped>.filters{display:flex;flex-wrap:wrap;align-items:end;gap:16px;margin:20px 0}label{display:grid;gap:6px}input,select{padding:9px;border:1px solid #cbd5df;border-radius:4px;background:var(--app-surface);color:inherit}dt{color:var(--app-muted)}dd{margin:0 0 10px;overflow-wrap:anywhere}</style>
+<style scoped>
+.filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; gap: 18px 16px; margin: 24px 0; padding: 22px; border: 1px solid var(--app-border); border-radius: var(--app-radius); background: var(--app-surface); }
+.filters label { display: grid; min-width: 0; gap: 8px; color: var(--app-muted); font-size: 12px; }
+.filters label:nth-last-of-type(2) { grid-column: 1; }
+.filters input, .filters select { width: 100%; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid var(--app-border); border-radius: 5px; background: var(--app-surface); color: var(--app-text); }
+.filters .el-button { justify-self: start; min-width: 90px; height: 36px; }
+dt { color: var(--app-muted); }
+dd { margin: 0 0 10px; overflow-wrap: anywhere; }
+:deep(.el-empty) { min-height: 240px; border: 1px solid var(--app-border); border-radius: var(--app-radius); background: var(--app-surface); }
+:deep(.el-empty__image) { width: 84px; }
+.el-pagination { justify-content: flex-end; margin-top: 18px; }
+@media (max-width: 1100px) { .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+</style>

@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
-import { formatShanghai, overviewEventDescription, shanghaiInputValue, toCsv, toUtcIso } from './logistics'
+import { formatShanghai, getLogisticsView, logisticsLocation, overviewEventDescription, shanghaiInputValue, toCsv, toUtcIso } from './logistics'
 
 describe('logistics helpers', () => {
+  it('accepts only known view names and builds safe internal destinations', () => {
+    expect(getLogisticsView('returns')).toBe('returns')
+    for (const view of [undefined, '', 'missing', '__proto__', ['returns', 'agent']]) {
+      expect(getLogisticsView(view)).toBe('overview')
+      expect(logisticsLocation(view)).toEqual({ name: 'logistics', query: {} })
+    }
+    expect(logisticsLocation('returns')).toEqual({ name: 'logistics', query: { view: 'returns' } })
+  })
+
   it('formats UTC timestamps in Asia/Shanghai', () => {
     expect(formatShanghai('2026-09-17T00:00:00Z')).toBe('2026/09/17 08:00')
     expect(formatShanghai(null)).toBe('\u2014')

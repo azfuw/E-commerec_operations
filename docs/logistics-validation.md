@@ -15,9 +15,10 @@
 | 验证 | 结果 |
 | --- | --- |
 | 后端完整离线回归 `python -m pytest -q` | **1106 passed，45 skipped**；1 条既有 LangGraph 依赖弃用提示 |
-| 前端完整单元测试 `npm test -- --run` | **16 文件，87 passed** |
+| 前端完整单元测试 `npm test -- --run` | **16 文件，88 passed** |
 | TypeScript 与生产构建 `npm run build` | **通过**；原主应用分包仍有体积提示，物流页面独立懒加载 |
-| 真实服务 Playwright `playwright test -c playwright.logistics.config.ts` | **3 passed**，无 API mock |
+| 真实服务 Playwright `playwright test -c playwright.logistics.config.ts` | **4 passed**，无 API mock |
+| 原运营与管理页面 Playwright `playwright test -c playwright.config.ts` | **9 passed**，使用现有 API fixture 验证运营流程及权限 |
 | PostgreSQL 迁移 | 独立临时数据库执行 upgrade head → check → downgrade 0007 → upgrade head → check，全部通过，未发现结构漂移 |
 | PostgreSQL 真实业务定向核验 | 两会话旧快照无误报、并发巡检仅 1 任务/1 事件、完整退货结案、历史事件防篡改均通过；自有验证库已清理 |
 | 代码检查 | `git diff --check` 通过 |
@@ -29,6 +30,7 @@
 1. 登录自动返回物流入口、总览、规则巡检、含运单引用的物流简报、异常分配和解决；390px 手机布局无页面横向溢出。
 2. 通过页面新建运单、登记实际发货、立即申请退货、审核、登记退回运输、收货、质检结案及 CSV 下载。验证了此前时间精度和退货字段传递问题的真实修复。
 3. 未登录接口拒绝访问；仓库员工只能读取自己的店铺；不能读取其他店铺数据。
+4. 运营与物流共用外框；部门切换保留最近业务页；共享审计页面保留来源部门；物流子页面刷新、后退与高亮一致；手机部门切换与末项导航可用。
 
 浏览器验证独立运行在 8011 端口，数据库位于 `data/logistics-demo/e2e/`，不污染 8010 展示库。数据和签名密钥在被 Git 忽略的本机目录中，未纳入交付代码。
 
@@ -46,9 +48,18 @@
 - [运单详情](assets/logistics/shipment-detail.png)
 - [Agent 事实引用](assets/logistics/agent-evidence.png)
 - [手机总览](assets/logistics/mobile-overview.png)
+- [运营工作台](assets/logistics/operations-workbench.png)
+- [共享审计页面](assets/logistics/shared-audit.png)
+- [手机运营工作台](assets/logistics/mobile-operations.png)
 - [使用指南](logistics-guide.md)
 - [API 契约](logistics-api-contract.md)
 - [独立审查报告](logistics-review-report.md)
+
+## 部门导航与样式优化
+
+2026-09-17 根据工作台切换反馈，运营与物流统一使用“智营台”品牌、固定部门切换、账号栏和响应式外框。删除物流页重复的侧栏及“返回运营工作台”按钮；业务菜单与“管理与支持”分组。物流视图使用白名单 `view` 查询参数，支持登录回跳、刷新和浏览器历史。
+
+样式职责：`frontend/src/styles.css` 管理公共主题、字体和通用页面样式；`AppShell.vue` 的 scoped 样式管理共享导航与外框；各业务页面只管理自己的表格、筛选、看板和弹窗。物流两段叠加样式已合并，并改用公共颜色变量；运营空状态与审计筛选面板同步调整。独立前端审查未发现重要问题。本轮没有修改后端。
 
 ## 当前范围
 
