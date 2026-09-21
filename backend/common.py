@@ -8,6 +8,11 @@ class UserRole(StrEnum):
     ADMIN = "admin"
 
 
+class UserDepartment(StrEnum):
+    OPERATIONS = "operations"
+    LOGISTICS = "logistics"
+
+
 class UserStatus(StrEnum):
     ACTIVE = "active"
     DISABLED = "disabled"

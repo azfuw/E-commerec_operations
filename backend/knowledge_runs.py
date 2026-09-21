@@ -1,18 +1,46 @@
 import logging
 from time import perf_counter
 
+from fastapi import HTTPException
 from sqlalchemy import and_, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.common import KnowledgeVersionStatus, AuditEventType, AuditOutcome
+from backend.common import KnowledgeVersionStatus, AuditEventType, AuditOutcome, UserDepartment, UserRole
+from backend.auth import has_department_access
 from backend.audit_events import add_audit_event
 from backend.knowledge_content import ChunkDraft
-from backend.models import KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion, User
+from backend.models import AuditEvent, KnowledgeChunk, KnowledgeDocument, KnowledgeDocumentVersion, User
 
 
 _logger = logging.getLogger("backend.knowledge")
+
+
+async def _knowledge_actor(session: AsyncSession, actor_id: str) -> User:
+    actor = await session.scalar(select(User).where(User.id == actor_id).execution_options(populate_existing=True).with_for_update(read=True))
+    if not has_department_access(actor, UserDepartment.OPERATIONS) or actor.role is not UserRole.ADMIN:
+        raise HTTPException(403, "Knowledge administration forbidden")
+    return actor
+
+
+async def _authorized_version(session: AsyncSession, version: KnowledgeDocumentVersion) -> bool:
+    # New versions record their uploader in the immutable audit; legacy versions use the document creator.
+    actor_id = await session.scalar(select(AuditEvent.actor_id).where(
+        AuditEvent.event_type == AuditEventType.KNOWLEDGE_VERSION_CREATED,
+        AuditEvent.resource_type == "knowledge_version", AuditEvent.resource_id == version.id,
+    ).order_by(AuditEvent.created_at, AuditEvent.id).limit(1))
+    if actor_id is None:
+        actor_id = await session.scalar(select(KnowledgeDocument.created_by).where(KnowledgeDocument.id == version.document_id))
+    try:
+        await _knowledge_actor(session, actor_id)
+    except HTTPException:
+        version.status = KnowledgeVersionStatus.FAILED
+        version.lease_owner = version.lease_expires_at = None
+        version.error_code = "KNOWLEDGE_AUTHORIZATION_CHANGED"
+        await session.commit()
+        return False
+    return True
 
 
 def _lease_expiry(session: AsyncSession, lease_seconds: int):
@@ -107,6 +135,7 @@ async def create_document_version(
     idempotency_key: str | None = None,
 ) -> tuple[KnowledgeDocument, KnowledgeDocumentVersion, bool]:
     started = perf_counter()
+    actor = await _knowledge_actor(session, created_by)
     if name is not None and idempotency_key:
         existing_document = await find_document_by_idempotency_key(
             session, created_by=created_by, idempotency_key=idempotency_key
@@ -169,7 +198,6 @@ async def create_document_version(
     )
     session.add(version)
     await session.flush()
-    actor = await session.get(User, created_by)
     add_audit_event(session,
         event_type=(AuditEventType.KNOWLEDGE_DOCUMENT_CREATED if new_document
                     else AuditEventType.KNOWLEDGE_VERSION_CREATED),
@@ -301,6 +329,13 @@ async def _commit_owned_update(
 async def renew_knowledge_lease(
     session: AsyncSession, *, version_id: str, lease_owner: str, lease_seconds: int
 ) -> bool:
+    version = await session.scalar(select(KnowledgeDocumentVersion).where(*_owned_lease(version_id, lease_owner))
+        .execution_options(populate_existing=True).with_for_update())
+    if version is None:
+        await session.rollback()
+        return False
+    if not await _authorized_version(session, version):
+        return False
     return await _commit_owned_update(
         session,
         version_id=version_id,
@@ -385,6 +420,8 @@ async def upsert_knowledge_chunks(
     if version is None:
         await session.rollback()
         return False
+    if not await _authorized_version(session, version):
+        return False
     context = await _version_context(session, version_id)
     try:
         for chunk in chunks:
@@ -451,6 +488,8 @@ async def activate_knowledge_version(
     )
     if candidate is None:
         await session.rollback()
+        return False
+    if not await _authorized_version(session, candidate):
         return False
     current = (
         await session.get(KnowledgeDocumentVersion, document.current_version_id)
@@ -530,6 +569,7 @@ async def disable_knowledge_document(session: AsyncSession, *, document_id: str,
     if document is None:
         await session.rollback()
         return False
+    actor = await _knowledge_actor(session, actor_id or document.created_by)
     await session.execute(
         update(KnowledgeDocument)
         .where(KnowledgeDocument.id == document_id)
@@ -553,7 +593,6 @@ async def disable_knowledge_document(session: AsyncSession, *, document_id: str,
             lease_expires_at=None,
         )
     )
-    actor = await session.get(User, actor_id or document.created_by)
     add_audit_event(session, event_type=AuditEventType.KNOWLEDGE_DOCUMENT_DISABLED,
         outcome=AuditOutcome.SUCCESS, store_id=None, actor_id=actor.id if actor else None,
         actor_role=actor.role if actor else None, resource_type='knowledge_document',

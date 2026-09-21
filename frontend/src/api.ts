@@ -331,7 +331,7 @@ export function listAdminStores(query: import('./types').AdminStoreQuery, signal
   const params = new URLSearchParams(Object.entries(query).filter(([,v]) => v !== undefined).map(([k,v]) => [k,String(v)]))
   return apiRequest(`/admin/stores?${params}`, signal ? { signal } : {})
 }
-export function updateAdminUser(id: string, body: { role?: import('./types').UserRole; status?: import('./types').UserStatus }, signal?: AbortSignal): Promise<import('./types').AdminUser> {
+export function updateAdminUser(id: string, body: { role?: import('./types').UserRole; department?: import('./types').UserDepartment; status?: import('./types').UserStatus }, signal?: AbortSignal): Promise<import('./types').AdminUser> {
   return apiRequest(`/admin/users/${encodeURIComponent(id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), ...(signal ? { signal } : {}) })
 }
 export function replaceAdminUserScopes(id: string, storeIds: string[], signal?: AbortSignal): Promise<import('./types').AdminUser> {

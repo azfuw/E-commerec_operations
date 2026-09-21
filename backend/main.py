@@ -9,7 +9,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import FileResponse
 from starlette.staticfiles import StaticFiles
 
-from backend.routes import router
+from backend.routes import router, shared_router
 from backend.logistics import router as logistics_router
 from backend.schemas import KnowledgeEnvelope, KnowledgeError
 
@@ -76,6 +76,7 @@ def _mount_frontend(app: FastAPI, frontend_dist: Path) -> None:
 def create_app(frontend_dist: Path | None = None) -> FastAPI:
     app = FastAPI(title="智营台 API", version="0.1.0")
     app.include_router(router)
+    app.include_router(shared_router)
     app.include_router(logistics_router)
 
     @app.exception_handler(StarletteHTTPException)

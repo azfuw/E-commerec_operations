@@ -9,6 +9,7 @@ from backend.platform_delivery_runs import (
     claim_next_platform_delivery,
     complete_platform_delivery,
     fail_platform_delivery,
+    publish_authorized,
     return_platform_delivery_for_retry,
 )
 
@@ -42,6 +43,8 @@ async def _load_publish_request(
         )
         if record is None or record.store_id != delivery.store_id:
             raise ValueError("invalid platform delivery linkage")
+        if not await publish_authorized(session, record):
+            raise PlatformClientError("PLATFORM_FORBIDDEN", False)
         request = (
             record.store_id,
             record.product_id,
@@ -89,6 +92,10 @@ async def run_once(
         return None
     delivery_id = delivery.id
 
+    async def authorize_publish() -> bool:
+        await _load_publish_request(session_factory, delivery)
+        return True
+
     client_error: tuple[str, bool, int | None] | None = None
     unexpected = False
     try:
@@ -100,6 +107,7 @@ async def run_once(
             product_id=product_id,
             payload=payload,
             idempotency_key=idempotency_key,
+            before_http_attempt=authorize_publish,
         )
     except PlatformClientError as error:
         client_error = (error.code, error.retryable, error.retry_after_seconds)

@@ -6,7 +6,7 @@ import {
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { canUseKnowledge, canViewAgentObservability, canViewAuditEvents, canManageSystem } from '../capabilities'
+import { canAccessDepartment, canUseKnowledge, canViewAgentObservability, canViewAuditEvents, canManageSystem } from '../capabilities'
 import { getLogisticsView, logisticsLocation, logisticsViewLabels, type LogisticsView } from '../logistics'
 import { clearSession, session } from '../session'
 
@@ -28,6 +28,9 @@ watch(() => route.fullPath, (path) => {
 }, { immediate: true })
 
 const roleLabel = computed(() => session.user ? { operator: '员工', supervisor: '主管', admin: '管理员' }[session.user.role] : '')
+const accountDepartmentLabel = computed(() => session.user?.department === 'logistics' ? '物流部门' : '运营部门')
+const canUseOperations = computed(() => !!session.user && canAccessDepartment(session.user.role, session.user.department, 'operations'))
+const canUseLogistics = computed(() => !!session.user && canAccessDepartment(session.user.role, session.user.department, 'logistics'))
 const canReview = computed(() => session.user?.role === 'supervisor' || session.user?.role === 'admin')
 const logisticsIcons = { overview: DataAnalysis, shipments: Box, returns: RefreshLeft, exceptions: Warning, agent: ChatLineRound }
 const logisticsViews = Object.keys(logisticsViewLabels) as LogisticsView[]
@@ -41,9 +44,9 @@ const sharedLinks = computed(() => {
   const role = session.user?.role
   if (!role) return []
   return [
-    { name: 'knowledge', label: '知识库', icon: Collection, visible: canUseKnowledge(role, isMobile.value) },
-    { name: 'agent-evaluations', label: 'Agent 评测', icon: DataAnalysis, visible: canViewAgentObservability(role, isMobile.value) },
-    { name: 'audit-events', label: '审计日志', icon: Tickets, visible: canViewAuditEvents(role, isMobile.value) },
+    { name: 'knowledge', label: '知识库', icon: Collection, visible: canUseKnowledge(role, session.user!.department, isMobile.value) },
+    { name: 'agent-evaluations', label: 'Agent 评测', icon: DataAnalysis, visible: canViewAgentObservability(role, session.user!.department, isMobile.value) },
+    { name: 'audit-events', label: '审计日志', icon: Tickets, visible: canViewAuditEvents(role, session.user!.department, isMobile.value) },
     { name: 'admin', label: '系统管理', icon: Setting, visible: canManageSystem(role, isMobile.value) },
   ].filter(item => item.visible)
 })
@@ -63,9 +66,9 @@ function logout(): void {
     <aside class="app-sidebar" aria-label="主导航">
       <div class="sidebar-top">
         <div class="app-brand"><span class="brand-symbol" aria-hidden="true">营</span><div><strong>智营台</strong><small>运营与物流协同</small></div></div>
-        <nav class="department-switch" aria-label="部门切换">
-          <router-link :to="lastOperations" aria-label="运营工作台" :aria-current="!isLogistics ? 'true' : undefined" :class="{ selected: !isLogistics }"><el-icon><TrendCharts /></el-icon><span>运营</span></router-link>
-          <router-link :to="lastLogistics" aria-label="物流工作台" :aria-current="isLogistics ? 'true' : undefined" :class="{ selected: isLogistics }"><el-icon><Van /></el-icon><span>物流</span></router-link>
+        <nav class="department-switch" :class="{ single: !(canUseOperations && canUseLogistics) }" aria-label="部门切换">
+          <router-link v-if="canUseOperations" :to="lastOperations" aria-label="运营工作台" :aria-current="!isLogistics ? 'true' : undefined" :class="{ selected: !isLogistics }"><el-icon><TrendCharts /></el-icon><span>运营</span></router-link>
+          <router-link v-if="canUseLogistics" :to="lastLogistics" aria-label="物流工作台" :aria-current="isLogistics ? 'true' : undefined" :class="{ selected: isLogistics }"><el-icon><Van /></el-icon><span>物流</span></router-link>
         </nav>
       </div>
       <nav class="business-navigation" :aria-label="isLogistics ? '物流业务导航' : '运营业务导航'">
@@ -92,7 +95,7 @@ function logout(): void {
       <header class="app-header">
         <div class="workspace-path"><span>{{ route.meta.workspace === 'shared' ? '管理与支持' : departmentLabel }}</span><span aria-hidden="true">/</span><strong>{{ currentPage }}</strong></div>
         <div class="account-controls">
-          <div v-if="session.user" class="user-summary"><span class="user-avatar" aria-hidden="true">{{ session.user.username.slice(0, 1).toUpperCase() }}</span><span class="user-name">{{ session.user.username }}</span><span class="user-role">{{ roleLabel }}</span></div>
+          <div v-if="session.user" class="user-summary"><span class="user-avatar" aria-hidden="true">{{ session.user.username.slice(0, 1).toUpperCase() }}</span><span class="user-name">{{ session.user.username }}</span><span class="user-department">{{ accountDepartmentLabel }}</span><span class="user-role">{{ roleLabel }}</span></div>
           <el-button class="logout-button" :icon="SwitchButton" text aria-label="退出登录" @click="logout"><span>退出登录</span></el-button>
         </div>
       </header>
@@ -127,6 +130,7 @@ function logout(): void {
 .app-brand strong { font-size: 21px; line-height: 1.2; letter-spacing: -.04em; }
 .app-brand small { color: var(--app-muted); font-size: 10px; letter-spacing: .08em; }
 .department-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 26px; padding: 4px; border: 1px solid var(--app-border); border-radius: 9px; background: #f0f3ef; }
+.department-switch.single { grid-template-columns: 1fr; }
 .department-switch a { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 34px; border-radius: 6px; color: var(--app-muted); text-decoration: none; transition: background .16s, color .16s; }
 .department-switch a:hover { color: var(--app-accent); }
 .department-switch a.selected { background: var(--app-surface); color: var(--app-accent); box-shadow: 0 1px 3px #233f2c12; font-weight: 650; }
@@ -145,7 +149,7 @@ function logout(): void {
 .user-summary { font-size: 13px; }
 .user-avatar { display: grid; flex-shrink: 0; place-items: center; width: 30px; height: 30px; border: 1px solid var(--app-border); border-radius: 50%; background: var(--app-bg); color: var(--app-accent); font-weight: 600; }
 .user-name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
-.user-role { color: var(--app-muted); font-size: 11px; }
+.user-department, .user-role { color: var(--app-muted); font-size: 11px; }
 .logout-button { color: var(--app-muted); }
 .app-main { width: 100%; max-width: 1600px; margin: 0 auto; padding: 30px 32px 48px; }
 .app-main:focus { outline: none; }
@@ -154,7 +158,7 @@ function logout(): void {
   .app-sidebar { padding-right: 12px; padding-left: 12px; }
   .app-header { padding-right: 24px; padding-left: 24px; }
   .app-main { padding: 24px 24px 40px; }
-  .user-role, .logout-button span { display: none; }
+  .user-department, .user-role, .logout-button span { display: none; }
 }
 @media (max-width: 767px) {
   .app-shell { display: block; }

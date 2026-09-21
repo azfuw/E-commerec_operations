@@ -18,7 +18,7 @@ const storeController = new AbortController()
 const isMobile =
   typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 767px)').matches
 const canStart = computed(
-  () => Boolean(session.user && canStartAnalysis(session.user.role, isMobile)),
+  () => Boolean(session.user && canStartAnalysis(session.user.role, session.user.department, isMobile)),
 )
 const days = computed(() => {
   if (!dates.value) return 0

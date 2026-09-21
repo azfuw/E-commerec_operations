@@ -5,7 +5,7 @@ import {canViewAuditEvents} from '../capabilities'
 import {session} from '../session'
 import type {AuditEvent,AuditEventQuery} from '../types'
 const mobile=typeof matchMedia==='function'&&matchMedia('(max-width: 767px)').matches
-const allowed=computed(()=>!!session.user&&canViewAuditEvents(session.user.role,mobile))
+const allowed=computed(()=>!!session.user&&canViewAuditEvents(session.user.role,session.user.department,mobile))
 const items=ref<AuditEvent[]>([]),selected=ref<AuditEvent|null>(null),drawer=ref(false),loading=ref(false),error=ref(''),page=ref(1),total=ref(0)
 const filters=reactive({store_id:'',proposal_id:'',workflow_run_id:'',actor_id:'',event_type:'',action:'',outcome:''})
 const from=ref(''),to=ref('')

@@ -4,7 +4,7 @@ import { ElMessageBox } from 'element-plus'
 import { ApiError, listAdminUsers, listAdminStores, updateAdminUser, replaceAdminUserScopes, updateAdminStore } from '../api'
 import { canManageSystem } from '../capabilities'
 import { session } from '../session'
-import type { AdminUser, AdminStore, UserRole, UserStatus } from '../types'
+import type { AdminUser, AdminStore, UserDepartment, UserRole, UserStatus } from '../types'
 
 const mobile = typeof matchMedia === 'function' && matchMedia('(max-width: 767px)').matches
 const allowed = computed(() => !!session.user && canManageSystem(session.user.role, mobile))
@@ -13,11 +13,12 @@ const users = ref<AdminUser[]>([]), stores = ref<AdminStore[]>([])
 const filters = reactive({ role: '' as UserRole | '', status: '' as UserStatus | '', store_id: '', enabled: '' })
 const loading = ref(false), pending = ref(false), error = ref(''), notice = ref('')
 const selected = ref<AdminUser | null>(null), editor = ref('')
-const form = reactive({ role: 'operator' as UserRole, status: 'active' as UserStatus, scopes: '' })
+const form = reactive({ role: 'operator' as UserRole, department: 'operations' as UserDepartment, status: 'active' as UserStatus, scopes: '' })
 const lifetime = new AbortController()
 let controller: AbortController | undefined
 const roles: UserRole[] = ['operator', 'supervisor', 'admin']
-const roleNames = { operator: '运营', supervisor: '主管', admin: '管理员' }
+const roleNames = { operator: '员工', supervisor: '主管', admin: '管理员' }
+const departmentNames = { operations: '运营', logistics: '物流' }
 const filtered = computed(() => tab.value === 'users' ? !!(filters.role || filters.status || filters.store_id) : !!filters.enabled)
 
 function failure(caught: unknown): void {
@@ -45,7 +46,7 @@ async function load(): Promise<void> {
 }
 function edit(user: AdminUser, mode: string): void {
   selected.value = user; editor.value = mode; error.value = ''; notice.value = ''
-  form.role = user.role; form.status = user.status; form.scopes = user.store_ids.join('\n')
+  form.role = user.role; form.department = user.department; form.status = user.status; form.scopes = user.store_ids.join('\n')
 }
 async function confirm(message: string): Promise<boolean> {
   try { await ElMessageBox.confirm(message, '确认变更', { confirmButtonText: '确认', cancelButtonText: '取消', type: 'warning' }); return true }
@@ -59,7 +60,7 @@ async function save(): Promise<void> {
     if (editor.value === 'user') {
       if (user.id === session.user?.id && (form.role !== 'admin' || form.status !== 'active')) return
       if (form.status !== user.status && !await confirm(`将「${user.username}」设为${form.status === 'disabled' ? '停用' : '启用'}？`)) return
-      await updateAdminUser(user.id, { role: form.role, status: form.status }, lifetime.signal)
+      await updateAdminUser(user.id, { role: form.role, department: form.department, status: form.status }, lifetime.signal)
     } else {
       const ids = form.scopes.split(/\s+/).filter(Boolean)
       if (ids.length > 100 || new Set(ids).size !== ids.length || ids.some(id => id.length > 36)) {
@@ -113,6 +114,7 @@ onBeforeUnmount(() => { lifetime.abort(); controller?.abort() })
           <el-empty v-if="!users.length" :description="filtered ? '没有符合筛选条件的用户' : '暂无用户'" />
           <el-table v-else :data="users">
             <el-table-column prop="username" label="用户名" min-width="120" />
+            <el-table-column label="部门" width="90"><template #default="{row}">{{ departmentNames[row.department as UserDepartment] }}</template></el-table-column>
             <el-table-column label="角色" width="100"><template #default="{row}">{{ roleNames[row.role as UserRole] }}</template></el-table-column>
             <el-table-column label="状态" width="90"><template #default="{row}"><el-tag :type="row.status === 'active' ? 'success' : 'info'">{{ row.status === 'active' ? '启用' : '停用' }}</el-tag></template></el-table-column>
             <el-table-column label="授权店铺" min-width="140"><template #default="{row}">{{ row.store_ids.join('、') || '无' }}</template></el-table-column>
@@ -135,6 +137,7 @@ onBeforeUnmount(() => { lifetime.abort(); controller?.abort() })
           <form class="edit-form" @submit.prevent="save">
             <template v-if="editor === 'user'">
               <label>用户角色 <select v-model="form.role" aria-label="用户角色" :disabled="pending || selected.id === session.user?.id"><option v-for="role in roles" :key="role" :value="role">{{ roleNames[role] }}</option></select></label>
+              <label>所属部门 <select v-model="form.department" aria-label="所属部门" :disabled="pending"><option value="operations">运营</option><option value="logistics">物流</option></select></label>
               <label>用户状态 <select v-model="form.status" aria-label="用户状态" :disabled="pending || selected.id === session.user?.id"><option value="active">启用</option><option value="disabled">停用</option></select></label>
               <p v-if="selected.id === session.user?.id" class="muted">不能停用自己或降低自己的管理员角色。</p>
             </template>

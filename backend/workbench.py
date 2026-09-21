@@ -7,10 +7,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from backend.auth import store_visibility_predicate
+from backend.auth import has_department_access, store_visibility_predicate
 from backend.common import (
+    UserDepartment,
     UserRole,
-    UserStatus,
     WorkflowQuality,
     WorkflowStatus,
     WorkflowType,
@@ -112,7 +112,7 @@ async def list_workbench_tasks(
             .where(User.id == actor_id)
             .execution_options(populate_existing=True)
         )
-        if actor is None or actor.status is not UserStatus.ACTIVE:
+        if not has_department_access(actor, UserDepartment.OPERATIONS):
             raise WorkbenchDomainError("WORKBENCH_FORBIDDEN", 403)
 
         authorized_store_ids = set(

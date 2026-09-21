@@ -7,7 +7,7 @@ from pwdlib import PasswordHash
 from sqlalchemy import select, true, ColumnElement
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.common import UserRole, UserStatus, utc_now
+from backend.common import UserDepartment, UserRole, UserStatus, utc_now
 from backend.config import Settings, get_settings
 from backend.database import get_session
 from backend.models import Store, User, UserStoreScope
@@ -81,6 +81,27 @@ def store_visibility_predicate(actor: User, store_id_column: ColumnElement[str])
     return store_id_column.in_(select(UserStoreScope.store_id).where(UserStoreScope.user_id == actor.id))
 
 
+def has_department_access(user: User | None, department: UserDepartment) -> bool:
+    return user is not None and user.status is UserStatus.ACTIVE and (
+        user.role is UserRole.ADMIN or user.department is department
+    )
+
+
+def require_department(user: User | None, department: UserDepartment) -> None:
+    if not has_department_access(user, department):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Department access forbidden")
+
+
+async def require_operations_user(user: User = Depends(get_current_user)) -> User:
+    require_department(user, UserDepartment.OPERATIONS)
+    return user
+
+
+async def require_logistics_user(user: User = Depends(get_current_user)) -> User:
+    require_department(user, UserDepartment.LOGISTICS)
+    return user
+
+
 def require_roles(*roles: UserRole):
     async def role_dependency(user: User = Depends(get_current_user)) -> User:
         if user.role not in roles:
@@ -101,8 +122,9 @@ async def require_store_access(
     if user.role is UserRole.ADMIN:
         return store
 
-    scope = await session.get(
-        UserStoreScope, {"user_id": user.id, "store_id": store.id}
+    scope = await session.scalar(
+        select(UserStoreScope).where(UserStoreScope.user_id == user.id, UserStoreScope.store_id == store.id)
+        .execution_options(populate_existing=True)
     )
     if scope is None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")

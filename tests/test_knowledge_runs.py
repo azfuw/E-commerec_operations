@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import and_, func, select, update
 
-from backend.common import KnowledgeVersionStatus, UserRole
+from backend.common import KnowledgeVersionStatus, UserDepartment, UserRole, UserStatus
 from backend.knowledge_content import ChunkDraft
 from backend.knowledge_runs import (
     activate_knowledge_version,
@@ -93,6 +93,13 @@ class _ActivationStatementSpy:
     async def scalar(self, statement):
         self.scalar_statements.append(statement)
         description = statement.column_descriptions[0]
+        if description["name"] == "actor_id":
+            return None
+        if description["name"] == "created_by":
+            return self.document.created_by
+        if description["entity"] is User:
+            return User(id=self.document.created_by, username="admin", password_hash="unused",
+                role=UserRole.ADMIN, department=UserDepartment.OPERATIONS, status=UserStatus.ACTIVE)
         if description["name"] == "document_id":
             return self.pre_read_document_id
         if description["entity"] is KnowledgeDocument:
@@ -453,7 +460,7 @@ async def test_activation_locks_document_before_the_owner_guarded_candidate() ->
     )
 
     assert session.scalar_statements[0]._for_update_arg is None
-    pre_read, document_lock, candidate_lock = session.scalar_statements
+    pre_read, document_lock, candidate_lock = session.scalar_statements[:3]
     assert pre_read.column_descriptions[0]["name"] == "document_id"
     assert pre_read.column_descriptions[0]["entity"] is KnowledgeDocumentVersion
     assert pre_read._for_update_arg is None
@@ -461,6 +468,9 @@ async def test_activation_locks_document_before_the_owner_guarded_candidate() ->
     assert document_lock._for_update_arg is not None
     assert candidate_lock.column_descriptions[0]["entity"] is KnowledgeDocumentVersion
     assert candidate_lock._for_update_arg is not None
+    actor_lock = session.scalar_statements[-1]
+    assert actor_lock.column_descriptions[0]["entity"] is User
+    assert actor_lock._for_update_arg is not None
     assert candidate_lock.whereclause.compare(
         and_(
             KnowledgeDocumentVersion.id == candidate.id,

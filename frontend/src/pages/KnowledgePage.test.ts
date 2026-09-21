@@ -10,15 +10,15 @@ it('blocks every mobile role before requests', async () => {
   vi.stubGlobal('matchMedia', () => ({ matches: true }))
   const fetch = vi.fn(); vi.stubGlobal('fetch', fetch)
   for (const role of ['operator','supervisor','admin'] as const) {
-    expect(canUseKnowledge(role,true)).toBe(false)
-    setCurrentUser({id:'u',username:'u',role})
+    expect(canUseKnowledge(role,'operations',true)).toBe(false)
+    setCurrentUser({id:'u',username:'u',role,department:'operations'})
     const wrapper = mount(KnowledgePage,{global:{plugins:[ElementPlus]}})
     await flushPromises(); expect(wrapper.text()).toContain('桌面或平板')
     expect(fetch).not.toHaveBeenCalled(); wrapper.unmount()
   }
 })
 it('operator can search but has no document management requests', async () => {
-  setCurrentUser({id:'u',username:'u',role:'operator'})
+  setCurrentUser({id:'u',username:'u',role:'operator',department:'operations'})
   const fetch = vi.fn(async (_input: RequestInfo | URL) => new Response(JSON.stringify([{id:'s',name:'Store',code:'s'}])))
   vi.stubGlobal('fetch',fetch)
   const wrapper = mount(KnowledgePage,{global:{plugins:[ElementPlus]}})
@@ -27,7 +27,7 @@ it('operator can search but has no document management requests', async () => {
   expect(wrapper.text()).not.toContain('上传文档'); wrapper.unmount()
 })
 it.each([401,403,404,409,422,503])('shows safe server error %s',async status => {
-  setCurrentUser({id:'a',username:'a',role:'admin'})
+  setCurrentUser({id:'a',username:'a',role:'admin',department:'operations'})
   vi.stubGlobal('fetch',async () => new Response(JSON.stringify({detail:'private diagnostic'}),{status}))
   const wrapper = mount(KnowledgePage,{global:{plugins:[ElementPlus]}})
   await flushPromises(); expect(wrapper.text()).not.toContain('private diagnostic')

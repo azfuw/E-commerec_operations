@@ -3,7 +3,9 @@ import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { login } from '../api'
+import { canAccessDepartment, homeLocation } from '../capabilities'
 import { logisticsLocation } from '../logistics'
+import { session } from '../session'
 import InlineError from '../components/InlineError.vue'
 
 const router = useRouter()
@@ -19,7 +21,12 @@ async function submit(): Promise<void> {
   errorMessage.value = ''
   try {
     await login(username.value, password.value)
-    await router.replace(route.query.next === 'logistics' ? logisticsLocation(route.query.view) : { name: 'workbench' })
+    if (!session.user) throw new Error('missing current user')
+    await router.replace(
+      route.query.next === 'logistics' && canAccessDepartment(session.user.role, session.user.department, 'logistics')
+        ? logisticsLocation(route.query.view)
+        : homeLocation(session.user),
+    )
   } catch {
     errorMessage.value = '登录失败，请检查账号或密码'
   } finally {

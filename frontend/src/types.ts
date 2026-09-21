@@ -1,8 +1,9 @@
 export type UserRole = 'operator' | 'supervisor' | 'admin'
+export type UserDepartment = 'operations' | 'logistics'
 
 export type UserStatus = 'active' | 'disabled'
 export interface AdminUser {
-  id: string; username: string; role: UserRole; status: UserStatus
+  id: string; username: string; role: UserRole; department: UserDepartment; status: UserStatus
   store_ids: string[]; created_at: string
 }
 export interface AdminStore {
@@ -45,6 +46,7 @@ export type CurrentUser = {
   id: string
   username: string
   role: UserRole
+  department: UserDepartment
 }
 
 export type AccessToken = {

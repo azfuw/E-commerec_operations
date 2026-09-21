@@ -39,4 +39,52 @@ async def test_demo_identity_seed_is_repeatable_and_store_scoped(session):
     assert await session.scalar(select(func.count(Order.id))) == 60
     manager = await session.scalar(select(User).where(User.username == "logistics"))
     assert manager is not None and manager.role.value == "supervisor"
+    assert getattr(manager, "department", None) == "logistics"
+    operations = await session.scalar(select(User).where(User.username == "operations"))
+    admin = await session.scalar(select(User).where(User.username == "admin"))
+    assert operations is not None and operations.department == "operations"
+    assert admin is not None and admin.role.value == "admin"
     assert await session.scalar(select(func.count(UserStoreScope.store_id)).where(UserStoreScope.user_id == manager.id)) == 3
+
+
+def test_previous_demo_upgrade_preserves_accounts_records_and_later_department_edits(tmp_path):
+    import sqlite3
+    import subprocess
+    import sys
+    from pathlib import Path
+    from scripts.run_logistics_demo import demo_id
+
+    database = tmp_path / "logistics.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("""CREATE TABLE users (
+            id VARCHAR(36) PRIMARY KEY, username VARCHAR(64) NOT NULL UNIQUE,
+            password_hash VARCHAR(255) NOT NULL, role VARCHAR(10) NOT NULL,
+            status VARCHAR(8) NOT NULL, created_at DATETIME NOT NULL)""")
+        connection.executemany("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)", [
+            (demo_id("user:logistics"), "logistics", "preserved-password", "supervisor", "disabled", "2026-09-01 00:00:00"),
+            ("existing-operations", "existing-operations", "existing-password", "operator", "active", "2026-09-01 00:00:00"),
+            ("unrelated-warehouse", "warehouse", "unrelated-password", "operator", "active", "2026-09-01 00:00:00"),
+        ])
+
+    def start():
+        result = subprocess.run(
+            [sys.executable, "-m", "scripts.run_logistics_demo", "--seed-only", "--data-dir", str(tmp_path)],
+            cwd=Path(__file__).parents[1], capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+
+    start()
+    with sqlite3.connect(database) as connection:
+        assert "department" in {row[1] for row in connection.execute("PRAGMA table_info(users)")}
+        assert connection.execute("SELECT department, password_hash, status FROM users WHERE username='logistics'").fetchone() == ("logistics", "preserved-password", "disabled")
+        assert connection.execute("SELECT department FROM users WHERE id='existing-operations'").fetchone() == ("operations",)
+        assert connection.execute("SELECT department FROM users WHERE id='unrelated-warehouse'").fetchone() == ("operations",)
+        before = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                  for table in ("logistics_shipments", "logistics_returns", "logistics_events")}
+        assert all(before.values())
+        connection.execute("UPDATE users SET department='operations' WHERE username='logistics'")
+    start()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT department, password_hash, status FROM users WHERE username='logistics'").fetchone() == ("operations", "preserved-password", "disabled")
+        after = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in before}
+        assert after == before

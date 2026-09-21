@@ -16,13 +16,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.exc import StaleDataError
 
-from backend.auth import get_current_user, require_store_access, store_visibility_predicate
-from backend.common import OrderStatus, UserRole, UserStatus, utc_now
+from backend.auth import get_current_user, require_logistics_user, require_department, require_store_access, store_visibility_predicate
+from backend.common import OrderStatus, UserDepartment, UserRole, UserStatus, utc_now
 from backend.database import get_session
 from backend.logistics_models import AgentRun, ExceptionTask, ReturnCase, Shipment, ShipmentEvent
 from backend.models import Order, Store, User, UserStoreScope
 
-router = APIRouter(prefix="/logistics", tags=["logistics"])
+router = APIRouter(prefix="/logistics", tags=["logistics"], dependencies=[Depends(require_logistics_user)])
 ShipmentStatus = Literal["pending_dispatch", "in_transit", "delivered"]
 ReturnStatus = Literal["requested", "approved", "in_transit", "received", "closed", "rejected"]
 ExceptionStatus = Literal["open", "in_progress", "resolved"]
@@ -105,7 +105,17 @@ class AgentQuestion(PatrolRequest):
     question: str = Field(min_length=1, max_length=1000)
 
 
+async def _logistics_actor(session: AsyncSession, actor: User, *, lock: bool = False) -> User:
+    statement = select(User).where(User.id == actor.id).execution_options(populate_existing=True)
+    if lock:
+        statement = statement.with_for_update()
+    current = await session.scalar(statement)
+    require_department(current, UserDepartment.LOGISTICS)
+    return current
+
+
 async def scope_ids(session: AsyncSession, actor: User, store_id: str | None) -> list[str]:
+    actor = await _logistics_actor(session, actor)
     if store_id is not None:
         await require_store_access(store_id, actor, session)
         return [store_id]
@@ -119,6 +129,7 @@ async def shipment_rows(session: AsyncSession, actor: User, store_id: str | None
 
 
 async def scoped_shipment(session: AsyncSession, actor: User, shipment_id: str, *, lock: bool = False):
+    actor = await _logistics_actor(session, actor, lock=lock)
     statement = select(Shipment, Store.name, Order.ordered_at).join(Store, Store.id == Shipment.store_id).join(Order, Order.id == Shipment.order_id).where(Shipment.id == shipment_id, Store.enabled.is_(True), store_visibility_predicate(actor, Shipment.store_id))
     if lock:
         statement = statement.with_for_update(of=Shipment).execution_options(populate_existing=True)
@@ -259,6 +270,7 @@ async def list_shipments(store_id: str | None = None, status: ShipmentStatus | N
 
 @router.post("/shipments", status_code=201)
 async def create_shipment(payload: ShipmentCreate, actor: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    actor = await _logistics_actor(session, actor, lock=True)
     order = await session.scalar(select(Order).join(Store).where(Order.id == payload.order_id, Store.enabled.is_(True), store_visibility_predicate(actor, Order.store_id)))
     if order is None:
         raise HTTPException(404, "订单不存在或不在可访问店铺内")
@@ -334,6 +346,7 @@ async def create_return(payload: ReturnCreate, actor: User = Depends(get_current
 
 
 async def scoped_return(session: AsyncSession, actor: User, return_id: str):
+    actor = await _logistics_actor(session, actor, lock=True)
     statement = select(ReturnCase, Shipment, Store.name).join(Shipment, Shipment.id == ReturnCase.shipment_id).join(Store, Store.id == ReturnCase.store_id).where(ReturnCase.id == return_id, Store.enabled.is_(True), store_visibility_predicate(actor, ReturnCase.store_id))
     result = (await session.execute(statement)).first()
     if result is None:
@@ -369,8 +382,8 @@ async def transition_return(return_id: str, payload: ReturnTransition, actor: Us
 
 @router.get("/assignees")
 async def assignees(store_id: str, actor: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
-    await require_store_access(store_id, actor, session)
-    users = (await session.scalars(select(User).where(User.status == UserStatus.ACTIVE, or_(User.role == UserRole.ADMIN, User.id.in_(select(UserStoreScope.user_id).where(UserStoreScope.store_id == store_id)))).order_by(User.username))).all()
+    await scope_ids(session, actor, store_id)
+    users = (await session.scalars(select(User).where(User.status == UserStatus.ACTIVE, or_(User.role == UserRole.ADMIN, User.department == UserDepartment.LOGISTICS), or_(User.role == UserRole.ADMIN, User.id.in_(select(UserStoreScope.user_id).where(UserStoreScope.store_id == store_id)))).order_by(User.username))).all()
     return [{"id": user.id, "username": user.username} for user in users]
 
 
@@ -388,6 +401,7 @@ async def list_exceptions(store_id: str | None = None, status: ExceptionStatus |
 
 @router.patch("/exceptions/{task_id}")
 async def update_exception(task_id: str, payload: ExceptionAction, actor: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    actor = await _logistics_actor(session, actor, lock=True)
     statement = task_select().where(ExceptionTask.id == task_id, Store.enabled.is_(True), store_visibility_predicate(actor, ExceptionTask.store_id))
     row = (await session.execute(statement)).first()
     if row is None:
@@ -401,7 +415,7 @@ async def update_exception(task_id: str, payload: ExceptionAction, actor: User =
     if payload.action == "assign":
         if not payload.assignee_id or payload.resolution is not None:
             raise HTTPException(422, "指派操作需要负责人，不能填写结案记录")
-        assignee = await session.scalar(select(User).where(User.id == payload.assignee_id, User.status == UserStatus.ACTIVE, or_(User.role == UserRole.ADMIN, User.id.in_(select(UserStoreScope.user_id).where(UserStoreScope.store_id == task.store_id)))))
+        assignee = await session.scalar(select(User).where(User.id == payload.assignee_id, User.status == UserStatus.ACTIVE, or_(User.role == UserRole.ADMIN, User.department == UserDepartment.LOGISTICS), or_(User.role == UserRole.ADMIN, User.id.in_(select(UserStoreScope.user_id).where(UserStoreScope.store_id == task.store_id)))).execution_options(populate_existing=True).with_for_update())
         if assignee is None:
             raise HTTPException(422, "负责人必须是可访问该店铺的有效用户")
         task.assignee_id, task.status = assignee.id, "in_progress"
@@ -421,14 +435,18 @@ def run_json(run: AgentRun) -> dict:
 
 
 async def visible_runs(session: AsyncSession, actor: User, ids: list[str]) -> list[AgentRun]:
+    allowed = set(ids) & set(await scope_ids(session, actor, None))
     query = select(AgentRun).order_by(AgentRun.started_at.desc(), AgentRun.id)
     if actor.role != UserRole.ADMIN:
         query = query.where(or_(AgentRun.created_by == actor.id, AgentRun.created_by.is_(None)))
-    allowed = set(ids)
     return [run for run in (await session.scalars(query)).all() if set(run.scope_store_ids).issubset(allowed)]
 
 
 async def patrol(session: AsyncSession, actor: User | None, rows, ids: list[str], *, now: datetime | None = None) -> AgentRun:
+    if actor is not None:
+        actor = await _logistics_actor(session, actor, lock=True)
+        if not set(ids).issubset(await scope_ids(session, actor, None)):
+            raise HTTPException(403, "物流巡检店铺权限已变更")
     shipment_ids = [row[0].id for row in rows]
     dialect = session.get_bind().dialect.name
     if dialect == "sqlite" and shipment_ids:

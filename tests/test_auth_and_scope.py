@@ -144,6 +144,20 @@ async def test_active_user_can_log_in(client, auth_data) -> None:
     assert response.json()["access_token"]
 
 
+async def test_operations_supervisor_cannot_read_same_store_logistics(client, session, auth_data):
+    auth_data["operator"].role = UserRole.SUPERVISOR
+    await session.commit()
+    login = await client.post(
+        "/auth/login", json={"username": "operator", "password": "DemoPass!2026"}
+    )
+    assert login.status_code == 200
+    response = await client.get(
+        "/logistics/dashboard?store_id=flagship",
+        headers={"Authorization": f"Bearer {login.json()['access_token']}"},
+    )
+    assert response.status_code == 403
+
+
 async def test_current_user_returns_database_identity(
     client, auth_data, operator_token
 ) -> None:
@@ -156,6 +170,7 @@ async def test_current_user_returns_database_identity(
         "id": "operator-user",
         "username": "operator",
         "role": "operator",
+        "department": "operations",
     }
 
 

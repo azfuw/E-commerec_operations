@@ -93,21 +93,11 @@ async def test_owned_analysis_predicate_never_updates_same_owner_optimization_ro
 
 async def test_manual_renewal_requires_manual_type_current_owner_and_live_lease(session) -> None:
     from backend.manual_review_runs import renew_manual_review_lease
+    from tests.test_manual_review_worker import _seed_manual_chain
 
-    analysis_id, optimization_id = await _add_live_typed_runs(session, owner="worker-a")
-    manual = WorkflowRun(
-        id="manual-1",
-        workflow_type=WorkflowType.MANUAL_REVIEW,
-        store_id="store-1",
-        created_by="user-1",
-        status=WorkflowStatus.PROCESSING,
-        quality_status=WorkflowQuality.NORMAL,
-        lease_owner="worker-a",
-        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
-    )
-    session.add(manual)
-    await session.commit()
-    manual_id = manual.id
+    chain = await _seed_manual_chain(session)
+    analysis_id, optimization_id = chain["analysis"].id, chain["optimization"].id
+    manual_id = chain["manual_workflow"].id
 
     assert await renew_manual_review_lease(
         session,

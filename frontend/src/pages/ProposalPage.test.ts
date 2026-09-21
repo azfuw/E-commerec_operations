@@ -176,7 +176,7 @@ function setMobile(mobile: boolean): void {
 }
 
 async function mountProposal(role: UserRole = 'operator') {
-  setCurrentUser({ id: `${role}-1`, username: role, role })
+  setCurrentUser({ id: `${role}-1`, username: role, role, department: 'operations' })
   const router = createRouter({
     history: createMemoryHistory('/app/'),
     routes: [

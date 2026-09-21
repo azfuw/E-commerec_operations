@@ -19,7 +19,7 @@ describe('session', () => {
 
   it('clears the token and database identity together', () => {
     setToken('session-token')
-    setCurrentUser({ id: 'operator-1', username: 'operator', role: 'operator' })
+    setCurrentUser({ id: 'operator-1', username: 'operator', role: 'operator', department: 'operations' })
 
     clearSession()
 

@@ -9,13 +9,14 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.auth import store_visibility_predicate
+from backend.auth import has_department_access, store_visibility_predicate
 from backend.audit_events import add_audit_event
 from backend.common import (
     ApprovalActionType,
     AuditEventType,
     AuditOutcome,
     PlatformDeliveryStatus,
+    UserDepartment,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -108,7 +109,7 @@ async def list_pending_approvals(
         )
         if (
             actor is None
-            or actor.status is not UserStatus.ACTIVE
+            or not has_department_access(actor, UserDepartment.OPERATIONS)
             or actor.role not in _APPROVAL_ROLES
         ):
             raise ApprovalDomainError("PROPOSAL_ACTION_FORBIDDEN", 403)
@@ -254,6 +255,8 @@ async def _authorized_context(
     )
     if actor is None or actor.status is not UserStatus.ACTIVE:
         raise ApprovalDomainError("PROPOSAL_NOT_FOUND", 404)
+    if not has_department_access(actor, UserDepartment.OPERATIONS):
+        raise ApprovalDomainError("PROPOSAL_ACTION_FORBIDDEN", 403)
     proposal_hint = await session.scalar(
         select(ProductProposal)
         .where(ProductProposal.id == proposal_id)

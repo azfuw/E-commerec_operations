@@ -16,6 +16,7 @@ from backend.common import (
     AgentCallType,
     PlatformDeliveryStatus,
     ProposalRevisionOrigin,
+    UserDepartment,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -38,6 +39,7 @@ class CurrentUserView(BaseModel):
     id: str
     username: str
     role: UserRole
+    department: UserDepartment
 
 
 class StoreSummary(BaseModel):
@@ -874,11 +876,12 @@ class AdminUserPatch(BaseModel):
     model_config = ConfigDict(extra='forbid')
     role: UserRole | None = None
     status: UserStatus | None = None
+    department: UserDepartment | None = None
 
     @model_validator(mode='after')
     def validate_patch(self):
         if not self.model_fields_set or any(getattr(self,key) is None for key in self.model_fields_set):
-            raise ValueError('role or status required')
+            raise ValueError('role, status or department required')
         return self
 
 
@@ -918,6 +921,7 @@ class AdminUserView(BaseModel):
     id: str
     username: str
     role: UserRole
+    department: UserDepartment
     status: UserStatus
     created_at: datetime
     store_ids: list[str]

@@ -7,7 +7,7 @@ import { session } from '../session'
 import type { KnowledgeDocument, KnowledgeSearchResult, KnowledgeVersionHistory, StoreSummary } from '../types'
 
 const isMobile = typeof matchMedia === 'function' && matchMedia('(max-width: 767px)').matches
-const allowed = computed(() => !!session.user && canUseKnowledge(session.user.role, isMobile))
+const allowed = computed(() => !!session.user && canUseKnowledge(session.user.role, session.user.department, isMobile))
 const admin = computed(() => session.user?.role === 'admin')
 const stores = ref<StoreSummary[]>([]), storeId = ref(''), query = ref('')
 const result = ref<KnowledgeSearchResult | null>(null), searching = ref(false)

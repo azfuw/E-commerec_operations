@@ -5,7 +5,7 @@ import {canViewAgentObservability} from '../capabilities'
 import {session} from '../session'
 import type {EvaluationRun,EvaluationRunDetail,EvaluationAgentType,AgentCall} from '../types'
 const mobile = typeof matchMedia === 'function' && matchMedia('(max-width: 767px)').matches
-const allowed = computed(()=>!!session.user && canViewAgentObservability(session.user.role,mobile))
+const allowed = computed(()=>!!session.user && canViewAgentObservability(session.user.role,session.user.department,mobile))
 const tab=ref('runs'),page=ref(1),total=ref(0),loading=ref(false),error=ref('')
 const storeId=ref(''),agent=ref<EvaluationAgentType|''>(''),status=ref<'completed'|'failed'|''>('')
 const workflow=ref(''),node=ref(''),callStatus=ref<'succeeded'|'failed'|''>(''),code=ref('')

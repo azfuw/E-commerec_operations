@@ -65,7 +65,7 @@ async def admin_user_views(session,users):
     for user_id,store_id in (await session.execute(select(UserStoreScope.user_id,UserStoreScope.store_id)
         .where(UserStoreScope.user_id.in_(scopes)).order_by(UserStoreScope.store_id))).all():
         scopes[user_id].append(store_id)
-    return [AdminUserView(id=u.id,username=u.username,role=u.role,status=u.status,created_at=u.created_at,store_ids=scopes[u.id]) for u in users]
+    return [AdminUserView(id=u.id,username=u.username,role=u.role,department=u.department,status=u.status,created_at=u.created_at,store_ids=scopes[u.id]) for u in users]
 
 
 async def update_admin_user(session:AsyncSession,*,actor_id:str,user_id:str,patch:AdminUserPatch)->User:
@@ -74,13 +74,14 @@ async def update_admin_user(session:AsyncSession,*,actor_id:str,user_id:str,patc
         if actor.id==target.id and (patch.role not in (None,UserRole.ADMIN) or patch.status==UserStatus.DISABLED):
             raise AdminDomainError('ADMIN_GUARD_VIOLATION',409)
         if not admins:raise AdminDomainError('ADMIN_GUARD_VIOLATION',409)
-        before_role,before_status=target.role,target.status
+        before_role,before_status,before_department=target.role,target.status,target.department
         for key,value in patch.model_dump(exclude_unset=True).items():setattr(target,key,value)
         if not any(row.role is UserRole.ADMIN and row.status is UserStatus.ACTIVE for row in admins):
             raise AdminDomainError('ADMIN_GUARD_VIOLATION',409)
         _audit(session,actor,AuditEventType.ADMIN_USER_UPDATED,'user',target.id,
             {'from_role':before_role.value,'to_role':target.role.value,'from_user_status':before_status.value,
-             'to_user_status':target.status.value,'changed_fields':sorted(patch.model_fields_set)})
+             'to_user_status':target.status.value,'from_department':before_department.value,
+             'to_department':target.department.value,'changed_fields':sorted(patch.model_fields_set)})
         await session.flush();await session.commit();return target
     except AdminDomainError:
         await session.rollback();raise

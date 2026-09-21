@@ -14,7 +14,7 @@ function response(body: unknown, status = 200): Response {
 }
 
 async function mountPage() {
-  setCurrentUser({ id: 'supervisor-1', username: 'supervisor', role: 'supervisor' })
+  setCurrentUser({ id: 'supervisor-1', username: 'supervisor', role: 'supervisor', department: 'operations' })
   const router = createRouter({
     history: createMemoryHistory('/app/'),
     routes: [

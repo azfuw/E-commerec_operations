@@ -50,10 +50,27 @@ def demo_id(name: str) -> str:
     return str(uuid5(NAMESPACE_URL, "zhiliu-logistics-demo:" + name))
 
 
+def upgrade_demo_departments(connection) -> None:
+    """Upgrade the local SQLite schema once, without resetting account settings."""
+    from sqlalchemy import inspect, text
+
+    schema = inspect(connection)
+    if not schema.has_table("users") or "department" in {column["name"] for column in schema.get_columns("users")}:
+        return
+    connection.exec_driver_sql(
+        "ALTER TABLE users ADD COLUMN department VARCHAR(10) NOT NULL DEFAULT 'operations' "
+        "CONSTRAINT user_department CHECK (department IN ('operations', 'logistics'))"
+    )
+    # Only identities created by this demo belong to its logistics department.
+    connection.execute(text("UPDATE users SET department='logistics' WHERE id=:id AND username=:username"), [
+        {"id": demo_id("user:" + username), "username": username} for username in ("logistics", "warehouse")
+    ])
+
+
 async def seed_demo_identity(session) -> None:
     from sqlalchemy import select
     from backend.auth import hash_password
-    from backend.common import OrderStatus, UserRole
+    from backend.common import OrderStatus, UserDepartment, UserRole
     from backend.models import Order, Store, User, UserStoreScope
 
     now = datetime.now(UTC)
@@ -62,14 +79,16 @@ async def seed_demo_identity(session) -> None:
         if not await session.get(Store, demo_id("store:" + code)):
             session.add(Store(id=demo_id("store:" + code), code="logistics-" + code, name=name))
     await session.flush()
-    for username, role, scope in [
-        ("logistics", UserRole.SUPERVISOR, stores),
-        ("warehouse", UserRole.OPERATOR, stores[:1]),
+    for username, role, department, scope in [
+        ("logistics", UserRole.SUPERVISOR, UserDepartment.LOGISTICS, stores),
+        ("warehouse", UserRole.OPERATOR, UserDepartment.LOGISTICS, stores[:1]),
+        ("operations", UserRole.SUPERVISOR, UserDepartment.OPERATIONS, stores),
+        ("admin", UserRole.ADMIN, UserDepartment.OPERATIONS, []),
     ]:
         actor = await session.scalar(select(User).where(User.username == username))
         if actor is None:
             actor = User(id=demo_id("user:" + username), username=username,
-                         password_hash=hash_password(DEMO_PASSWORD), role=role)
+                         password_hash=hash_password(DEMO_PASSWORD), role=role, department=department)
             session.add(actor)
             await session.flush()
             for code, _ in scope:
@@ -97,6 +116,7 @@ async def initialize_demo() -> None:
         connection.execute("PRAGMA busy_timeout=10000")
 
     async with engine.begin() as connection:
+        await connection.run_sync(upgrade_demo_departments)
         await connection.run_sync(Base.metadata.create_all)
     async with async_session_factory() as session:
         await seed_demo_identity(session)

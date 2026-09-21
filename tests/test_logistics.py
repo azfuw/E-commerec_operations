@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm.exc import StaleDataError
 
 from backend.auth import get_current_user
-from backend.common import OrderStatus, UserRole
+from backend.common import OrderStatus, UserDepartment, UserRole
 from backend.database import get_session
 from backend.models import Base, Order, Store, User, UserStoreScope
 
@@ -20,8 +20,8 @@ from backend.models import Base, Order, Store, User, UserStoreScope
 @pytest_asyncio.fixture
 async def logistics_data(session):
     now = datetime.now(UTC).replace(microsecond=0)
-    actor = User(id="log-operator", username="log-operator", password_hash="unused", role=UserRole.OPERATOR)
-    outsider = User(id="log-outsider", username="log-outsider", password_hash="unused", role=UserRole.OPERATOR)
+    actor = User(id="log-operator", username="log-operator", password_hash="unused", role=UserRole.OPERATOR, department=UserDepartment.LOGISTICS)
+    outsider = User(id="log-outsider", username="log-outsider", password_hash="unused", role=UserRole.OPERATOR, department=UserDepartment.LOGISTICS)
     session.add_all([actor, outsider, Store(id="log-a", name="华东店", code="log-a"), Store(id="log-b", name="华南店", code="log-b")])
     await session.flush()
     session.add_all([UserStoreScope(user_id=actor.id, store_id="log-a"), UserStoreScope(user_id=outsider.id, store_id="log-b")])

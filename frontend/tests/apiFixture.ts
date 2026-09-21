@@ -4,11 +4,12 @@ import type {
   ApprovalAction,
   ComplianceReview,
   ProposalRevision,
+  UserDepartment,
   UserRole,
   WorkflowStatus,
 } from '../src/types'
 
-type FixtureUser = { id: string; username: string; role: UserRole; token: string }
+type FixtureUser = { id: string; username: string; role: UserRole; department: UserDepartment; token: string }
 
 type ManualRevisionBody = {
   parent_revision_id?: unknown
@@ -35,9 +36,9 @@ type FixtureState = {
 }
 
 const users: Record<'operator' | 'supervisor' | 'admin', FixtureUser> = {
-  operator: { id: 'operator-1', username: 'operator', role: 'operator', token: 'operator-token' },
-  supervisor: { id: 'supervisor-1', username: 'supervisor', role: 'supervisor', token: 'supervisor-token' },
-  admin: { id: 'admin-1', username: 'admin', role: 'admin', token: 'admin-token' },
+  operator: { id: 'operator-1', username: 'operator', role: 'operator', department: 'operations', token: 'operator-token' },
+  supervisor: { id: 'supervisor-1', username: 'supervisor', role: 'supervisor', department: 'operations', token: 'supervisor-token' },
+  admin: { id: 'admin-1', username: 'admin', role: 'admin', department: 'operations', token: 'admin-token' },
 }
 
 const store = { id: 'store-1', code: 'MAIN', name: '旗舰店' }
@@ -391,7 +392,7 @@ export async function installApiFixture(page: Page): Promise<ApiFixtureControlle
     }
 
     if (path === '/auth/me' && method === 'GET') {
-      await respond(route, { id: actor.id, username: actor.username, role: actor.role })
+      await respond(route, { id: actor.id, username: actor.username, role: actor.role, department: actor.department })
       return
     }
     if (path === '/stores' && method === 'GET') {

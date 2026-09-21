@@ -68,7 +68,9 @@ class _SuccessClient:
         self.tracker = tracker
         self.calls: list[dict[str, object]] = []
 
-    async def publish_listing(self, **kwargs: object) -> PlatformPublishResult:
+    async def publish_listing(self, *, before_http_attempt=None, **kwargs: object) -> PlatformPublishResult:
+        if before_http_attempt is not None:
+            await before_http_attempt()
         if self.tracker is not None:
             assert self.tracker.active_contexts == 0
         self.calls.append(kwargs)

@@ -6,9 +6,9 @@ import pytest_asyncio
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from backend.common import AuditEventType, PlatformDeliveryStatus
+from backend.common import AuditEventType, PlatformDeliveryStatus, UserRole
 from backend.database import Base
-from backend.models import AuditEvent, PlatformDelivery, PublishRecord
+from backend.models import AuditEvent, PlatformDelivery, PublishRecord, Store, User, UserStoreScope
 from backend.platform_delivery_runs import (
     claim_next_platform_delivery,
     complete_platform_delivery,
@@ -48,6 +48,12 @@ async def seed_pending_delivery(
     record_id = f"publish-{token}"
     delivery_id = f"delivery-{token}"
     async with factory() as session:
+        visible_store_id = store_id or f"store-{token}"
+        if await session.get(Store, visible_store_id) is None:
+            session.add(Store(id=visible_store_id, code=visible_store_id, name="Delivery store"))
+        session.add(User(id=f"user-{token}", username=f"user-{token}", password_hash="unused", role=UserRole.SUPERVISOR))
+        await session.flush()
+        session.add(UserStoreScope(user_id=f"user-{token}", store_id=visible_store_id))
         session.add(
             PublishRecord(
                 id=record_id,

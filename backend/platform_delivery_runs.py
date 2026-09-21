@@ -10,8 +10,9 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from backend.audit_events import add_audit_event
-from backend.common import AuditEventType, AuditOutcome, PlatformDeliveryStatus
-from backend.models import PlatformDelivery, PublishRecord
+from backend.auth import has_department_access
+from backend.common import AuditEventType, AuditOutcome, PlatformDeliveryStatus, UserDepartment, UserRole
+from backend.models import PlatformDelivery, PublishRecord, Store, User, UserStoreScope
 
 
 _ERROR_CODES = frozenset(
@@ -30,6 +31,16 @@ _ERROR_CODES = frozenset(
         "PLATFORM_DELIVERY_FAILED",
     }
 )
+
+
+async def publish_authorized(session: AsyncSession, record: PublishRecord) -> bool:
+    actor = await session.scalar(select(User).where(User.id == record.approved_by)
+        .execution_options(populate_existing=True).with_for_update())
+    if not has_department_access(actor, UserDepartment.OPERATIONS) or actor.role not in {UserRole.SUPERVISOR, UserRole.ADMIN}:
+        return False
+    store = await session.scalar(select(Store.id).where(Store.id == record.store_id, Store.enabled.is_(True)))
+    scope = await session.scalar(select(UserStoreScope.user_id).where(UserStoreScope.user_id == actor.id, UserStoreScope.store_id == record.store_id))
+    return store is not None and scope is not None
 
 
 def _after_database_time(
@@ -197,6 +208,11 @@ async def complete_platform_delivery(
         if delivery is None:
             await session.rollback()
             return False
+        record = await session.get(PublishRecord, delivery.publish_record_id, populate_existing=True)
+        if record is None or not await publish_authorized(session, record):
+            _mark_failed(session, delivery, "PLATFORM_FORBIDDEN")
+            await session.commit()
+            return False
         delivery.status = PlatformDeliveryStatus.SUCCEEDED
         delivery.next_attempt_at = None
         delivery.lease_owner = None
@@ -232,7 +248,10 @@ async def return_platform_delivery_for_retry(
         if delivery is None:
             await session.rollback()
             return False
-        if delivery.attempt_count >= 3:
+        record = await session.get(PublishRecord, delivery.publish_record_id, populate_existing=True)
+        if record is None or not await publish_authorized(session, record):
+            _mark_failed(session, delivery, "PLATFORM_FORBIDDEN")
+        elif delivery.attempt_count >= 3:
             _mark_failed(session, delivery, error_code)
         else:
             delay = (

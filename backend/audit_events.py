@@ -18,6 +18,7 @@ from backend.common import (
     KnowledgeVersionStatus,
     PlatformDeliveryStatus,
     ProposalRevisionOrigin,
+    UserDepartment,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -43,6 +44,8 @@ AUDIT_DETAIL_KEYS = frozenset(
         "published_to_version",
         "from_role",
         "to_role",
+        "from_department",
+        "to_department",
         "from_user_status",
         "to_user_status",
         "scope_count",
@@ -60,7 +63,7 @@ AUDIT_DETAIL_KEYS = frozenset(
 _EDITABLE_FIELDS = frozenset(
     {"title", "selling_points", "description", "keywords", "attribute_completions"}
 )
-_AUDIT_CHANGED_FIELDS = _EDITABLE_FIELDS | frozenset({"role", "status", "store_scopes", "enabled"})
+_AUDIT_CHANGED_FIELDS = _EDITABLE_FIELDS | frozenset({"role", "status", "department", "store_scopes", "enabled"})
 _RESOURCE_TYPES = frozenset(
     {"user", "store", "knowledge_document", "knowledge_version", "evaluation_run", "platform_delivery"}
 )
@@ -114,6 +117,8 @@ def _safe_details(details: dict[str, object]) -> None:
         "risk_level": {item.value for item in ComplianceRiskLevel},
         "from_role": {item.value for item in UserRole},
         "to_role": {item.value for item in UserRole},
+        "from_department": {item.value for item in UserDepartment},
+        "to_department": {item.value for item in UserDepartment},
         "from_user_status": {item.value for item in UserStatus},
         "to_user_status": {item.value for item in UserStatus},
         "document_status": {item.value for item in KnowledgeVersionStatus},
@@ -232,7 +237,7 @@ async def list_audit_events(
     actor_id: str,
     filters: AuditEventFilters,
 ) -> tuple[list[AuditEvent], int]:
-    from backend.auth import store_visibility_predicate
+    from backend.auth import has_department_access, store_visibility_predicate
     try:
         actor = await session.scalar(
             select(User)
@@ -241,7 +246,7 @@ async def list_audit_events(
         )
         if (
             actor is None
-            or actor.status is not UserStatus.ACTIVE
+            or not has_department_access(actor, UserDepartment.OPERATIONS)
             or actor.role not in {UserRole.SUPERVISOR, UserRole.ADMIN}
         ):
             raise AuditEventDomainError("PROPOSAL_ACTION_FORBIDDEN", 403)

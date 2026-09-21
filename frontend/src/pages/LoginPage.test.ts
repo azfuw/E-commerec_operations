@@ -3,6 +3,7 @@ import ElementPlus from 'element-plus'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { clearSession, setCurrentUser } from '../session'
 import LoginPage from './LoginPage.vue'
 
 const apiMock = vi.hoisted(() => ({
@@ -34,7 +35,8 @@ async function mountLogin(query = '') {
 
 describe('LoginPage', () => {
   beforeEach(() => {
-    apiMock.login = () => Promise.resolve()
+    clearSession()
+    apiMock.login = async () => setCurrentUser({ id: 'operator-1', username: 'operator', role: 'operator', department: 'operations' })
   })
 
   it('uses visible labels and disables duplicate submission', async () => {
@@ -79,12 +81,32 @@ describe('LoginPage', () => {
     expect(router.currentRoute.value.fullPath).toBe('/app/workbench')
   })
 
-  it('preserves a logistics visitor’s destination after login', async () => {
+  it('sends a logistics account to logistics and preserves only its safe logistics view', async () => {
+    apiMock.login = async () => setCurrentUser({ id: 'logistics-1', username: 'logistics', role: 'operator', department: 'logistics' })
     const { router, wrapper } = await mountLogin('?next=logistics&view=returns')
     await wrapper.get('input#username').setValue('logistics')
     await wrapper.get('input#password').setValue('Logistics!2026')
     await wrapper.get('form').trigger('submit')
     await flushPromises()
     expect(router.currentRoute.value.fullPath).toBe('/app/logistics?view=returns')
+  })
+
+  it('ignores a cross-department logistics return target for an operations account', async () => {
+    const { router, wrapper } = await mountLogin('?next=logistics&view=returns')
+    await wrapper.get('input#username').setValue('operator')
+    await wrapper.get('input#password').setValue('DemoPass!2026')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/app/workbench')
+  })
+
+  it('uses the logistics home for a logistics account without a return target', async () => {
+    apiMock.login = async () => setCurrentUser({ id: 'logistics-1', username: 'logistics', role: 'operator', department: 'logistics' })
+    const { router, wrapper } = await mountLogin()
+    await wrapper.get('input#username').setValue('logistics')
+    await wrapper.get('input#password').setValue('Logistics!2026')
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/app/logistics')
   })
 })

@@ -1387,6 +1387,8 @@ def test_audit_event_helper_rejects_unknown_unsafe_and_oversized_details_before_
             "published_to_version",
             "from_role",
             "to_role",
+            "from_department",
+            "to_department",
             "from_user_status",
             "to_user_status",
             "scope_count",
@@ -1405,6 +1407,8 @@ def test_audit_event_helper_rejects_unknown_unsafe_and_oversized_details_before_
         {"revision_number": float("nan")},
         {"current_step": object()},
         {"changed_fields": ["x" * 4096]},
+        {"from_department": "finance"},
+        {"to_department": None},
     ]
     for details in invalid:
         before = set(session.new)

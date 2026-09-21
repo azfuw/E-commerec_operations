@@ -32,6 +32,7 @@ from backend.common import (
     PlatformDeliveryStatus,
     ProposalRevisionOrigin,
     RefundStatus,
+    UserDepartment,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -50,6 +51,7 @@ class User(Base):
     __table_args__ = (
         CheckConstraint("role IN ('operator', 'supervisor', 'admin')", name="user_role"),
         CheckConstraint("status IN ('active', 'disabled')", name="user_status"),
+        CheckConstraint("department IN ('operations', 'logistics')", name="user_department"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
@@ -74,6 +76,18 @@ class User(Base):
             values_callable=lambda enum: [member.value for member in enum],
         ),
         default=lambda: UserStatus.ACTIVE,
+        nullable=False,
+    )
+    department: Mapped[UserDepartment] = mapped_column(
+        Enum(
+            UserDepartment,
+            name="user_department",
+            native_enum=False,
+            create_constraint=False,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
+        default=lambda: UserDepartment.OPERATIONS,
+        server_default=UserDepartment.OPERATIONS.value,
         nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

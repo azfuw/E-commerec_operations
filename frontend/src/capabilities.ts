@@ -1,27 +1,45 @@
-import type { UserRole, WorkflowStatus } from './types'
+import type { CurrentUser, UserDepartment, UserRole, WorkflowStatus } from './types'
+
+export function canAccessDepartment(
+  role: UserRole,
+  department: UserDepartment,
+  target: UserDepartment,
+): boolean {
+  return role === 'admin' || department === target
+}
+
+export function homeLocation(
+  user: CurrentUser,
+  preferred?: unknown,
+): { name: 'logistics' | 'workbench' } {
+  const department = user.role === 'admin' && (preferred === 'operations' || preferred === 'logistics')
+    ? preferred
+    : user.department
+  return { name: department === 'logistics' ? 'logistics' : 'workbench' }
+}
 
 export function canManageSystem(role: UserRole, isMobile: boolean): boolean {
   return !isMobile && role === 'admin'
 }
 
-export function canUseKnowledge(role: UserRole, isMobile: boolean): boolean {
-  return !isMobile && (role === 'operator' || role === 'supervisor' || role === 'admin')
+export function canUseKnowledge(role: UserRole, department: UserDepartment, isMobile: boolean): boolean {
+  return !isMobile && canAccessDepartment(role, department, 'operations')
 }
 
-export function canViewAgentObservability(role: UserRole, isMobile: boolean): boolean {
-  return !isMobile && (role === 'supervisor' || role === 'admin')
+export function canViewAgentObservability(role: UserRole, department: UserDepartment, isMobile: boolean): boolean {
+  return !isMobile && canAccessDepartment(role, department, 'operations') && (role === 'supervisor' || role === 'admin')
 }
 
-export function canViewAuditEvents(role: UserRole, isMobile: boolean): boolean {
-  return !isMobile && (role === 'supervisor' || role === 'admin')
+export function canViewAuditEvents(role: UserRole, department: UserDepartment, isMobile: boolean): boolean {
+  return !isMobile && canAccessDepartment(role, department, 'operations') && (role === 'supervisor' || role === 'admin')
 }
 
-export function canStartAnalysis(role: UserRole, isMobile: boolean): boolean {
-  return role === 'operator' && !isMobile
+export function canStartAnalysis(role: UserRole, department: UserDepartment, isMobile: boolean): boolean {
+  return role === 'operator' && department === 'operations' && !isMobile
 }
 
-export function canSelectProduct(role: UserRole, isMobile: boolean): boolean {
-  return role === 'operator' && !isMobile
+export function canSelectProduct(role: UserRole, department: UserDepartment, isMobile: boolean): boolean {
+  return role === 'operator' && department === 'operations' && !isMobile
 }
 
 export function canEditProposal(

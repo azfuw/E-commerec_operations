@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import re
 from typing import Annotated
@@ -128,7 +129,10 @@ class CommercePlatformClient:
         product_id: str,
         payload: dict[str, object],
         idempotency_key: str,
+        before_http_attempt: Callable[[], Awaitable[bool]] | None,
     ) -> httpx.Response:
+        if before_http_attempt is not None and not await before_http_attempt():
+            raise PlatformClientError("PLATFORM_FORBIDDEN", False)
         return await self._request(
             "PUT",
             f"/v1/stores/{store_id}/listings/{product_id}",
@@ -143,6 +147,7 @@ class CommercePlatformClient:
         product_id: str,
         payload: dict[str, object],
         idempotency_key: str,
+        before_http_attempt: Callable[[], Awaitable[bool]] | None = None,
     ) -> PlatformPublishResult:
         invalid = False
         try:
@@ -160,12 +165,12 @@ class CommercePlatformClient:
 
         token = await self._token()
         response = await self._post_listing(
-            token, store_id, product_id, validated, idempotency_key
+            token, store_id, product_id, validated, idempotency_key, before_http_attempt
         )
         if response.status_code == 401:
             token = await self._token(force=True)
             response = await self._post_listing(
-                token, store_id, product_id, validated, idempotency_key
+                token, store_id, product_id, validated, idempotency_key, before_http_attempt
             )
         return self._validated_result(response)
 

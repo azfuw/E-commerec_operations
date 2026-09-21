@@ -1,6 +1,8 @@
 # 物流部门 API
 
-前缀 `/logistics`，沿用现有登录及 Bearer JWT。所有读取、巡检和修改均按当前有效用户的有效店铺权限过滤；管理者的管理员角色可访问全部有效店铺。越权详情统一 404，显式选择无权限店铺返回 403，停用店铺返回 404。写入请求拒绝未定义字段，错误响应沿用 FastAPI `detail`。
+前缀 `/logistics`，沿用现有登录及 Bearer JWT。所有接口要求当前有效用户属于物流部门，或角色为管理员；运营账号直接访问统一返回 403。进入部门后，所有读取、巡检和修改继续按有效店铺权限过滤；管理员可访问全部有效店铺。跨店详情统一 404，显式选择无权限店铺返回 403，停用店铺返回 404。写入请求拒绝未定义字段，错误响应沿用 FastAPI `detail`。
+
+`GET /auth/me` 返回 `{id,username,role,department}`，`department` 为 `operations` 或 `logistics`。部门授权取自数据库，不信任客户端的菜单、查询参数或旧 JWT 中的权限信息。管理员通过 `PATCH /admin/users/{id}` 的 `department` 字段修改部门；普通账号不能修改，变更写入审计记录。
 
 结构化日期统一 ISO 8601 UTC，实际节点输入必须带时区，不能倒序或晚于服务器时间（允许 5 秒钟差）。自然语言证据使用明确标注的北京时间；今日签收按 Asia/Shanghai 自然日计算。没有已签收样本时准时率为 `null`。
 
@@ -14,7 +16,7 @@
 | GET `/orders` | `store_id?`, `q?`, `limit=100`（上限 500） | 未建立物流单、未取消的订单数组 |
 | GET `/returns` | `store_id?`, `status?`, `q?`, `page`, `page_size` | 分页 Return |
 | GET `/exceptions` | `store_id?`, `status?`, `kind?`, `page`, `page_size` | 分页 Exception |
-| GET `/assignees` | 必填 `store_id` | `[{id,username}]`，仅有效且能访问该店的用户 |
+| GET `/assignees` | 必填 `store_id` | `[{id,username}]`，仅有效且能访问该店的物流用户或管理员 |
 | GET `/agent/runs` | `store_id?`, `limit=20`（上限 100） | Run 数组，最近在前 |
 | GET `/agent/brief` | `store_id?` | AgentAnswer |
 

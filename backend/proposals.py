@@ -7,10 +7,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.auth import store_visibility_predicate
+from backend.auth import has_department_access, store_visibility_predicate
 from backend.common import (
     ApprovalActionType,
     ProposalRevisionOrigin,
+    UserDepartment,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -72,7 +73,7 @@ async def _selection_context(
     )
     if user is None or user.status is not UserStatus.ACTIVE:
         raise ProposalDomainError("ANALYSIS_SELECTION_NOT_FOUND", 404)
-    if user.role is not UserRole.OPERATOR:
+    if not has_department_access(user, UserDepartment.OPERATIONS) or user.role is not UserRole.OPERATOR:
         raise ProposalDomainError("ANALYSIS_SELECTION_FORBIDDEN", 403)
 
     run = await session.scalar(
@@ -280,7 +281,7 @@ async def get_proposal_for_actor(
             .where(User.id == actor_id)
             .execution_options(populate_existing=True)
         )
-        if user is None or user.status is not UserStatus.ACTIVE or user.role not in {
+        if not has_department_access(user, UserDepartment.OPERATIONS) or user.role not in {
             UserRole.OPERATOR,
             UserRole.SUPERVISOR,
             UserRole.ADMIN,

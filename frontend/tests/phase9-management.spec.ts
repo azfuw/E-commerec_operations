@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test'
 
 test('desktop knowledge search uses authorized context and safe text', async ({page}) => {
   await page.addInitScript(() => sessionStorage.setItem('access_token','fixture'))
-  await page.route('**/auth/me',route => route.fulfill({json:{id:'admin',username:'admin',role:'admin'}}))
+  await page.route('**/auth/me',route => route.fulfill({json:{id:'admin',username:'admin',role:'admin',department:'operations'}}))
   await page.route('**/stores',route => route.fulfill({json:[{id:'store',name:'测试店铺',code:'store'}]}))
   await page.route('**/knowledge/documents?*',route => route.fulfill({json:{data:{items:[],total:0,page:1,page_size:20}}}))
   await page.route('**/knowledge/search',route => {
@@ -21,7 +21,7 @@ test('desktop knowledge search uses authorized context and safe text', async ({p
 test('mobile management deep links perform zero management requests',async ({page}) => {
   await page.setViewportSize({width:390,height:844})
   await page.addInitScript(() => sessionStorage.setItem('access_token','fixture'))
-  await page.route('**/auth/me',route => route.fulfill({json:{id:'admin',username:'admin',role:'admin'}}))
+  await page.route('**/auth/me',route => route.fulfill({json:{id:'admin',username:'admin',role:'admin',department:'operations'}}))
   let requests = 0
   await page.route(/\/((knowledge|admin|agent-evaluations)\/|agent-calls\?|audit-events\?)/,route => { requests++; return route.abort() })
   for (const path of ['knowledge','agent-evaluations','audit-events','admin']) {
@@ -34,17 +34,21 @@ test('mobile management deep links perform zero management requests',async ({pag
 test('admin edits users and exact scopes, confirms store state and refetches facts', async ({page}) => {
   await page.setViewportSize({width:1024,height:768})
   await page.addInitScript(() => sessionStorage.setItem('access_token','fixture'))
-  await page.route('**/auth/me', route => route.fulfill({json:{id:'admin',username:'admin',role:'admin'}}))
+  await page.route('**/auth/me', route => route.fulfill({json:{id:'admin',username:'admin',role:'admin',department:'operations'}}))
   const users = [
-    {id:'admin',username:'admin',role:'admin',status:'active',store_ids:[],created_at:'2026-09-05T00:00:00Z'},
-    {id:'operator',username:'operator',role:'operator',status:'active',store_ids:['s1'],created_at:'2026-09-05T00:00:00Z'},
+    {id:'admin',username:'admin',role:'admin',department:'operations',status:'active',store_ids:[],created_at:'2026-09-05T00:00:00Z'},
+    {id:'operator',username:'operator',role:'operator',department:'operations',status:'active',store_ids:['s1'],created_at:'2026-09-05T00:00:00Z'},
   ]
   const store = {id:'s2',name:'测试店铺',code:'store-code',enabled:true,created_at:'2026-09-05T00:00:00Z'}
   let reads = 0, writes = 0
   await page.route('**/admin/users?*', route => { reads++; return route.fulfill({json:{items:users,total:2}}) })
   await page.route('**/admin/users/operator', route => {
     expect(route.request().method()).toBe('PATCH')
-    Object.assign(users[1]!,route.request().postDataJSON()); writes++
+    const body = route.request().postDataJSON()
+    expect(body).toEqual(writes === 0
+      ? {role:'supervisor',department:'logistics',status:'active'}
+      : {role:'supervisor',department:'logistics',status:'disabled'})
+    Object.assign(users[1]!,body); writes++
     return route.fulfill({json:users[1]})
   })
   await page.route('**/admin/users/operator/store-scopes', route => {
@@ -66,9 +70,11 @@ test('admin edits users and exact scopes, confirms store state and refetches fac
   await page.getByRole('button',{name:'Close this dialog'}).click()
   await page.getByRole('button',{name:'编辑用户',exact:true}).nth(1).click()
   await page.getByLabel('用户角色',{exact:true}).selectOption('supervisor')
+  await page.getByLabel('所属部门',{exact:true}).selectOption('logistics')
   await page.getByRole('button',{name:'保存变更'}).click()
   await expect(page.getByText('变更已保存',{exact:true})).toBeVisible()
   await expect(page.getByRole('cell',{name:'主管',exact:true})).toBeVisible()
+  await expect(page.getByRole('cell',{name:'物流',exact:true})).toBeVisible()
   await page.getByRole('button',{name:'店铺权限',exact:true}).nth(1).click()
   await page.getByLabel('授权店铺 ID（每行一个）').fill('s2')
   await page.getByRole('button',{name:'保存变更'}).click()
@@ -97,7 +103,7 @@ test('admin edits users and exact scopes, confirms store state and refetches fac
 test('mobile operator sees forbidden for role restricted management routes', async ({page}) => {
   await page.setViewportSize({width:390,height:844})
   await page.addInitScript(() => sessionStorage.setItem('access_token','fixture'))
-  await page.route('**/auth/me', route => route.fulfill({json:{id:'op',username:'op',role:'operator'}}))
+  await page.route('**/auth/me', route => route.fulfill({json:{id:'op',username:'op',role:'operator',department:'operations'}}))
   let requests=0
   await page.route(/\/(admin\/|agent-evaluations\/|agent-calls\?|audit-events\?)/,route=>{requests++;return route.abort()})
   for(const path of ['agent-evaluations','audit-events','admin']) {
@@ -110,7 +116,7 @@ test('mobile operator sees forbidden for role restricted management routes', asy
 test('tablet supervisor reads evaluation detail and call summary',async ({page})=>{
   await page.setViewportSize({width:1024,height:768})
   await page.addInitScript(()=>sessionStorage.setItem('access_token','fixture'))
-  await page.route('**/auth/me',route=>route.fulfill({json:{id:'s',username:'supervisor',role:'supervisor'}}))
+  await page.route('**/auth/me',route=>route.fulfill({json:{id:'s',username:'supervisor',role:'supervisor',department:'operations'}}))
   const run={id:'run',agent_type:'analysis',store_id:'store',status:'completed',summary:{total_cases:1,passed_cases:1,failed_cases:0,average_latency_ms:1},suite_version:'v1',runner_version:'v1',dataset_version:'v1',started_at:'2026-09-05T00:00:00Z',completed_at:'2026-09-05T00:00:01Z'}
   await page.route('**/agent-evaluations/runs?*',route=>route.fulfill({json:{items:[run],total:1}}))
   await page.route('**/agent-evaluations/runs/run',route=>route.fulfill({json:{...run,results:[{case_key:'exact',case_version:1,outcome:'passed',result_code:'EVALUATION_PASSED',latency_ms:1,metrics:{candidate_set_valid:true}}]}}))
@@ -125,7 +131,7 @@ test('tablet supervisor reads evaluation detail and call summary',async ({page})
 
 test('desktop admin can filter audit and inspect safe detail',async({page})=>{
   await page.addInitScript(()=>sessionStorage.setItem('access_token','fixture'))
-  await page.route('**/auth/me',route=>route.fulfill({json:{id:'a',username:'admin',role:'admin'}}))
+  await page.route('**/auth/me',route=>route.fulfill({json:{id:'a',username:'admin',role:'admin',department:'operations'}}))
   await page.route('**/audit-events?*',route=>route.fulfill({json:{items:[{id:'audit',event_type:'admin_store_updated',outcome:'success',store_id:'store',details:{store_enabled:false},created_at:'2026-09-05T00:00:00Z'}],total:1}}))
   await page.goto('/app/audit-events')
   await page.getByRole('button',{name:'查看详情'}).click()

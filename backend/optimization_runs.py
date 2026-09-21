@@ -9,13 +9,14 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import has_department_access
 from backend.common import (
     AgentCallType,
     ComplianceRiskLevel,
     KnowledgeVersionStatus,
     ProposalRevisionOrigin,
+    UserDepartment,
     UserRole,
-    UserStatus,
     WorkflowQuality,
     WorkflowStatus,
     WorkflowType,
@@ -260,6 +261,8 @@ async def claim_next_optimization_run(
 async def renew_optimization_lease(
     session: AsyncSession, *, workflow_run_id: str, lease_owner: str, lease_seconds: int
 ) -> bool:
+    if isinstance(await _lock_or_result(session, workflow_run_id, lease_owner), OwnedOptimizationContextResult):
+        return False
     return await commit_owned_workflow_update(
         session,
         update(WorkflowRun)
@@ -273,6 +276,8 @@ async def update_optimization_step(
 ) -> bool:
     if not isinstance(current_step, str) or not current_step or len(current_step) > 64:
         raise ValueError("current_step must be a nonempty string of at most 64 characters")
+    if isinstance(await _lock_or_result(session, workflow_run_id, lease_owner), OwnedOptimizationContextResult):
+        return False
     return await commit_owned_workflow_update(
         session,
         update(WorkflowRun)
@@ -335,7 +340,7 @@ async def _locked_context(
         or candidate.product_id != product.id
     ):
         return "OPTIMIZATION_CONTEXT_INCONSISTENT"
-    if not store.enabled or user.status != UserStatus.ACTIVE or user.role != UserRole.OPERATOR or scope is None:
+    if not store.enabled or not has_department_access(user, UserDepartment.OPERATIONS) or user.role != UserRole.OPERATOR or scope is None:
         return "OPTIMIZATION_AUTHORIZATION_CHANGED"
     if not product.enabled:
         return "OPTIMIZATION_FACT_ERROR"

@@ -29,7 +29,7 @@ const canSelect = computed(() =>
   Boolean(
     session.user &&
       workflow.value?.status === 'awaiting_selection' &&
-      canSelectProduct(session.user.role, isMobile),
+      canSelectProduct(session.user.role, session.user.department, isMobile),
   ),
 )
 

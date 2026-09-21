@@ -1,5 +1,7 @@
 # 物流工作台交付验证
 
+2026-09-21 权限修正与最新验收见 [部门隔离验证报告](department-isolation-validation.md)。以下保留 2026-09-17 的交付记录；当前普通账号仅能进入所属部门，跨部门切换仅向管理员提供。
+
 日期：2026-09-17。代码基于原项目 `711ca05`，开发分支 `codex/logistics-command-center`。Astra max 主导业务设计和复杂后端实现，独立 Astra max 审查；Sol high 完成界面，Terra high 验证原有回归。
 
 ## 可体验结果

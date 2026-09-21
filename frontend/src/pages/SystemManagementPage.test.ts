@@ -10,7 +10,7 @@ it.each(['operator', 'supervisor', 'admin'] as const)('enforces admin and device
   for (const mobile of [true, false]) {
     expect(canManageSystem(role, mobile)).toBe(role === 'admin' && !mobile)
     if (role === 'admin' && !mobile) continue
-    setCurrentUser({ id: 'a', username: 'a', role })
+    setCurrentUser({ id: 'a', username: 'a', role, department: 'operations' })
     vi.stubGlobal('matchMedia', () => ({ matches: mobile }))
     const fetch = vi.fn(); vi.stubGlobal('fetch', fetch)
     const wrapper = mount(SystemManagementPage, { global: { plugins: [ElementPlus] } })
@@ -21,7 +21,7 @@ it.each(['operator', 'supervisor', 'admin'] as const)('enforces admin and device
   }
 })
 it.each([401, 403, 404, 409, 422, 503])('renders safe error %s', async status => {
-  setCurrentUser({ id: 'a', username: 'a', role: 'admin' })
+  setCurrentUser({ id: 'a', username: 'a', role: 'admin', department: 'operations' })
   vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ detail: 'private diagnostic' }), { status }))
   const wrapper = mount(SystemManagementPage, { global: { plugins: [ElementPlus] } })
   await flushPromises()
@@ -30,7 +30,7 @@ it.each([401, 403, 404, 409, 422, 503])('renders safe error %s', async status =>
   wrapper.unmount()
 })
 it('distinguishes empty lists from filter misses and preserves filter values', async () => {
-  setCurrentUser({ id: 'a', username: 'a', role: 'admin' })
+  setCurrentUser({ id: 'a', username: 'a', role: 'admin', department: 'operations' })
   const fetch = vi.fn(async () => new Response(JSON.stringify({ items: [], total: 0 })))
   vi.stubGlobal('fetch', fetch)
   const wrapper = mount(SystemManagementPage, { global: { plugins: [ElementPlus] } })

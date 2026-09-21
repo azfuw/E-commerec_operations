@@ -10,7 +10,7 @@ from typing import Literal, TYPE_CHECKING
 
 from sqlalchemy import select, func
 from sqlalchemy.exc import SQLAlchemyError
-from backend.common import EvaluationAgentType, EvaluationRunStatus, UserRole, UserStatus
+from backend.common import EvaluationAgentType, EvaluationRunStatus, UserDepartment, UserRole, UserStatus
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -265,11 +265,12 @@ def evaluate_fixed_case(case: dict[str, object]) -> EvaluationResultInput:
 
 
 async def _reader(session,actor_id):
+    from backend.auth import has_department_access
     from backend.models import User
     actor = await session.scalar(select(User).where(User.id == actor_id).execution_options(populate_existing=True))
     if actor is None or actor.status != UserStatus.ACTIVE:
         raise EvaluationDomainError('EVALUATION_AUTHENTICATION_REQUIRED',401)
-    if actor.role not in (UserRole.ADMIN,UserRole.SUPERVISOR):
+    if not has_department_access(actor, UserDepartment.OPERATIONS) or actor.role not in (UserRole.ADMIN,UserRole.SUPERVISOR):
         raise EvaluationDomainError('EVALUATION_FORBIDDEN',403)
     return actor
 

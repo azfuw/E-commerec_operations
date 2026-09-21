@@ -10,17 +10,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.audit_events import add_audit_event
 from backend.common import (
+    UserDepartment,
     AgentCallType,
     AuditEventType,
     AuditOutcome,
     ComplianceRiskLevel,
     ProposalRevisionOrigin,
     UserRole,
-    UserStatus,
     WorkflowQuality,
     WorkflowStatus,
     WorkflowType,
 )
+from backend.auth import has_department_access
 from backend.compliance_agent import (
     ComplianceAgentCallRecord,
     ComplianceAgentResponse,
@@ -349,6 +350,11 @@ async def renew_manual_review_lease(
     lease_owner: str,
     lease_seconds: int,
 ) -> bool:
+    context = await _load_owned_manual_review_context(
+        session, workflow_run_id=workflow_run_id, lease_owner=lease_owner, commit_ready=False
+    )
+    if context.disposition != "ready":
+        return False
     return await commit_owned_workflow_update(
         session,
         update(WorkflowRun)
@@ -640,7 +646,7 @@ async def _load_owned_manual_review_context(
                 error_code="MANUAL_REVIEW_CONTEXT_INCONSISTENT",
             )
         if (
-            actor.status is not UserStatus.ACTIVE
+            not has_department_access(actor, UserDepartment.OPERATIONS)
             or actor.role not in _ALLOWED_ROLES
             or not store.enabled
             or scope is None

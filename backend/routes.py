@@ -30,6 +30,7 @@ from backend.audit_events import AuditEventDomainError, AuditEventFilters, list_
 from backend.auth import (
     create_access_token,
     get_current_user,
+    require_operations_user,
     require_roles,
     require_store_access,
     verify_password,
@@ -126,7 +127,8 @@ from backend.workbench import (
     list_workbench_tasks,
 )
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_operations_user)])
+shared_router = APIRouter()
 
 
 def _publish_record_view(
@@ -160,7 +162,7 @@ async def _rollback_webhook(session: AsyncSession) -> None:
         pass
 
 
-@router.post("/integrations/platform/webhooks", status_code=status.HTTP_201_CREATED)
+@shared_router.post("/integrations/platform/webhooks", status_code=status.HTTP_201_CREATED)
 async def platform_webhook_route(
     request: Request,
     response: Response,
@@ -215,7 +217,7 @@ def _admin_http_error(error):
         detail={'code':error.code if isinstance(error,AdminDomainError) else 'ADMIN_CONFLICT','request_id':str(uuid4())})
 
 
-@router.get('/admin/users',response_model=AdminUserListView)
+@shared_router.get('/admin/users',response_model=AdminUserListView)
 async def admin_users_route(query:Annotated[AdminUserQuery,Query()],user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
     try:
         users,total=await list_admin_users(session,actor_id=user.id,**query.model_dump())
@@ -224,7 +226,7 @@ async def admin_users_route(query:Annotated[AdminUserQuery,Query()],user:User=De
         await session.rollback();raise _admin_http_error(error) from None
 
 
-@router.patch('/admin/users/{user_id}',response_model=AdminUserView)
+@shared_router.patch('/admin/users/{user_id}',response_model=AdminUserView)
 async def admin_user_update_route(user_id:Annotated[str,Path(min_length=1,max_length=36)],patch:AdminUserPatch,
     user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
     try:
@@ -234,7 +236,7 @@ async def admin_user_update_route(user_id:Annotated[str,Path(min_length=1,max_le
         await session.rollback();raise _admin_http_error(error) from None
 
 
-@router.put('/admin/users/{user_id}/store-scopes',response_model=AdminUserView)
+@shared_router.put('/admin/users/{user_id}/store-scopes',response_model=AdminUserView)
 async def admin_user_scopes_route(user_id:Annotated[str,Path(min_length=1,max_length=36)],request:AdminScopeReplacement,
     user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
     try:
@@ -244,7 +246,7 @@ async def admin_user_scopes_route(user_id:Annotated[str,Path(min_length=1,max_le
         await session.rollback();raise _admin_http_error(error) from None
 
 
-@router.get('/admin/stores',response_model=AdminStoreListView)
+@shared_router.get('/admin/stores',response_model=AdminStoreListView)
 async def admin_stores_route(query:Annotated[AdminStoreQuery,Query()],user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
     try:
         stores,total=await list_admin_stores(session,actor_id=user.id,**query.model_dump())
@@ -253,7 +255,7 @@ async def admin_stores_route(query:Annotated[AdminStoreQuery,Query()],user:User=
         await session.rollback();raise _admin_http_error(error) from None
 
 
-@router.patch('/admin/stores/{store_id}',response_model=AdminStoreView)
+@shared_router.patch('/admin/stores/{store_id}',response_model=AdminStoreView)
 async def admin_store_update_route(store_id:Annotated[str,Path(min_length=1,max_length=36)],patch:AdminStorePatch,
     user:User=Depends(require_roles(UserRole.ADMIN)),session:AsyncSession=Depends(get_session)):
     try:return AdminStoreView.model_validate(await update_admin_store(session,actor_id=user.id,store_id=store_id,patch=patch))
@@ -376,7 +378,7 @@ def _remove_stored_upload(path) -> None:
         pass
 
 
-@router.post("/auth/login", response_model=AccessToken)
+@shared_router.post("/auth/login", response_model=AccessToken)
 async def login(
     request: LoginRequest,
     session: AsyncSession = Depends(get_session),
@@ -392,14 +394,14 @@ async def login(
     return AccessToken(access_token=create_access_token(user, settings))
 
 
-@router.get("/auth/me", response_model=CurrentUserView)
+@shared_router.get("/auth/me", response_model=CurrentUserView)
 async def read_current_user(
     user: User = Depends(get_current_user),
 ) -> CurrentUserView:
-    return CurrentUserView(id=user.id, username=user.username, role=user.role)
+    return CurrentUserView(id=user.id, username=user.username, role=user.role, department=user.department)
 
 
-@router.get("/stores", response_model=list[StoreSummary])
+@shared_router.get("/stores", response_model=list[StoreSummary])
 async def list_stores(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),

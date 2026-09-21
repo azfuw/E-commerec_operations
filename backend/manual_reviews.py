@@ -9,10 +9,12 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.audit_events import add_audit_event
+from backend.auth import has_department_access
 from backend.common import (
     AuditEventType,
     AuditOutcome,
     ProposalRevisionOrigin,
+    UserDepartment,
     UserRole,
     UserStatus,
     WorkflowQuality,
@@ -132,7 +134,7 @@ async def _authorized_context(
     )
     if actor is None or actor.status is not UserStatus.ACTIVE:
         raise ManualReviewDomainError("PROPOSAL_NOT_FOUND", 404)
-    if actor.role not in _ALLOWED_ROLES:
+    if not has_department_access(actor, UserDepartment.OPERATIONS) or actor.role not in _ALLOWED_ROLES:
         raise ManualReviewDomainError("PROPOSAL_ACTION_FORBIDDEN", 403)
     proposal_hint = await session.scalar(
         select(ProductProposal)

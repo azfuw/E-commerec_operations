@@ -145,8 +145,8 @@ test('real authentication enforces warehouse store scope', async ({ page, reques
   expect((await request.get('/logistics/shipments?store_id=unavailable-store', { headers })).status()).toBe(404)
 })
 
-test('department switching keeps the shared shell and supports history and deep links', async ({ page }) => {
-  await enter(page)
+test('administrator department switching keeps the shared shell and supports history and deep links', async ({ page }) => {
+  await enter(page, 'admin')
   const departments = page.getByRole('navigation', { name: '部门切换' })
   await expect(departments).toBeVisible()
   await expect(page.getByRole('button', { name: '退出登录', exact: true })).toHaveCount(1)
@@ -159,12 +159,12 @@ test('department switching keeps the shared shell and supports history and deep 
   await page.screenshot({ path: path.join(evidence, 'operations-workbench.png'), fullPage: true })
   await departments.getByRole('link', { name: '物流工作台', exact: true }).click()
   await expect(page.getByRole('heading', { name: '退货管理', exact: true })).toBeVisible()
-  await page.getByRole('link', { name: '审计日志', exact: true }).click()
-  await expect(page).toHaveURL(/audit-events\?workspace=logistics/)
+  await page.getByRole('link', { name: '系统管理', exact: true }).click()
+  await expect(page).toHaveURL(/admin\?workspace=logistics/)
   await page.reload()
   await expect(departments.getByRole('link', { name: '物流工作台', exact: true })).toHaveAttribute('aria-current', 'true')
-  await expect(page.getByRole('heading', { name: '审计日志', exact: true })).toBeVisible()
-  await page.screenshot({ path: path.join(evidence, 'shared-audit.png'), fullPage: true })
+  await expect(page.getByRole('heading', { name: '系统管理', exact: true })).toBeVisible()
+  await page.screenshot({ path: path.join(evidence, 'shared-admin.png'), fullPage: true })
   await nav(page, 'shipments').click()
   await expect(page.getByRole('heading', { name: '运单追踪', exact: true })).toBeVisible()
   await page.reload()
@@ -181,4 +181,83 @@ test('department switching keeps the shared shell and supports history and deep 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
   await expect(departments.getByRole('link', { name: '物流工作台', exact: true })).toBeVisible()
   await page.screenshot({ path: path.join(evidence, 'mobile-operations.png'), fullPage: true })
+})
+
+test('logistics users cannot open or call operations business, even with the same stores', async ({ page, request }) => {
+  await enter(page)
+  await expect(page.getByRole('link', { name: '运营工作台', exact: true })).toHaveCount(0)
+  await expect(page.getByRole('link', { name: '待审批', exact: true })).toHaveCount(0)
+  await expect(page.getByRole('link', { name: '审计日志', exact: true })).toHaveCount(0)
+  const token = await page.evaluate(() => sessionStorage.getItem('access_token'))
+  const headers = { Authorization: `Bearer ${token}` }
+  for (const url of ['/workbench/tasks', '/approvals', '/audit-events', '/stores/unavailable/products']) {
+    expect((await request.get(url, { headers })).status(), url).toBe(403)
+  }
+  for (const url of ['/analysis-runs', '/approvals/nonexistent/approve', '/knowledge/search']) {
+    expect((await request.post(url, { headers, data: {} })).status(), url).toBe(403)
+  }
+  await page.goto('approvals')
+  await expect(page).toHaveURL(/\/app\/forbidden$/)
+  await page.getByRole('link', { name: /返回.*工作台/ }).click()
+  await expect(page).toHaveURL(/\/app\/logistics$/)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(page.getByRole('link', { name: '运营工作台', exact: true })).toHaveCount(0)
+  await page.screenshot({ path: path.join(evidence, 'logistics-department-isolation.png'), fullPage: true })
+})
+
+test('operations login lands in its own workbench and cannot modify logistics', async ({ page, request }) => {
+  await page.goto('logistics?view=returns')
+  await page.getByLabel('用户名', { exact: true }).fill('operations')
+  await page.getByLabel('密码', { exact: true }).fill('Logistics!2026')
+  await page.getByRole('button', { name: '登录', exact: true }).click()
+  await expect(page).toHaveURL(/\/app\/workbench$/)
+  await expect(page.getByRole('heading', { name: '任务工作台' })).toBeVisible()
+  await expect(page.getByRole('link', { name: '物流工作台', exact: true })).toHaveCount(0)
+  const token = await page.evaluate(() => sessionStorage.getItem('access_token'))
+  const headers = { Authorization: `Bearer ${token}` }
+  for (const url of ['/logistics/dashboard', '/logistics/shipments', '/logistics/returns', '/logistics/agent/runs']) {
+    expect((await request.get(url, { headers })).status(), url).toBe(403)
+  }
+  for (const url of ['/logistics/shipments', '/logistics/returns', '/logistics/agent/patrol', '/logistics/agent/query']) {
+    expect((await request.post(url, { headers, data: {} })).status(), url).toBe(403)
+  }
+  await page.goto('logistics?view=returns')
+  await expect(page).toHaveURL(/\/app\/forbidden$/)
+  await page.getByRole('link', { name: /返回.*工作台/ }).click()
+  await expect(page).toHaveURL(/\/app\/workbench$/)
+  await page.screenshot({ path: path.join(evidence, 'operations-department-isolation.png'), fullPage: true })
+})
+
+test('administrator changes department in the UI and existing tokens immediately use the new permission', async ({ page, request }) => {
+  const login = async (username: string) => {
+    const response = await request.post('/auth/login', { data: { username, password: 'Logistics!2026' } })
+    expect(response.status()).toBe(200)
+    return { Authorization: `Bearer ${(await response.json()).access_token}` }
+  }
+  const admin = await login('admin')
+  const actor = await login('operations')
+  const identity = await (await request.get('/auth/me', { headers: actor })).json()
+  expect(identity.department).toBe('operations')
+  try {
+    await enter(page, 'admin')
+    await page.getByRole('link', { name: '系统管理', exact: true }).click()
+    const row = page.getByRole('row').filter({ has: page.getByRole('cell', { name: 'operations', exact: true }) })
+    await row.getByRole('button', { name: '编辑用户', exact: true }).click()
+    await page.getByLabel('所属部门', { exact: true }).selectOption('logistics')
+    const mutation = page.waitForResponse(response => response.url().endsWith(`/admin/users/${identity.id}`) && response.request().method() === 'PATCH')
+    await page.getByRole('button', { name: '保存变更', exact: true }).click()
+    const changed = await mutation
+    expect(changed.status()).toBe(200)
+    expect((await changed.json()).department).toBe('logistics')
+    await expect(page.locator('.el-drawer')).toBeHidden()
+    await expect(row).toContainText('物流')
+    await page.screenshot({ path: path.join(evidence, 'department-management.png'), fullPage: true, animations: 'disabled' })
+    expect((await request.get('/workbench/tasks', { headers: actor })).status()).toBe(403)
+    expect((await request.get('/logistics/dashboard', { headers: actor })).status()).toBe(200)
+    expect((await (await request.get('/auth/me', { headers: actor })).json()).department).toBe('logistics')
+  } finally {
+    expect((await request.patch(`/admin/users/${identity.id}`, { headers: admin, data: { department: 'operations' } })).status()).toBe(200)
+  }
+  expect((await request.get('/logistics/dashboard', { headers: actor })).status()).toBe(403)
+  expect((await request.get('/workbench/tasks', { headers: actor })).status()).toBe(200)
 })

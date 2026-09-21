@@ -10,19 +10,22 @@ logger = logging.getLogger("logistics.worker")
 
 async def patrol_once(session, username: str) -> dict:
     from sqlalchemy import select
-    from backend.common import UserStatus
+    from backend.auth import require_department
+    from backend.common import UserDepartment, UserStatus
     from backend.models import User
     from backend.logistics import patrol, run_json, scope_ids, shipment_rows
 
-    actor = await session.scalar(select(User).where(User.username == username))
+    actor = await session.scalar(select(User).where(User.username == username).execution_options(populate_existing=True))
     if actor is None or actor.status != UserStatus.ACTIVE:
         raise ValueError("Logistics worker requires an active user")
+    require_department(actor, UserDepartment.LOGISTICS)
     ids = await scope_ids(session, actor, None)
     rows = await shipment_rows(session, actor)
     return run_json(await patrol(session, actor, rows, ids))
 
 
 async def run_forever(username: str, interval: float = 300) -> None:
+    from fastapi import HTTPException
     from backend.database import async_session_factory
 
     while True:
@@ -32,6 +35,8 @@ async def run_forever(username: str, interval: float = 300) -> None:
             logger.info("Patrol completed: %s scanned, %s new tasks", result["scanned_shipments"], result["created_exceptions"])
         except ValueError:
             logger.error("Patrol paused: configured user is missing or disabled")
+        except HTTPException:
+            logger.error("Patrol paused: configured user no longer has logistics access")
         except Exception:
             # Avoid writing connection strings or raw business payloads to logs.
             logger.error("Patrol failed; the next interval will retry with a fresh session")
