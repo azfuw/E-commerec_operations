@@ -17,3 +17,9 @@ frontend/playwright-report/
 frontend/test-results/
 phase10-evidence/
 data/logistics-demo/
+
+# Local architecture validation receipts and browser captures.
+docs/architecture/*.visual-check.json
+docs/architecture/*-receipt.json
+docs/architecture/supplementary-browser.json
+docs/architecture/desktop-*.png

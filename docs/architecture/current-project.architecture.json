@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "智营台 · 电商运营与物流协同架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/azfuw/E-commerec_operations.git",
+      "revision": "ebb4be01392d457b1634dbf790857b6aacaee64c"
+    },
+    "viewBox": [1390, 820],
+    "views": [
+      {"id": "access", "label": "统一入口与权限", "focus": ["workspaces", "api", "authorization", "postgres"], "note": "运营、物流与管理页面共用 API；服务端按部门、角色和店铺范围重新授权。"},
+      {"id": "operations", "label": "运营 Agent 链路", "focus": ["postgres", "operations-workers", "deepseek", "knowledge-bge", "milvus"], "note": "数据库租约驱动分析、优化、合规与人工复核；规则引用由 PostgreSQL 与 Milvus 联合校验。"},
+      {"id": "logistics", "label": "物流业务链路", "focus": ["workspaces", "api", "logistics-patrol", "postgres"], "note": "运单、退货、异常与巡检共享业务事实；规则 Agent 为本地确定性逻辑。"},
+      {"id": "delivery", "label": "平台投递与回调", "focus": ["postgres", "platform-worker", "contract-simulator", "signed-webhook", "api"], "note": "批准后持久投递到本地 contract_simulator；签名回调接收边界由独立测试请求验证。"}
+    ]
+  },
+  "components": [
+    {
+      "id": "workspaces", "type": "frontend", "label": "统一工作台", "sublabel": "Vue 3 · 运营 / 物流 / 管理",
+      "pos": [30, 370], "size": [180, 76],
+      "sources": [
+        {"path": "frontend/src/router.ts", "line": 22, "label": "部门路由"},
+        {"path": "frontend/src/components/AppShell.vue", "line": 1, "label": "统一外框"}
+      ]
+    },
+    {
+      "id": "authorization", "type": "security", "label": "部门与业务授权", "sublabel": "JWT 身份 · 角色 · 店铺范围",
+      "pos": [280, 70], "size": [200, 76],
+      "sources": [
+        {"path": "backend/auth.py", "line": 84, "label": "部门授权"},
+        {"path": "backend/auth.py", "line": 114, "label": "店铺授权"}
+      ]
+    },
+    {
+      "id": "api", "type": "backend", "label": "FastAPI 模块化单体", "sublabel": "运营 · 物流 · 管理 · 回调",
+      "pos": [280, 370], "size": [200, 76],
+      "sources": [
+        {"path": "backend/main.py", "line": 78, "end_line": 80, "label": "路由装配"},
+        {"path": "backend/routes.py", "line": 165, "label": "平台回调"},
+        {"path": "backend/logistics.py", "line": 25, "label": "物流 API"}
+      ]
+    },
+    {
+      "id": "postgres", "type": "database", "label": "PostgreSQL 16", "sublabel": "业务事实 · 租约 · 审计 · 回调",
+      "pos": [560, 370], "size": [200, 76],
+      "sources": [
+        {"path": "backend/models.py", "line": 1, "label": "运营与投递模型"},
+        {"path": "backend/logistics_models.py", "line": 14, "label": "物流模型"}
+      ]
+    },
+    {
+      "id": "operations-workers", "type": "backend", "label": "运营图工作流", "sublabel": "分析 · 优化 · 合规 · 人工复核",
+      "pos": [830, 70], "size": [210, 76],
+      "sources": [
+        {"path": "backend/analysis_worker.py", "line": 1, "label": "分析 Worker"},
+        {"path": "backend/optimization_worker.py", "line": 1, "label": "优化 Worker"},
+        {"path": "backend/manual_review_worker.py", "line": 1, "label": "人工复核 Worker"}
+      ]
+    },
+    {
+      "id": "deepseek", "type": "external", "label": "DeepSeek API", "sublabel": "结构化 JSON · 有界重试",
+      "pos": [1170, 70], "size": [190, 76],
+      "sources": [{"path": "backend/deepseek_runtime.py", "line": 1, "label": "统一运行时"}]
+    },
+    {
+      "id": "knowledge-bge", "type": "backend", "label": "知识索引与 BGE", "sublabel": "版本正文 · dense / sparse · 重排",
+      "pos": [830, 220], "size": [210, 76],
+      "sources": [
+        {"path": "backend/knowledge_worker.py", "line": 1, "label": "索引 Worker"},
+        {"path": "backend/knowledge_search.py", "line": 1, "label": "混合检索"}
+      ]
+    },
+    {
+      "id": "milvus", "type": "database", "label": "Milvus 2.5", "sublabel": "混合向量候选索引",
+      "pos": [1170, 220], "size": [190, 76],
+      "sources": [
+        {"path": "docker-compose.yml", "line": 50, "label": "本地服务"},
+        {"path": "backend/knowledge_index.py", "line": 1, "label": "索引适配"}
+      ]
+    },
+    {
+      "id": "platform-worker", "type": "backend", "label": "平台投递 Worker", "sublabel": "租约 · 幂等 · 顺序 · 有界重试",
+      "pos": [830, 370], "size": [210, 76],
+      "sources": [
+        {"path": "backend/platform_delivery_worker.py", "line": 71, "label": "投递执行"},
+        {"path": "backend/platform_delivery_runs.py", "line": 1, "label": "租约状态"}
+      ]
+    },
+    {
+      "id": "contract-simulator", "type": "external", "label": "contract_simulator", "sublabel": "本地平台契约目标",
+      "pos": [1170, 370], "size": [190, 76],
+      "sources": [
+        {"path": "tests/support/platform_simulator.py", "line": 1, "label": "契约模拟器"},
+        {"path": "backend/platform_client.py", "line": 66, "label": "平台客户端"}
+      ]
+    },
+    {
+      "id": "logistics-patrol", "type": "backend", "label": "物流域与规则巡检", "sublabel": "运单 · 退货 · 异常 · 确定性问答",
+      "pos": [830, 650], "size": [210, 76],
+      "sources": [
+        {"path": "backend/logistics.py", "line": 1, "label": "物流业务与巡检"},
+        {"path": "scripts/run_logistics_worker.py", "line": 1, "label": "定时巡检"}
+      ]
+    },
+    {
+      "id": "signed-webhook", "type": "security", "label": "签名回调接收", "sublabel": "HMAC 验证 · 独立测试请求",
+      "pos": [280, 650], "size": [200, 76],
+      "sources": [
+        {"path": "backend/platform_webhooks.py", "line": 104, "label": "签名回调"},
+        {"path": "backend/routes.py", "line": 165, "label": "回调入口"}
+      ]
+    }
+  ],
+  "connections": [
+    {"id": "ui-api", "from": "workspaces", "to": "api", "label": "HTTP", "variant": "emphasis"},
+    {"id": "api-auth", "from": "api", "to": "authorization", "label": "每次请求重新授权", "variant": "security"},
+    {"id": "api-postgres", "from": "api", "to": "postgres", "label": "SQL 事务", "variant": "emphasis"},
+    {"id": "ops-postgres", "from": "operations-workers", "to": "postgres", "label": "租约 / 状态"},
+    {"id": "ops-deepseek", "from": "operations-workers", "to": "deepseek", "label": "HTTPS · JSON"},
+    {"id": "ops-knowledge", "from": "operations-workers", "to": "knowledge-bge", "label": "规则检索", "labelAt": [935, 160]},
+    {"id": "knowledge-milvus", "from": "knowledge-bge", "to": "milvus", "label": "写入 / 召回"},
+    {"id": "logistics-postgres", "from": "logistics-patrol", "to": "postgres", "label": "物流事实 / 巡检"},
+    {"id": "delivery-postgres", "from": "platform-worker", "to": "postgres", "label": "投递租约 / 状态", "labelAt": [700, 460]},
+    {"id": "delivery-platform", "from": "platform-worker", "to": "contract-simulator", "label": "OAuth + 幂等 PUT"},
+    {"id": "webhook-api", "from": "signed-webhook", "to": "api", "label": "验签 / 持久化", "variant": "security"}
+  ],
+  "cards": [
+    {
+      "dot": "cyan", "title": "两部门统一工作台",
+      "items": [
+        "运营完成分析、优化、复核、审批与投递；物流处理运单、退货和异常。",
+        "普通账号只进入所属部门；管理员可跨部门管理。"
+      ]
+    },
+    {
+      "dot": "emerald", "title": "共享事实与恢复边界",
+      "items": [
+        "PostgreSQL 保存业务事实、任务租约、审计和回调回执。",
+        "Milvus 是可重建候选索引；有效规则仍由 PostgreSQL 版本校验。"
+      ]
+    },
+    {
+      "dot": "slate", "title": "已核验范围 · 2026-09-21",
+      "items": [
+        "依据 master @ ebb4be0 的路由、模型、Worker、迁移与前端源码。",
+        "平台目标为本地契约模拟器；回调接收独立验证；物流未接真实承运商。"
+      ]
+    }
+  ]
+}
